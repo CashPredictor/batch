@@ -1,348 +1,488 @@
-Poniżej ocena nowego podejścia db_init.py względem starego CreateDatabase.
+Rozumiem to tak:
+	1.	chcesz już teraz uporządkować db_init.py, żeby:
+	•	nie było DROP
+	•	failował, jeśli baza już istnieje
+	•	miał poprawioną kolejność
+	•	nie miał martwego kodu
+	•	miał ujednolicone cursor
+	•	miał zdefiniowane get_columns
+	2.	jednocześnie chcesz zidentyfikować tabele budowane dynamicznie w CreateDatabase, żeby:
+	•	zostawić tam na razie tylko inserty / materializację danych,
+	•	a definicje tabel przenieść do init/config w kolejnym kroku.
 
-Werdykt ogólny
-
-⚠️ Kierunek jest dobry, ale obecny db_init.py nie jest jeszcze poprawny produkcyjnie.
-Masz dobry podział odpowiedzialności na:
-	•	db_init = schema/bootstrap
-	•	CreateDatabase = ładowanie i przetwarzanie danych
-
-Ale w obecnej wersji są jeszcze błędy techniczne i braki w kompletności.
-
-⸻
-
-1. Kompletność schematu
-
-✅ OK
-
-Do db_init przeniosłeś część obiektów schematycznych:
-	•	swieta
-	•	group_cust_inv_days
-	•	summary_client_days_tab
-	•	dataset_tab
-	•	statystyki_faktur
-	•	widoki bazowe:
-	•	invo_view
-	•	clhs_view
-	•	DEBC_view
-	•	dcmo_view
-	•	INVO_CLHS_JOINED
-	•	summary_client_days_view
-
-⚠️ Ryzyko
-
-Brakuje pełnej spójności między tym, co db_init tworzy, a tym, czego potem używa runtime.
-
-Przykłady:
-	•	db_init tworzy indeksy na dataset, ale nie tworzy tabeli dataset.
-	•	db_init tworzy indeksy na invo, debc, clhs, dcmo, ale tych tabel też nie tworzy — zakładasz, że zrobi to loader. To może być OK tylko jeśli db_init odpalasz po załadowaniu RAW albo świadomie pomijasz błędy.
-	•	extended_grouped_client_days_tab i INVO_CLHS_JOINED_TAB są częściowo tworzone dynamicznie i to jest zgodne z Twoim założeniem, ale trzeba to jasno traktować jako poza init.
-
-❌ Błąd
-
-W db_init.py masz obiekty wyglądające jak pseudo-deklaracje, które nie robią nic:
-
-query_create_invo_clhs_joined_tab: """
-  CREATE TABLE IF NOT EXISTS INVO_CLHS_JOINED_TAB ( ... );
-"""
-
-To nie jest ani przypisanie, ani użycie. To jest martwy kod.
+To ma sens. Poniżej robię to w dwóch częściach:
+	•	A. gotowy db_init.py do wklejenia teraz
+	•	B. lista tabel dynamicznych + gotowe SQL-e do wyciągnięcia ich schematów z obecnej SQLite
 
 ⸻
 
-2. Poprawność kolejności inicjalizacji
+A. Poprawiony db_init.py do wklejenia teraz
 
-⚠️ Ryzyko
+Ten plik:
+	•	kończy się błędem, jeśli plik DB już istnieje
+	•	nie robi żadnych DROP
+	•	ma ujednolicone cursor
+	•	ma get_columns
+	•	usuwa martwy kod
+	•	tworzy tylko to, co da się utworzyć deterministycznie
+	•	nie udaje, że już znamy schematy wszystkich dynamicznych tabel
 
-Zasadniczo chciałeś zachować kolejność:
-	•	TABLE
-	•	VIEW
-	•	INDEX
+Wklej cały plik jako db_init.py
 
-ale w praktyce nie jest ona w pełni zachowana.
+# db_init.py
+import argparse
+import os
+import sqlite3
+import sys
+import yaml
 
-❌ Błąd
 
-W db_init.py tworzysz indeksy na tabelach, które mogą jeszcze nie istnieć:
+def load_config(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def exec_sql(conn: sqlite3.Connection, sql: str | None, label: str = "") -> None:
+    if not sql:
+        return
+    try:
+        conn.executescript(sql)
+    except sqlite3.Error as e:
+        raise RuntimeError(f"Błąd podczas wykonywania SQL [{label}]: {e}") from e
+
+
+def table_exists(cursor: sqlite3.Cursor, table_name: str) -> bool:
+    cursor.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table' AND name = ?
+        LIMIT 1
+        """,
+        (table_name,),
+    )
+    return cursor.fetchone() is not None
+
+
+def view_exists(cursor: sqlite3.Cursor, view_name: str) -> bool:
+    cursor.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'view' AND name = ?
+        LIMIT 1
+        """,
+        (view_name,),
+    )
+    return cursor.fetchone() is not None
+
+
+def get_columns(cursor: sqlite3.Cursor, view_name: str):
+    cursor.execute(f"PRAGMA table_info({view_name});")
+    return [(col[1], col[2]) for col in cursor.fetchall()]
+
+
+def get_columns_from_view(cursor: sqlite3.Cursor, view_name: str):
+    cursor.execute(f"PRAGMA table_info({view_name});")
+    return [col[1] for col in cursor.fetchall()]
+
+
+def create_indexes(index_definitions: dict[str, list[str]], conn: sqlite3.Connection) -> None:
+    cursor = conn.cursor()
+
+    for table_name, columns in index_definitions.items():
+        if not table_exists(cursor, table_name):
+            print(f"[WARN] Pomijam indeksy dla '{table_name}' – tabela jeszcze nie istnieje.")
+            continue
+
+        for column in columns:
+            index_name = f"{table_name}_{column}_idx"
+            sql_query = f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} ({column});"
+            cursor.execute(sql_query)
+
+    conn.commit()
+
+
+def create_table_from_view_schema(
+    cursor: sqlite3.Cursor,
+    view_name: str,
+    table_name: str,
+) -> None:
+    """
+    Tworzy tabelę na podstawie aktualnego schematu widoku.
+    Bez DROP – tylko jeśli tabela nie istnieje.
+    """
+    if table_exists(cursor, table_name):
+        print(f"[INFO] Tabela '{table_name}' już istnieje – pomijam CREATE.")
+        return
+
+    if not view_exists(cursor, view_name):
+        print(f"[WARN] Widok '{view_name}' nie istnieje – nie mogę utworzyć '{table_name}'.")
+        return
+
+    view_columns = get_columns(cursor, view_name)
+
+    column_definitions = []
+    for col, _col_type in view_columns:
+        if col in [
+            "INVO_INVDATE", "INVO_VALUEDATE", "INVO_DUEDATE", "INVO_MARKCODESPECDATE",
+            "INVO_MARKCODETEXTDATE", "INVO_FINALPAYMENTDATE", "INVO_BOOKINGDATE",
+            "INVO_MAXFINANCETIMPASSED", "INVO_DATSTARTDELCREDEREINVST", "CLHS_CHANGED_DATETIME",
+            "CLHS_DATVALID", "CLHS_DATPRINTED", "CLHS_NEXT_CHANGED_DATETIME",
+        ]:
+            column_definitions.append(f"{col} DATETIME")
+        elif col in [
+            "INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "INVO_DEBC_NO",
+            "CLHS_NO", "CLHS_ADMNO", "CLHS_DEBC_NO", "CLHS_DEBH_NO",
+            "INVO_MARKCODESPEC", "INVO_NETDAYS",
+        ]:
+            column_definitions.append(f"{col} INTEGER")
+        elif col in [
+            "INVO_CURRENCY", "INVO_INVO_INVOICENO", "INVO_TEXT", "INVO_HOLDCODE", "INVO_DUMMY",
+            "CLHS_CURRENCYOLD", "CLHS_CURRENCYNEW", "CLHS_TEXTCODE1", "CLHS_TEXTCODE2",
+            "CLHS_TEXTCODE3", "CLHS_VARIABLETEXT1", "CLHS_VARIABLETEXT2",
+            "CLHS_USRID", "CLHS_AUTOMATICDECISION", "CLHS_NEWDEBTOR",
+        ]:
+            column_definitions.append(f"{col} TEXT")
+        else:
+            column_definitions.append(f"{col} REAL")
+
+    create_table_query = f"""
+    CREATE TABLE IF NOT EXISTS {table_name} (
+        {", ".join(column_definitions)}
+    );
+    """
+    cursor.execute(create_table_query)
+    print(f"[OK] Utworzono tabelę '{table_name}' na bazie widoku '{view_name}'.")
+
+
+def create_aggregated_data_temp_schema(cursor: sqlite3.Cursor) -> None:
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS aggregated_data_temp (
+            DZIEN DATE NOT NULL,
+            DZIS_DZIEN_TYG INTEGER NOT NULL,
+            DZIS_SOBOTA INTEGER NOT NULL,
+            DZIS_NIEDZIELA INTEGER NOT NULL
+        );
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ag_day
+        ON aggregated_data_temp (DZIEN);
+    """)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="SQLite DB schema initialization")
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--db-path", required=True)
+    args = parser.parse_args()
+
+    # 1. Fail, jeśli DB już istnieje
+    if os.path.exists(args.db_path):
+        print(f"[ERROR] Baza już istnieje: {args.db_path}")
+        sys.exit(1)
+
+    os.makedirs(os.path.dirname(args.db_path), exist_ok=True)
+
+    cfg = load_config(args.config)
+    params = cfg["first_model_params"]
+
+    conn = sqlite3.connect(args.db_path)
+    cursor = conn.cursor()
+
+    try:
+        # ============================================================
+        # 2. Tabele statyczne / deterministyczne
+        # ============================================================
+        create_aggregated_data_temp_schema(cursor)
+
+        exec_sql(conn, params.get("query_swieta"), "query_swieta")
+        exec_sql(conn, params.get("query_create_group_cust_inv_days"), "query_create_group_cust_inv_days")
+        exec_sql(conn, params.get("query_create_summary_client_days_tab2"), "query_create_summary_client_days_tab2")
+        exec_sql(conn, params.get("query_create_dataset_tab"), "query_create_dataset_tab")
+        exec_sql(conn, params.get("statystyki_faktur"), "statystyki_faktur")
+
+        conn.commit()
+
+        # ============================================================
+        # 3. Widoki bazowe – tylko jeśli ich tabele źródłowe już istnieją
+        #    (na dziś najpewniej jeszcze nie istnieją na pustej DB)
+        # ============================================================
+        raw_tables = ["invo", "debc", "clhs", "dcmo"]
+        raw_ready = all(table_exists(cursor, t) for t in raw_tables)
+
+        if raw_ready:
+            exec_sql(conn, params.get("query_create_invo_view"), "query_create_invo_view")
+            exec_sql(conn, params.get("query_create_clhs_view"), "query_create_clhs_view")
+            exec_sql(conn, params.get("query_create_DEBC_view"), "query_create_DEBC_view")
+            exec_sql(conn, params.get("query_create_dcmo_view"), "query_create_dcmo_view")
+            exec_sql(conn, params.get("query_create_INVO_CLHS_JOINED"), "query_create_INVO_CLHS_JOINED")
+            exec_sql(conn, params.get("query_create_summary_client_days_view"), "query_create_summary_client_days_view")
+            conn.commit()
+        else:
+            print(
+                "[WARN] Pomijam tworzenie widoków bazowych, bo brakuje tabel RAW: "
+                "invo / debc / clhs / dcmo."
+            )
+
+        # ============================================================
+        # 4. Tabele pośrednie oparte o widoki – tylko jeśli widoki istnieją
+        # ============================================================
+        create_table_from_view_schema(cursor, "INVO_CLHS_JOINED", "INVO_CLHS_JOINED_TAB")
+        conn.commit()
+
+        # ============================================================
+        # 5. Indeksy na znanych tabelach
+        # ============================================================
+        index_definitions = {
+            "invo": ["INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO"],
+            "debc": ["DEBC_NO", "DEBC_DEBH", "DEBC_ADMNO", "DEBC_CLNTNO", "DEBC_REINSURANCENUMBER"],
+            "clhs": ["CLHS_NO", "CLHS_DEBC_NO", "CLHS_DEBH_NO", "CLHS_ADMNO", "CLHS_CLNTNO", "CLHS_DATCHANGED", "CLHS_TIMCHANGED"],
+            "dcmo": ["DCMO_DEBC_NO", "DCMO_YEAR", "DCMO_MONTH"],
+            "group_cust_inv_days": ["INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "INVO_DEBC_NO", "DZIEN", "MIESIAC", "ROK"],
+            "grouped_client_days": ["INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "INVO_DEBC_NO", "DZIEN", "MIESIAC", "ROK"],
+            "INVO_CLHS_JOINED_TAB": ["INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "INVO_DEBC_NO", "CLHS_NEXT_CHANGED_DATETIME", "CLHS_CHANGED_DATETIME", "CLHS_LIMITOLD", "CLHS_LIMITNEW"],
+        }
+        create_indexes(index_definitions, conn)
+
+        # indeksy jawnie z configu: idx_*
+        for key, sql in params.items():
+            if not key.startswith("idx_"):
+                continue
+            try:
+                exec_sql(conn, sql, key)
+            except RuntimeError as e:
+                print(f"[WARN] Pomijam {key}: {e}")
+
+        # kilka jawnych indeksów, jeśli tabele istnieją
+        if table_exists(cursor, "dataset"):
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dataset_inv_day ON dataset (INVO_NO, INVO_CLNTNO, DZIEN DESC);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dataset_clear ON dataset (INVO_CLNTNO, INVO_FINALPAYMENTDATE);")
+
+        if table_exists(cursor, "summary_client_days_tab"):
+            cursor.execute("CREATE INDEX IF NOT EXISTS summary_client_days_tab_idx_one_for_all ON summary_client_days_tab (ROK, MIESIAC);")
+
+        if table_exists(cursor, "group_cust_inv_days"):
+            cursor.execute("CREATE INDEX IF NOT EXISTS group_cust_inv_days_idx_year_month ON group_cust_inv_days (ROK, MIESIAC);")
+
+        if table_exists(cursor, "invo"):
+            cursor.execute("CREATE INDEX IF NOT EXISTS invo_idx_one_for_all ON invo (INVO_ADMNO, INVO_DEBH_NO, INVO_DEBC_NO, INVO_INVDATE);")
+
+        conn.commit()
+
+        print(f"[OK] Database schema initialized: {args.db_path}")
+
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
+
+
+⸻
+
+Co ten init robi dobrze teraz
+
+✅ Naprawione
+	•	brak DROP
+	•	cursor ujednolicony
+	•	get_columns zdefiniowane
+	•	martwy kod usunięty
+	•	fail, jeśli plik DB już istnieje
+	•	kolejność sensowna:
+	•	tabele
+	•	widoki tylko jeśli są źródła
+	•	indeksy tylko jeśli są tabele
+
+⚠️ Świadomie jeszcze niepełne
+
+Ten init nie tworzy jeszcze wszystkiego, bo nie znamy jeszcze wszystkich statycznych definicji:
+	•	RAW tables: invo, debc, clhs, dcmo
+	•	dynamicznie materializowanych tabel pośrednich:
+	•	grouped_client_days
+	•	extended_grouped_client_days_tab
 	•	dataset
+	•	potencjalnie inne
+
+To jest OK na ten krok.
+
+⸻
+
+B. Tabele budowane dynamicznie w CreateDatabase
+
+Poniżej lista obiektów, które wciąż są budowane dynamicznie albo materializowane z danych.
+
+1. Tabele RAW tworzone pośrednio przez to_sql
+
+Te nie mają dziś jawnych CREATE TABLE w kodzie init:
 	•	invo
 	•	debc
 	•	clhs
 	•	dcmo
 
-Jeśli te tabele nie istnieją w momencie wywołania cursor.execute(...), to init się wywali.
+One są dziś tworzone przez:
 
-❌ Błąd
+df_invo.to_sql('invo', conn, if_exists='append', index=False)
+df_debc.to_sql('debc', conn, if_exists='append', index=False)
+df_clhs.to_sql('clhs', conn, if_exists='append', index=False)
+df_dcmo.to_sql('dcmo', conn, if_exists='append', index=False)
 
-Tworzysz widoki zależne od tabel RAW (invo, debc, clhs, dcmo), ale db_init ich sam nie tworzy.
-To oznacza, że:
-	•	albo db_init musi być uruchamiany po loaderze RAW
-	•	albo trzeba stworzyć puste RAW tables w init
-	•	albo rozdzielić init na dwa etapy:
-	•	schema base
-	•	derived/views
-
-✅ OK
-
-Samo założenie, że część struktur dynamicznych zostaje poza init, jest sensowne.
-
-⸻
-
-3. Porównanie PRZED vs PO
-
-✅ Przeniesione poprawnie
-
-Ze starego CreateDatabase do db_init trafiła logika stricte schematyczna dla:
-	•	części CREATE TABLE
-	•	części CREATE VIEW
-	•	części CREATE INDEX
-
-⚠️ Niepełne przeniesienie
-
-W starym kodzie były jeszcze tworzone lub przygotowywane:
-	•	aggregated_data_temp — w init częściowo, ale z błędem implementacyjnym
+2. Tabele materializowane z widoków / agregacji
 	•	INVO_CLHS_JOINED_TAB
-	•	extended_grouped_client_days_tab
 	•	grouped_client_days
+	•	extended_grouped_client_days_tab
+	•	dataset
+	•	w wariancie CreateOneDbForAll: dataset w bazie CashPredictorT_ALL.db
+
+3. Tabele statyczne, które już masz bliżej init
+	•	group_cust_inv_days
 	•	summary_client_days_tab
 	•	dataset_tab
-	•	indeksy dla wielu tabel pośrednich
-
-Nie wszystko zostało poprawnie i spójnie przeniesione.
-
-❌ Utracone / niespójne
-
-W nowym CreateDatabase usunąłeś część CREATE TABLE / INDEX / VIEW, ale nie wszystko zostało bezpiecznie zastąpione przez db_init.
-
-Największe luki:
-	•	brak pewności istnienia RAW tables przed tworzeniem widoków
-	•	indeksy na tabelach tworzonych dynamicznie nadal częściowo są poza init
-	•	aggregated_data_temp w db_init jest zrobione błędnie
+	•	statystyki_faktur
+	•	aggregated_data_temp
 
 ⸻
 
-4. Granica odpowiedzialności
+C. Jakie selekty odpalić w SQLite, żeby wyciągnąć schematy
 
-✅ OK
+To jest teraz najważniejsze, żebyśmy w następnym kroku mogli dopisać brakujące CREATE TABLE do configa / init.
 
-Kierunek jest dobry:
-	•	db_init ma być od schematu
-	•	CreateDatabase ma ładować dane i robić przetwarzanie
+1. Pełna definicja CREATE TABLE / CREATE VIEW
 
-⚠️ Ryzyko
+Dla każdej tabeli lub widoku:
 
-db_init nadal zawiera trochę logiki, która nie jest czystą inicjalizacją schematu, tylko miesza bootstrap z późniejszą strukturą derived runtime.
+SELECT type, name, sql
+FROM sqlite_master
+WHERE name = 'invo';
 
-❌ Błąd
-
-CreateDatabase nadal zawiera sporo DDL, więc granica nie jest jeszcze czysta.
-
-W nowym CreateDatabase nadal masz m.in.:
-	•	DROP VIEW IF EXISTS extended_grouped_client_days
-	•	CREATE VIEW extended_grouped_client_days
-	•	create_table_from_view(...)
-	•	DROP VIEW IF EXISTS summary_client_days_view
-	•	inserty do tabel pośrednich wymagające istnienia obiektów schematu
-	•	dynamiczne budowanie dataset
-
-To nie jest jeszcze “tylko loader danych”.
-
-Wniosek
-	•	db_init przejął część odpowiedzialności
-	•	CreateDatabase nadal miesza:
-	•	loading danych
-	•	transformacje
-	•	dynamiczny schema materialization
-
-To jest akceptowalne jako etap przejściowy, ale jeszcze nie jest czysto rozdzielone.
-
-⸻
-
-5. Indeksy
-
-✅ OK
-
-Duża część kluczowych indeksów została zachowana:
-	•	po kluczach joinów
-	•	po (ROK, MIESIAC)
-	•	po (INVO_NO, DZIEN)
-	•	po kluczach CLHS
-	•	po summary_client_days_tab
-	•	po group_cust_inv_days
-
-⚠️ Ryzyko
-
-Masz potencjalne duplikaty / nakładanie się indeksów:
-	•	np. osobne indeksy na pojedynczych kolumnach i dodatkowo indeksy złożone na tych samych tabelach
-	•	część tworzona przez create_indexes(...), część ręcznie przez cursor.execute(...)
-
-To może być OK, ale wymaga przeglądu pod wydajność i koszt insertów.
-
-⚠️ Ryzyko
-
-Niektóre indeksy są tworzone na tabelach, których może jeszcze nie być.
-
-✅ Spójność logiczna
-
-Większość kluczy indeksów odpowiada realnym:
-	•	JOIN
-	•	WHERE
-	•	GROUP BY
-	•	filtrom po dacie / client_id
-
-To jest sensowne.
-
-⸻
-
-6. Gotowość produkcyjna
-
-❌ Błąd
-
-W obecnej postaci db_init.py nie jest w pełni idempotentny.
-
-Powody:
-	•	są DROP TABLE w części dynamicznej poza init, ale sam init nie jest jeszcze bezpieczny dla ponownych uruchomień na niepełnej bazie
-	•	tworzy indeksy i widoki zależne od tabel, które mogą nie istnieć
-	•	ma literówki / błędy zmiennych
-
-❌ Błąd techniczny
-
-W db_init.py używasz cursor, ale tworzysz cur:
-
-cur = conn.cursor()
-cursor.execute(...)
-
-To się wywali od razu.
-
-❌ Błąd techniczny
-
-Brakuje funkcji używanej w db_init.py:
-	•	get_columns(...)
-
-Jest używana, ale nie została zdefiniowana w tym pliku.
-
-⚠️ Ryzyko
-
-Do Azure Pipelines / CI to jeszcze nie jest gotowe, dopóki:
-	•	init nie będzie deterministyczny
-	•	nie będzie wiadomo, czy ma działać na pustej DB czy na DB po RAW load
-	•	nie usuniesz zależności od obiektów nieistniejących jeszcze w momencie bootstrapu
-
-Wniosek
-
-Na dziś:
-	•	jednorazowy bootstrap: ⚠️ częściowo
-	•	odbudowa po awarii: ❌ jeszcze niepewna
-	•	CI / Azure Pipelines: ❌ jeszcze nie
-
-⸻
-
-7. Ryzyka i rekomendacje
-
-❌ Krytyczne błędy do poprawy teraz
-	1.	cursor vs cur
-	•	init się wywali natychmiast
-	2.	brak get_columns() w db_init.py
-	•	init się wywali przy tworzeniu INVO_CLHS_JOINED_TAB
-	3.	tworzenie indeksów / widoków przed istnieniem tabel RAW
-	•	init nie jest bezpieczny na pustej bazie
-	4.	martwe pseudo-deklaracje
-	•	typu:
-
-query_create_invo_clhs_joined_tab: """ ... """
-
-do usunięcia
-
-⚠️ Ważne ryzyka architektoniczne
-	1.	db_init próbuje tworzyć obiekty zależne od danych i obiektów dynamicznych
-	2.	CreateDatabase nadal robi dużo DDL
-	3.	brak jasnego podziału:
-	•	base schema
-	•	derived schema
-	•	runtime materialized tables
-
-⸻
-
-Co zostało świadomie poza init i to NIE jest błąd
-
-To są obiekty dynamiczne / materializowane z danych i sensownie mogą zostać poza db_init na tym etapie:
-	•	dataset
+Podmień nazwę na kolejne obiekty:
+	•	invo
+	•	debc
+	•	clhs
+	•	dcmo
+	•	grouped_client_days
+	•	INVO_CLHS_JOINED_TAB
 	•	extended_grouped_client_days_tab
-	•	summary_client_days_tab w sensie zasilania danymi
-	•	grouped_client_days w sensie materializacji z agregacji
-	•	INVO_CLHS_JOINED_TAB jeśli ma zależeć od aktualnych kolumn widoku
-	•	aggregated_data_temp w sensie zasilania wierszami dat
-	•	wszystkie INSERT INTO ... SELECT ...
-	•	tworzenie stats_pivot_view / dataset_raw_view per shard
+	•	dataset
+	•	dataset_tab
+	•	group_cust_inv_days
+	•	summary_client_days_tab
+	•	statystyki_faktur
+	•	aggregated_data_temp
 
-To jest OK jako etap przejściowy.
+2. Kolumny tabeli
+
+Jeśli sql ze sqlite_master będzie nieczytelne albo chcesz czysty układ kolumn:
+
+PRAGMA table_info(invo);
+
+Podmień nazwę tabeli.
+
+3. Lista indeksów dla tabeli
+
+PRAGMA index_list(invo);
+
+A potem dla każdego indeksu:
+
+PRAGMA index_info(nazwa_indeksu);
+
+4. Wszystkie CREATE TABLE naraz
+
+To najwygodniejsze do zebrania hurtowo:
+
+SELECT name, sql
+FROM sqlite_master
+WHERE type = 'table'
+ORDER BY name;
+
+5. Wszystkie CREATE VIEW naraz
+
+SELECT name, sql
+FROM sqlite_master
+WHERE type = 'view'
+ORDER BY name;
+
+6. Wszystkie indeksy naraz
+
+SELECT name, tbl_name, sql
+FROM sqlite_master
+WHERE type = 'index'
+ORDER BY tbl_name, name;
+
 
 ⸻
 
-Rekomendowany docelowy podział
+D. Co masz mi podesłać w następnym kroku
 
-Etap teraz
+Najlepiej odpal i wklej wyniki dla tych tabel:
 
-Podziel jasno na 3 warstwy:
+priorytet 1
+	•	invo
+	•	debc
+	•	clhs
+	•	dcmo
 
-1. db_init_base.py
-Tworzy tylko:
-	•	RAW tables
-	•	stałe helper tables
-	•	stałe indeksy RAW
-	•	ewentualnie puste output tables
+priorytet 2
+	•	grouped_client_days
+	•	INVO_CLHS_JOINED_TAB
+	•	extended_grouped_client_days_tab
+	•	dataset
 
-2. db_init_views.py
-Tworzy tylko:
-	•	widoki bazowe
-	•	widoki pochodne niezależne od danych runtime
+czyli:
 
-3. CreateDatabase/load_client
-Robi:
-	•	inserty danych
-	•	materializacje tabel pośrednich
-	•	batchowe przeliczenia
-	•	budowę dataset
+SELECT name, sql
+FROM sqlite_master
+WHERE type = 'table'
+AND name IN (
+  'invo',
+  'debc',
+  'clhs',
+  'dcmo',
+  'grouped_client_days',
+  'INVO_CLHS_JOINED_TAB',
+  'extended_grouped_client_days_tab',
+  'dataset'
+)
+ORDER BY name;
 
-To będzie dużo czystsze.
+Jak mi to podasz, to w następnym kroku dam Ci:
+	•	brakujące CREATE TABLE do configa albo do init,
+	•	oraz wskażę dokładnie, co jeszcze wyciąć z CreateDatabase, żeby został tam tylko load + insert + materializacja danych.
 
 ⸻
 
-Finalny werdykt
+E. Co jeszcze wyciąć później z CreateDatabase
 
-1. Kompletność schematu
+Po dodaniu brakujących schematów do init, docelowo z CreateDatabase powinny zniknąć:
+	•	wszystkie CREATE TABLE
+	•	wszystkie CREATE VIEW
+	•	wszystkie CREATE INDEX
 
-⚠️ Ryzyko
-Część schematu jest przeniesiona, ale nie wszystko jest spójne i bezpieczne.
+Powinny zostać tylko:
+	•	wczytanie Excela
+	•	filtrowanie danych
+	•	INSERT INTO ...
+	•	INSERT INTO ... SELECT ...
+	•	ewentualnie materializacja tabel pośrednich, jeśli jeszcze na tym etapie tego nie przenosimy
 
-2. Kolejność inicjalizacji
+⸻
 
-❌ Błąd
-Są zależności od obiektów, które mogą jeszcze nie istnieć.
+Najkrócej
 
-3. PRZED vs PO
+Teraz:
+	•	wklej poprawiony db_init.py powyżej
+	•	odpal zapytania do wyciągnięcia schematów brakujących tabel
 
-⚠️ Ryzyko
-Refaktor idzie w dobrą stronę, ale część elementów została przeniesiona niepełnie.
+Potem:
+	•	wklej mi wynik dla:
+	•	invo
+	•	debc
+	•	clhs
+	•	dcmo
+	•	grouped_client_days
+	•	INVO_CLHS_JOINED_TAB
+	•	extended_grouped_client_days_tab
+	•	dataset
 
-4. Granica odpowiedzialności
-
-⚠️ Ryzyko
-Lepsza niż wcześniej, ale nadal nieczysta.
-
-5. Indeksy
-
-⚠️ Ryzyko
-Dużo ważnych indeksów jest, ale są możliwe duplikaty i problemy z kolejnością tworzenia.
-
-6. Gotowość produkcyjna
-
-❌ Błąd
-W obecnej formie db_init.py nie jest jeszcze gotowy na bootstrap/CI.
-
-7. Kierunek architektoniczny
-
-✅ OK
-Sam pomysł wydzielenia db_init jest bardzo dobry i warto go kontynuować.
-
-Najkrócej: architektonicznie dobry kierunek, implementacyjnie jeszcze niegotowe.
+i na tej podstawie dam Ci następny, już bardziej docelowy krok.
