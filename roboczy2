@@ -1,270 +1,331 @@
-faktycznie extended_grouped_client_days jest ucięty, jak pobrać pełną definicję widoku z sqllite żeby dodać ją do configa?
+Tak — pełną definicję widoku najpewniej pobierzesz z sqlite_master, nie z .schema.
 
-poniżej aktualny init po dodaniu wszystkich skryptów do configa i użycia ich w init:
-# db_init.py
-import argparse
-import os
+Jak pobrać pełny SQL widoku z SQLite
+
+SQL
+
+SELECT sql
+FROM sqlite_master
+WHERE type = 'view'
+  AND name = 'extended_grouped_client_days';
+
+Dla wszystkich widoków
+
+SELECT name, sql
+FROM sqlite_master
+WHERE type = 'view'
+ORDER BY name;
+
+W Pythonie
+
 import sqlite3
-import sys
-import yaml
+
+conn = sqlite3.connect(r"C:\sciezka\do\bazy.db")
+cur = conn.cursor()
+
+cur.execute("""
+    SELECT sql
+    FROM sqlite_master
+    WHERE type = 'view' AND name = ?
+""", ("extended_grouped_client_days",))
+
+row = cur.fetchone()
+print(row[0] if row else "Brak widoku")
+conn.close()
 
 
-def load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+⸻
 
+Ocena obecnego init
 
-def exec_sql(conn: sqlite3.Connection, sql: str | None, label: str = "") -> None:
-    if not sql:
-        return
-    try:
-        conn.executescript(sql)
-    except sqlite3.Error as e:
-        raise RuntimeError(f"Błąd podczas wykonywania SQL [{label}]: {e}") from e
+Co jest OK
 
+Masz już utworzenie tabel:
+	•	invo
+	•	debc
+	•	clhs
+	•	dcmo
+	•	group_cust_inv_days
+	•	grouped_client_days
+	•	INVO_CLHS_JOINED_TAB
+	•	extended_grouped_client_days_tab
+	•	dataset_tab
+	•	dataset
+	•	summary_client_days_tab
+	•	statystyki_faktur
+	•	aggregated_data_temp
 
-def table_exists(cursor: sqlite3.Cursor, table_name: str) -> bool:
-    cursor.execute(
-        """
-        SELECT 1
-        FROM sqlite_master
-        WHERE type = 'table' AND name = ?
-        LIMIT 1
-        """,
-        (table_name,),
-    )
-    return cursor.fetchone() is not None
+czyli z tabel z Twojej listy nic istotnego nie brakuje.
 
+⸻
 
-def view_exists(cursor: sqlite3.Cursor, view_name: str) -> bool:
-    cursor.execute(
-        """
-        SELECT 1
-        FROM sqlite_master
-        WHERE type = 'view' AND name = ?
-        LIMIT 1
-        """,
-        (view_name,),
-    )
-    return cursor.fetchone() is not None
+Co trzeba poprawić w samym init
 
+Masz jeszcze kilka błędów / śmieci:
 
-def get_columns(cursor: sqlite3.Cursor, view_name: str):
-    cursor.execute(f"PRAGMA table_info({view_name});")
-    return [(col[1], col[2]) for col in cursor.fetchall()]
+1. Błąd w create_aggregated_data_temp_schema
 
+Masz użycie params, ale funkcja go nie dostaje.
 
-def get_columns_from_view(cursor: sqlite3.Cursor, view_name: str):
-    cursor.execute(f"PRAGMA table_info({view_name});")
-    return [col[1] for col in cursor.fetchall()]
-
-
-def create_indexes(index_definitions: dict[str, list[str]], conn: sqlite3.Connection) -> None:
-    cursor = conn.cursor()
-
-    for table_name, columns in index_definitions.items():
-        if not table_exists(cursor, table_name):
-            print(f"[WARN] Pomijam indeksy dla '{table_name}' – tabela jeszcze nie istnieje.")
-            continue
-
-        for column in columns:
-            index_name = f"{table_name}_{column}_idx"
-            sql_query = f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} ({column});"
-            cursor.execute(sql_query)
-
-    conn.commit()
-
+było
 
 def create_aggregated_data_temp_schema(cursor: sqlite3.Cursor) -> None:
+    cursor.execute(params.get("query_aggregated_data_temp"))
+
+ma być
+
+def create_aggregated_data_temp_schema(cursor: sqlite3.Cursor, params: dict) -> None:
     cursor.execute(params.get("query_aggregated_data_temp"))
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_ag_day
         ON aggregated_data_temp (DZIEN);
     """)
 
+i wywołanie:
 
-def main():
-    parser = argparse.ArgumentParser(description="SQLite DB schema initialization")
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--db-path", required=True)
-    args = parser.parse_args()
+create_aggregated_data_temp_schema(cursor, params)
 
-    # 1. Fail, jeśli DB już istnieje
-    if os.path.exists(args.db_path):
-        print(f"[ERROR] Baza już istnieje: {args.db_path}")
-        sys.exit(1)
 
-    os.makedirs(os.path.dirname(args.db_path), exist_ok=True)
+⸻
 
-    cfg = load_config(args.config)
-    params = cfg["first_model_params"]
+2. Masz duplikaty exec_sql(...)
 
-    conn = sqlite3.connect(args.db_path)
-    cursor = conn.cursor()
+Usuń powtórzenia:
 
+do usunięcia
+
+exec_sql(conn, params.get("statystyki_faktur"), "statystyki_faktur")
+exec_sql(conn, params.get("query_swieta"), "query_swieta")
+
+bo już były wyżej.
+
+I w sekcji widoków masz podwójne:
+
+exec_sql(conn, params.get("query_create_invo_view"), ...)
+exec_sql(conn, params.get("query_create_clhs_view"), ...)
+exec_sql(conn, params.get("query_create_DEBC_view"), ...)
+exec_sql(conn, params.get("query_create_dcmo_view"), ...)
+exec_sql(conn, params.get("query_create_INVO_CLHS_JOINED"), ...)
+
+to też zostaw tylko raz.
+
+⸻
+
+Czy masz wszystkie indeksy?
+
+Jednokolumnowe
+
+Tak, z create_indexes(...) pokrywasz:
+	•	invo
+	•	debc
+	•	clhs
+	•	dcmo
+	•	group_cust_inv_days
+	•	grouped_client_days
+	•	INVO_CLHS_JOINED_TAB
+
+czyli te z listy typu:
+	•	invo_INVO_NO_idx
+	•	debc_DEBC_NO_idx
+	•	clhs_CLHS_NO_idx
+	•	dcmo_DCMO_YEAR_idx
+	•	itd.
+
+są pokryte.
+
+⸻
+
+Czego na pewno nie widzę jawnie w init
+
+To są indeksy wielokolumnowe, które muszą być w config jako idx_* albo jawnie dopisane.
+
+Dodaj do config.yaml te klucze, jeśli ich jeszcze nie masz
+
+idx_clhs_joined_keys_datetime: |
+  CREATE INDEX IF NOT EXISTS idx_clhs_joined_keys_datetime
+  ON INVO_CLHS_JOINED_TAB (
+    CLHS_CHANGED_DATETIME,
+    INVO_ADMNO,
+    INVO_CLNTNO,
+    INVO_DEBC_NO,
+    INVO_DEBH_NO,
+    INVO_NO
+  );
+
+idx_ext_days_ids_dzien: |
+  CREATE INDEX IF NOT EXISTS idx_ext_days_ids_dzien
+  ON extended_grouped_client_days_tab (
+    DZIEN,
+    INVO_ADMNO,
+    INVO_CLNTNO,
+    INVO_DEBC_NO,
+    INVO_DEBH_NO
+  );
+
+group_cust_inv_days_idx_one_for_all: |
+  CREATE INDEX IF NOT EXISTS group_cust_inv_days_idx_one_for_all
+  ON group_cust_inv_days (
+    DZIEN,
+    INVO_ADMNO,
+    INVO_CLNTNO,
+    INVO_DEBC_NO,
+    INVO_DEBH_NO
+  );
+
+idx_invo_debcno_invdate: |
+  CREATE INDEX IF NOT EXISTS idx_invo_debcno_invdate
+  ON invo (
+    INVO_DEBC_NO,
+    INVO_INVDATE
+  );
+
+idx_invo_debcno_invdate_etc: |
+  CREATE INDEX IF NOT EXISTS idx_invo_debcno_invdate_etc
+  ON invo (
+    INVO_ADMNO,
+    INVO_CLNTNO,
+    INVO_DEBC_NO,
+    INVO_DEBH_NO,
+    INVO_INVDATE
+  );
+
+idx_statystyki_keys_day_param_scen: |
+  CREATE INDEX IF NOT EXISTS idx_statystyki_keys_day_param_scen
+  ON statystyki_faktur (
+    DZIEN,
+    INVO_ADMNO,
+    INVO_CLNTNO,
+    INVO_DEBC_NO,
+    INVO_DEBH_NO,
+    PARAM_Z_ILU_DNI,
+    SCENARIUSZ
+  );
+
+statystyki_faktur_idx_one_for_all: |
+  CREATE INDEX IF NOT EXISTS statystyki_faktur_idx_one_for_all
+  ON statystyki_faktur (
+    DZIEN,
+    INVO_ADMNO,
+    INVO_CLNTNO,
+    INVO_DEBC_NO,
+    INVO_DEBH_NO,
+    PARAM_Z_ILU_DNI,
+    SCENARIUSZ
+  );
+
+idx_summary_days_ids_dzien: |
+  CREATE INDEX IF NOT EXISTS idx_summary_days_ids_dzien
+  ON summary_client_days_tab (
+    DZIEN,
+    INVO_CLNTNO,
+    INVO_DEBC_NO,
+    INVO_DEBH_NO
+  );
+
+
+⸻
+
+Czy trzeba coś dodać do init
+
+Nie musisz dodawać osobnych wywołań, bo już masz pętlę:
+
+for key, sql in params.items():
+    if not key.startswith("idx_"):
+        continue
     try:
-        # ============================================================
-        # 2. Tabele statyczne / deterministyczne
-        # ============================================================
-        create_aggregated_data_temp_schema(cursor)
+        exec_sql(conn, sql, key)
+    except RuntimeError as e:
+        print(f"[WARN] Pomijam {key}: {e}")
 
-        exec_sql(conn, params.get("query_swieta"), "query_swieta")
-        exec_sql(conn, params.get("query_create_group_cust_inv_days"), "query_create_group_cust_inv_days")
-        exec_sql(conn, params.get("query_create_summary_client_days_tab2"), "query_create_summary_client_days_tab2")
-        exec_sql(conn, params.get("query_create_dataset_tab"), "query_create_dataset_tab")
-        exec_sql(conn, params.get("statystyki_faktur"), "statystyki_faktur")
+Ale uwaga:
 
-        exec_sql(conn, params.get("query_create_invo_table"), "query_create_invo_table")
-        exec_sql(conn, params.get("query_create_debc_table"), "query_create_debc_table")
-        exec_sql(conn, params.get("query_create_clhs_table"), "query_create_clhs_table")
-        exec_sql(conn, params.get("query_create_dcmo_table"), "query_create_dcmo_table")
-        
-        exec_sql(conn, params.get("query_create_grouped_client_days_table"), "query_create_grouped_client_days_table")
-        exec_sql(conn, params.get("query_create_dataset"), "query_create_dataset")
-        exec_sql(conn, params.get("query_create_invo_clhs_joined_tab_table"), "query_create_invo_clhs_joined_tab_table")
-        exec_sql(conn, params.get("query_create_extended_grouped_client_days_tab_table"), "query_create_extended_grouped_client_days_tab_table")
-        exec_sql(conn, params.get("statystyki_faktur"), "statystyki_faktur")
-        exec_sql(conn, params.get("query_swieta"), "query_swieta")        
+ta pętla złapie tylko klucze zaczynające się od idx_.
 
-        conn.commit()
+A z Twojej listy dwa klucze, które podałem wyżej, nie zaczynają się od idx_:
+	•	group_cust_inv_days_idx_one_for_all
+	•	statystyki_faktur_idx_one_for_all
 
-        # ============================================================
-        # 3. Widoki bazowe – tylko jeśli ich tabele źródłowe już istnieją
-        #    (na dziś najpewniej jeszcze nie istnieją na pustej DB)
-        # ============================================================
-        raw_tables = ["invo", "debc", "clhs", "dcmo"]
-        raw_ready = all(table_exists(cursor, t) for t in raw_tables)
+Masz więc 2 opcje.
 
-        if raw_ready:
-            exec_sql(conn, params.get("query_create_invo_view"), "query_create_invo_view")
-            exec_sql(conn, params.get("query_create_clhs_view"), "query_create_clhs_view")
-            exec_sql(conn, params.get("query_create_DEBC_view"), "query_create_DEBC_view")
-            exec_sql(conn, params.get("query_create_dcmo_view"), "query_create_dcmo_view")
-            exec_sql(conn, params.get("query_create_INVO_CLHS_JOINED"), "query_create_INVO_CLHS_JOINED")
-            exec_sql(conn, params.get("query_create_summary_client_days_view"), "query_create_summary_client_days_view")
-            exec_sql(conn, params.get("query_create_invo_view"), "query_create_invo_view")
-            exec_sql(conn, params.get("query_create_clhs_view"), "query_create_clhs_view")
-            exec_sql(conn, params.get("query_create_DEBC_view"), "query_create_DEBC_view")
-            exec_sql(conn, params.get("query_create_dcmo_view"), "query_create_dcmo_view")
-            exec_sql(conn, params.get("query_create_INVO_CLHS_JOINED"), "query_create_INVO_CLHS_JOINED")
-            exec_sql(conn, params.get("query_create_extended_grouped_client_days_view"), "query_create_extended_grouped_client_days_view")
-            exec_sql(conn, params.get("query_create_summary_client_days_view"), "query_create_summary_client_days_view")            
-            conn.commit()
-        else:
-            print(
-                "[WARN] Pomijam tworzenie widoków bazowych, bo brakuje tabel RAW: "
-                "invo / debc / clhs / dcmo."
-            )
+Lepsza opcja: zmień nazwy kluczy w configu na:
 
+idx_group_cust_inv_days_one_for_all: |
+  CREATE INDEX IF NOT EXISTS group_cust_inv_days_idx_one_for_all
+  ON group_cust_inv_days (
+    DZIEN,
+    INVO_ADMNO,
+    INVO_CLNTNO,
+    INVO_DEBC_NO,
+    INVO_DEBH_NO
+  );
 
-        # ============================================================
-        # 5. Indeksy na znanych tabelach
-        # ============================================================
-        index_definitions = {
-            "invo": ["INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO"],
-            "debc": ["DEBC_NO", "DEBC_DEBH", "DEBC_ADMNO", "DEBC_CLNTNO", "DEBC_REINSURANCENUMBER"],
-            "clhs": ["CLHS_NO", "CLHS_DEBC_NO", "CLHS_DEBH_NO", "CLHS_ADMNO", "CLHS_CLNTNO", "CLHS_DATCHANGED", "CLHS_TIMCHANGED"],
-            "dcmo": ["DCMO_DEBC_NO", "DCMO_YEAR", "DCMO_MONTH"],
-            "group_cust_inv_days": ["INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "INVO_DEBC_NO", "DZIEN", "MIESIAC", "ROK"],
-            "grouped_client_days": ["INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "INVO_DEBC_NO", "DZIEN", "MIESIAC", "ROK"],
-            "INVO_CLHS_JOINED_TAB": ["INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "INVO_DEBC_NO", "CLHS_NEXT_CHANGED_DATETIME", "CLHS_CHANGED_DATETIME", "CLHS_LIMITOLD", "CLHS_LIMITNEW"],
-        }
-        create_indexes(index_definitions, conn)
+idx_statystyki_faktur_one_for_all: |
+  CREATE INDEX IF NOT EXISTS statystyki_faktur_idx_one_for_all
+  ON statystyki_faktur (
+    DZIEN,
+    INVO_ADMNO,
+    INVO_CLNTNO,
+    INVO_DEBC_NO,
+    INVO_DEBH_NO,
+    PARAM_Z_ILU_DNI,
+    SCENARIUSZ
+  );
 
-        # indeksy jawnie z configu: idx_*
-        for key, sql in params.items():
-            if not key.startswith("idx_"):
-                continue
-            try:
-                exec_sql(conn, sql, key)
-            except RuntimeError as e:
-                print(f"[WARN] Pomijam {key}: {e}")
+Wtedy obecny init je złapie bez zmian.
 
-        # kilka jawnych indeksów, jeśli tabele istnieją
-        if table_exists(cursor, "dataset"):
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dataset_inv_day ON dataset (INVO_NO, INVO_CLNTNO, DZIEN DESC);")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dataset_clear ON dataset (INVO_CLNTNO, INVO_FINALPAYMENTDATE);")
+⸻
 
-        if table_exists(cursor, "summary_client_days_tab"):
-            cursor.execute("CREATE INDEX IF NOT EXISTS summary_client_days_tab_idx_one_for_all ON summary_client_days_tab (ROK, MIESIAC);")
+Minimalna lista braków do domknięcia
 
-        if table_exists(cursor, "group_cust_inv_days"):
-            cursor.execute("CREATE INDEX IF NOT EXISTS group_cust_inv_days_idx_year_month ON group_cust_inv_days (ROK, MIESIAC);")
+Jeśli tych kluczy jeszcze nie masz w configu, dodaj:
+	•	idx_clhs_joined_keys_datetime
+	•	idx_ext_days_ids_dzien
+	•	idx_group_cust_inv_days_one_for_all
+	•	idx_invo_debcno_invdate
+	•	idx_invo_debcno_invdate_etc
+	•	idx_statystyki_keys_day_param_scen
+	•	idx_statystyki_faktur_one_for_all
+	•	idx_summary_days_ids_dzien
 
-        if table_exists(cursor, "invo"):
-            cursor.execute("CREATE INDEX IF NOT EXISTS invo_idx_one_for_all ON invo (INVO_ADMNO, INVO_DEBH_NO, INVO_DEBC_NO, INVO_INVDATE);")
+⸻
 
-        conn.commit()
+Drobna uwaga o idx_dataset_inv_day
 
-        print(f"[OK] Database schema initialized: {args.db_path}")
+W Twojej liście masz:
+	•	DZIEN, INVO_NO
 
-    finally:
-        conn.close()
+a w init tworzysz:
 
+CREATE INDEX IF NOT EXISTS idx_dataset_inv_day ON dataset (INVO_NO, INVO_CLNTNO, DZIEN DESC);
 
-if __name__ == "__main__":
-    main()
+To nie jest ten sam indeks.
 
+Jeżeli chcesz mieć zgodność z listą, zmień na:
 
-sprawdź czy mamy już wszystkie tabele i indeksy, poniżej masz listę ich wszystkich jakie powinny być:
-tabela	indeks	kolumny
-INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_CLHS_CHANGED_DATETIME_idx	CLHS_CHANGED_DATETIME
-INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_CLHS_LIMITNEW_idx	CLHS_LIMITNEW
-INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_CLHS_LIMITOLD_idx	CLHS_LIMITOLD
-INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_CLHS_NEXT_CHANGED_DATETIME_idx	CLHS_NEXT_CHANGED_DATETIME
-INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_INVO_ADMNO_idx	INVO_ADMNO
-INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_INVO_CLNTNO_idx	INVO_CLNTNO
-INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_INVO_DEBC_NO_idx	INVO_DEBC_NO
-INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_INVO_DEBH_NO_idx	INVO_DEBH_NO
-INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_INVO_NO_idx	INVO_NO
-INVO_CLHS_JOINED_TAB	idx_clhs_joined_keys_datetime	CLHS_CHANGED_DATETIME, INVO_ADMNO, INVO_CLNTNO, INVO_DEBC_NO, INVO_DEBH_NO, INVO_NO
-aggregated_data_temp	idx_ag_day	DZIEN
-clhs	clhs_CLHS_ADMNO_idx	CLHS_ADMNO
-clhs	clhs_CLHS_CLNTNO_idx	CLHS_CLNTNO
-clhs	clhs_CLHS_DATCHANGED_idx	CLHS_DATCHANGED
-clhs	clhs_CLHS_DEBC_NO_idx	CLHS_DEBC_NO
-clhs	clhs_CLHS_DEBH_NO_idx	CLHS_DEBH_NO
-clhs	clhs_CLHS_NO_idx	CLHS_NO
-clhs	clhs_CLHS_TIMCHANGED_idx	CLHS_TIMCHANGED
-dataset	idx_dataset_clear	INVO_FINALPAYMENTDATE
-dataset	idx_dataset_inv_day	DZIEN, INVO_NO
-dataset_tab		
-dcmo	dcmo_DCMO_DEBC_NO_idx	DCMO_DEBC_NO
-dcmo	dcmo_DCMO_MONTH_idx	DCMO_MONTH
-dcmo	dcmo_DCMO_YEAR_idx	DCMO_YEAR
-debc	debc_DEBC_ADMNO_idx	DEBC_ADMNO
-debc	debc_DEBC_CLNTNO_idx	DEBC_CLNTNO
-debc	debc_DEBC_DEBH_idx	DEBC_DEBH
-debc	debc_DEBC_NO_idx	DEBC_NO
-debc	debc_DEBC_REINSURANCENUMBER_idx	DEBC_REINSURANCENUMBER
-extended_grouped_client_days_tab	idx_ext_days_ids_dzien	DZIEN, INVO_ADMNO, INVO_CLNTNO, INVO_DEBC_NO, INVO_DEBH_NO
-group_cust_inv_days	group_cust_inv_days_DZIEN_idx	DZIEN
-group_cust_inv_days	group_cust_inv_days_INVO_ADMNO_idx	INVO_ADMNO
-group_cust_inv_days	group_cust_inv_days_INVO_CLNTNO_idx	INVO_CLNTNO
-group_cust_inv_days	group_cust_inv_days_INVO_DEBC_NO_idx	INVO_DEBC_NO
-group_cust_inv_days	group_cust_inv_days_INVO_DEBH_NO_idx	INVO_DEBH_NO
-group_cust_inv_days	group_cust_inv_days_INVO_NO_idx	INVO_NO
-group_cust_inv_days	group_cust_inv_days_MIESIAC_idx	MIESIAC
-group_cust_inv_days	group_cust_inv_days_ROK_idx	ROK
-group_cust_inv_days	group_cust_inv_days_idx_one_for_all	DZIEN, INVO_ADMNO, INVO_CLNTNO, INVO_DEBC_NO, INVO_DEBH_NO
-group_cust_inv_days	group_cust_inv_days_idx_year_month	MIESIAC, ROK
-grouped_client_days	grouped_client_days_DZIEN_idx	DZIEN
-grouped_client_days	grouped_client_days_INVO_ADMNO_idx	INVO_ADMNO
-grouped_client_days	grouped_client_days_INVO_CLNTNO_idx	INVO_CLNTNO
-grouped_client_days	grouped_client_days_INVO_DEBC_NO_idx	INVO_DEBC_NO
-grouped_client_days	grouped_client_days_INVO_DEBH_NO_idx	INVO_DEBH_NO
-grouped_client_days	grouped_client_days_MIESIAC_idx	MIESIAC
-grouped_client_days	grouped_client_days_ROK_idx	ROK
-invo	idx_invo_debcno_invdate	INVO_DEBC_NO, INVO_INVDATE
-invo	idx_invo_debcno_invdate_etc	INVO_ADMNO, INVO_CLNTNO, INVO_DEBC_NO, INVO_DEBH_NO, INVO_INVDATE
-invo	invo_INVO_ADMNO_idx	INVO_ADMNO
-invo	invo_INVO_CLNTNO_idx	INVO_CLNTNO
-invo	invo_INVO_DEBH_NO_idx	INVO_DEBH_NO
-invo	invo_INVO_NO_idx	INVO_NO
-invo	invo_idx_one_for_all	INVO_ADMNO, INVO_DEBC_NO, INVO_DEBH_NO, INVO_INVDATE
-statystyki_faktur	idx_statystyki_keys_day_param_scen	DZIEN, INVO_ADMNO, INVO_CLNTNO, INVO_DEBC_NO, INVO_DEBH_NO, PARAM_Z_ILU_DNI, SCENARIUSZ
-statystyki_faktur	statystyki_faktur_idx_one_for_all	DZIEN, INVO_ADMNO, INVO_CLNTNO, INVO_DEBC_NO, INVO_DEBH_NO, PARAM_Z_ILU_DNI, SCENARIUSZ
-summary_client_days_tab	idx_summary_days_ids_dzien	DZIEN, INVO_CLNTNO, INVO_DEBC_NO, INVO_DEBH_NO
-summary_client_days_tab	summary_client_days_tab_idx_one_for_all	MIESIAC, ROK
-jeżeli czegoś brakuje w init to podaj mi kod jaki mam dodać do configa aby je utworzyć i podaj mi wywołanie w init
+cursor.execute("""
+    CREATE INDEX IF NOT EXISTS idx_dataset_inv_day
+    ON dataset (DZIEN, INVO_NO);
+""")
 
+albo zaktualizuj listę referencyjną, jeśli nowa wersja jest świadomie lepsza.
+
+⸻
+
+Werdykt
+
+✅ Tabele
+
+Masz już komplet.
+
+⚠️ Indeksy
+
+Jednokolumnowe są praktycznie domknięte, ale wielokolumnowe trzeba dopilnować przez config.
+
+❌ Błędy w init
+
+Masz jeszcze do poprawy:
+	•	params w create_aggregated_data_temp_schema
+	•	duplikaty exec_sql(...)
+	•	niespójność idx_dataset_inv_day względem listy referencyjnej
+
+Jeśli chcesz, w następnym kroku złożę Ci od razu oczyszczoną finalną wersję db_init.py po tych poprawkach.
