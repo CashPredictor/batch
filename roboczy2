@@ -1,31 +1,309 @@
-ma być:
-„całe tworzenie schematu zostało usunięte z CreateDatabase”.
+Tak — skoro chcesz dojść do stanu:
+
+„całe tworzenie schematu zostało usunięte z CreateDatabase”
+
+to trzeba przyjąć bardzo prosty podział ról:
+
+db_init.py
+	•	tworzy pustą bazę,
+	•	tworzy wszystkie tabele,
+	•	tworzy wszystkie widoki,
+	•	tworzy wszystkie indeksy,
+	•	opcjonalnie waliduje kompletność schematu.
+
+CreateDatabase.py
+	•	zakłada, że baza już istnieje i ma kompletny schemat,
+	•	ładuje RAW do istniejących tabel,
+	•	czyści / zasila dane pochodne w istniejących tabelach,
+	•	nie robi żadnego CREATE TABLE,
+	•	nie robi żadnego DROP TABLE,
+	•	nie robi żadnego CREATE VIEW,
+	•	nie robi żadnego DROP VIEW,
+	•	nie buduje definicji widoków z Pythona,
+	•	nie odtwarza schematu „operacyjnie”.
+
+To jest dokładnie to, do czego chcesz dojść.
+
+Odpowiedzi na Twoje konkretne pytania
+
+1. grouped_client_days
+
+Tak — ten fragment:
+
+df.to_sql("grouped_client_days", conn, if_exists="replace", index=False)
+
+w docelowym modelu jest zły, bo replace oznacza de facto:
+	•	drop tabeli,
+	•	create tabeli od nowa,
+	•	insert.
+
+Czyli to jest nadal tworzenie schematu w CreateDatabase, tylko ukryte przez Pandas.
+
+Jeżeli tabela już istnieje z db_init, to tutaj ma być:
+	•	najpierw DELETE FROM grouped_client_days
+	•	potem insert.
+
+Najbezpieczniej tak:
+
+cursor.execute("DELETE FROM grouped_client_days")
+df.to_sql("grouped_client_days", conn, if_exists="append", index=False)
+
+Bo wtedy:
+	•	schemat zostaje,
+	•	tylko ładujesz dane.
+
+To wynika wprost z tego, że db_init już tworzy grouped_client_days przez query_create_grouped_client_days_table.  ￼
+
+2. generate_view_query_complete(dcmo_columns, offsets)
+
+Tak — skoro masz już definicję extended_grouped_client_days w configu i ma ona być tworzona przez db_init, to tego już nie potrzebujesz w CreateDatabase.
+
+Ten kod:
+
+view_query = generate_view_query_complete(dcmo_columns, offsets)
+cursor.execute("DROP VIEW IF EXISTS extended_grouped_client_days;")
+cursor.execute(view_query)
+
+to jest czyste tworzenie schematu po stronie CreateDatabase, więc powinno zniknąć. W aktualnym pliku dokładnie tak to jeszcze działa.  ￼  ￼
+
+Czyli:
+	•	generate_view_query_complete docelowo do usunięcia z CreateDatabase,
+	•	create_table_from_view docelowo do usunięcia z CreateDatabase,
+	•	get_columns_from_view używane tylko do budowania schematu też docelowo zbędne w CreateDatabase.  ￼
+
+3. stats_pivot_view i dataset_raw_view
+
+Analogicznie, ten blok:
+
+pivot_sql = params['query_create_stats_pivot_view'].replace("{shard_condition}", shard_condition)
+raw_sql   = params['query_create_dataset_raw_view'].replace("{shard_condition}", shard_condition)
+
+cursor.execute("DROP VIEW IF EXISTS stats_pivot_view;")
+cursor.execute(pivot_sql)
+
+też jest schematem, nie zasilaniem.
+
+Czyli przy Twojej docelowej zasadzie to również ma wyjść z CreateDatabase.
+
+Tylko tu jest ważne rozróżnienie:
+	•	jeśli stats_pivot_view i dataset_raw_view mają być zwykłymi trwałymi widokami bazy, to muszą być tworzone w db_init;
+	•	jeśli chcesz mieć wersję per-shard, to nie może to być jeden stały globalny widok w bazie w obecnej formie, bo on zależy od runtime parametru shard_condition.
+
+Czyli tu masz do wyboru tylko dwie sensowne ścieżki:
+
+wariant A — pełne usunięcie schematu z CreateDatabase
+	•	stats_pivot_view nie może mieć już {shard_condition},
+	•	dataset_raw_view nie może mieć już {shard_condition},
+	•	oba widoki stają się stałymi definicjami z configa,
+	•	shardowanie robisz na etapie INSERT INTO dataset_tab SELECT ... FROM dataset_raw_view WHERE ....
+
+wariant B — jeśli zostaje {shard_condition}
+	•	to formalnie nadal jest to generowanie schematu w runtime,
+	•	czyli nie spełnia Twojej zasady „całe tworzenie schematu usunięte z CreateDatabase”.
+
+Jeżeli chcesz być konsekwentny, to musisz iść w wariant A.
+
+To zresztą dobrze pasuje do tego, co już sam napisałeś: CreateDatabase ma tylko zasilać istniejące obiekty.
+
+Co jeszcze w CreateDatabase trzeba poprawić
+
+Patrząc funkcjonalnie, trzeba wyciąć z niego wszystko, co robi którąkolwiek z tych rzeczy:
+	•	drop/create tabel,
+	•	drop/create widoków,
+	•	generowanie definicji widoków w Pythonie,
+	•	generowanie definicji tabel na podstawie DataFrame albo widoku,
+	•	to_sql(..., if_exists="replace").
+
+W obecnym CreateDatabase nadal schematowo robią to co najmniej te elementy:
+
+Do usunięcia z CreateDatabase
+	1.	generate_view_query_complete(...)
+	2.	create_table_from_view(...)
+	3.	wszystkie DROP VIEW IF EXISTS ...
+	4.	wszystkie cursor.execute(...) z CREATE VIEW ...
+	5.	wszystkie DROP TABLE IF EXISTS ... dla tabel pochodnych
+	6.	wszystkie CREATE TABLE ... dla tabel pochodnych
+	7.	każde df.to_sql(..., if_exists="replace") dla tabel, które już mają definicję z db_init
+	8.	helpery potrzebne tylko do odtwarzania schematu widok/tabela, jeśli nigdzie indziej nie są używane.  ￼  ￼
+
+Co ma zostać, bo to jest zasilanie
+	1.	ładowanie Excela i obróbka DataFrame RAW
+	2.	DELETE FROM invo/debc/clhs/dcmo przed reloadem RAW
+	3.	to_sql(..., if_exists="append") do RAW
+	4.	DELETE FROM INVO_CLHS_JOINED_TAB + INSERT INTO INVO_CLHS_JOINED_TAB SELECT * FROM INVO_CLHS_JOINED
+	5.	DELETE FROM group_cust_inv_days + executemany/append danych
+	6.	DELETE FROM grouped_client_days + append z DataFrame
+	7.	DELETE FROM extended_grouped_client_days_tab + INSERT INTO ... SELECT * FROM extended_grouped_client_days
+	8.	DELETE FROM summary_client_days_tab + INSERT INTO ... SELECT * FROM summary_client_days_view
+	9.	DELETE FROM statystyki_faktur + liczenie i insert statystyk
+	10.	DELETE FROM dataset_tab + insert danych do dataset_tab
+	11.	DELETE FROM dataset + zasilenie dataset z dataset_tab / przetworzenia.  ￼
+
+Krótko:
+mają zostać tylko operacje DML, nie DDL.
+
+Jak to ugryźć praktycznie
+
+Najprościej wprowadzić zasadę:
+
+Etap 1 — db_init tworzy i waliduje schemat
+
+db_init po utworzeniu bazy powinien sprawdzić, że istnieją wszystkie wymagane obiekty.
+
+Etap 2 — CreateDatabase na starcie robi walidację
+
+Na wejściu CreateDatabase powinien powiedzieć:
+	•	baza musi istnieć,
+	•	baza musi mieć kompletny schemat,
+	•	jeśli nie, to fail fast.
+
+To jest dokładnie zgodne z tym, że nowy CreateDatabase już zależy od wcześniejszego db_init.
+
+Jak sprawdzić, czy baza istnieje i jest kompletna
+
+To jest najlepszy następny krok.
+
+Nie „czy baza istnieje”, tylko:
+	•	czy plik istnieje,
+	•	czy ma wymagane tabele,
+	•	czy ma wymagane widoki,
+	•	opcjonalnie czy ma wymagane indeksy.
+
+Minimalnie w CreateDatabase dodałbym walidację na wejściu.
+
+Tabele wymagane
+
+Na pewno:
+	•	invo
+	•	debc
+	•	clhs
+	•	dcmo
+	•	swieta
+	•	aggregated_data_temp
+	•	group_cust_inv_days
+	•	grouped_client_days
+	•	INVO_CLHS_JOINED_TAB
+	•	extended_grouped_client_days_tab
+	•	summary_client_days_tab
+	•	statystyki_faktur
+	•	dataset_tab
+	•	dataset
+
+Widoki wymagane
+
+Jeżeli chcesz pełne przeniesienie schematu do db_init, to także:
+	•	invo_view
+	•	clhs_view
+	•	DEBC_view
+	•	dcmo_view
+	•	INVO_CLHS_JOINED
+	•	extended_grouped_client_days
+	•	summary_client_days_view
+	•	stats_pivot_view
+	•	dataset_raw_view
+
+W tej chwili db_init nie tworzy jeszcze wszystkiego z tej listy, bo tworzy tylko część widoków.  ￼
+
+Proponowany wzorzec walidacji
+
+W CreateDatabase dodajesz helper w tym stylu:
+
+def object_exists(cursor, obj_type, name):
+    cursor.execute("""
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = ? AND name = ?
+        LIMIT 1
+    """, (obj_type, name))
+    return cursor.fetchone() is not None
 
 
-tu powinno być insert bo tabel ajuz istnieje z init, tak?
-# Zapisanie DataFrame do tabeli SQLite (struktura tabeli tworzona automatycznie)
-        df.to_sql("grouped_client_days", conn, if_exists="replace", index=False)
+def validate_required_schema(conn):
+    cursor = conn.cursor()
 
-tego już nie potrzebujemy skoro mamy definicję w config?
-        view_query = generate_view_query_complete(dcmo_columns, offsets)
-i czego jeszcze, ale co ma zostać bo jest insertem?
+    required_tables = [
+        "invo", "debc", "clhs", "dcmo",
+        "swieta", "aggregated_data_temp",
+        "group_cust_inv_days", "grouped_client_days",
+        "INVO_CLHS_JOINED_TAB", "extended_grouped_client_days_tab",
+        "summary_client_days_tab", "statystyki_faktur",
+        "dataset_tab", "dataset",
+    ]
 
-podobnie z tym:
-            # Wstrzyknięcie warunku do SQL
-            pivot_sql = params['query_create_stats_pivot_view'].replace("{shard_condition}", shard_condition)
-            raw_sql   = params['query_create_dataset_raw_view'].replace("{shard_condition}", shard_condition)
-                
-            cursor.execute("DROP VIEW IF EXISTS stats_pivot_view;")
-            cursor.execute(pivot_sql)
+    required_views = [
+        "invo_view", "clhs_view", "DEBC_view", "dcmo_view",
+        "INVO_CLHS_JOINED", "extended_grouped_client_days",
+        "summary_client_days_view", "stats_pivot_view", "dataset_raw_view",
+    ]
 
-wszystkie mają używać:
-	•	nie wszystkie definicje z configa są przez db_init użyte,
+    missing_tables = [t for t in required_tables if not object_exists(cursor, "table", t)]
+    missing_views = [v for v in required_views if not object_exists(cursor, "view", v)]
 
-w CreateDatabase nie mamy wykorzystywać schematów z configa tylko zasilać istniejące już obiekty. 
-CreateDatabase nadal wykonuje sporą część „schematowej” pracy operacyjnej: odtwarza techniczne widoki i materializuje dane pochodne. nie ma odtwarzać schematu, tylko zasilać.
+    if missing_tables or missing_views:
+        raise RuntimeError(
+            "Baza nie ma kompletnego schematu. "
+            f"Brak tabel: {missing_tables}. "
+            f"Brak widoków: {missing_views}. "
+            "Uruchom najpierw db_init.py."
+        )
 
-jak to ugryźć? sprawdzić czy baza istnieje czy jest kompleta, jak to zrobić?
-	•	nowy CreateDatabase już zależy od tego, że db_init był uruchomiony wcześniej. To trzeba jasno uznać za obowiązkowy etap procesu.  ￼
+I na starcie CreateDatabase, zaraz po sqlite3.connect(...), robisz:
 
+if not os.path.exists(db_path):
+    raise FileNotFoundError(f"Baza nie istnieje: {db_path}. Najpierw uruchom db_init.py")
 
+validate_required_schema(conn)
 
+To jest najczystsze rozwiązanie przejściowe.
+
+Co bym zrobił teraz, krok po kroku
+
+W db_init
+
+Domknąć schemat tak, żeby tworzył też:
+	•	stats_pivot_view
+	•	dataset_raw_view
+
+i żeby nie było duplikatów typu podwójne summary_client_days_view.
+
+W CreateDatabase
+
+Usunąć:
+	•	generate_view_query_complete
+	•	create_table_from_view
+	•	wszystkie DROP VIEW
+	•	wszystkie CREATE VIEW
+	•	wszystkie DROP/CREATE TABLE dla tabel pochodnych
+	•	wszystkie replace dla tabel istniejących z init.
+
+Zostawić:
+	•	DELETE
+	•	INSERT
+	•	append
+	•	batchowe przeliczanie danych.
+
+W okresie przejściowym
+
+Dodać walidację kompletności schematu na wejściu do CreateDatabase, żeby od razu było jasne:
+„nie uruchamiaj mnie na pustej bazie”.
+
+Najkrótsza odpowiedź na Twoje pytanie „co jeszcze jest w CreateDatabase do poprawy?”
+
+Do poprawy jest wszystko, co:
+	•	odtwarza widok,
+	•	odtwarza tabelę,
+	•	generuje schemat z DataFrame,
+	•	robi replace,
+	•	robi DROP VIEW,
+	•	robi DROP TABLE dla tabel pochodnych.
+
+A zostaje wszystko, co:
+	•	czyści dane,
+	•	ładuje dane,
+	•	przelicza dane,
+	•	inseruje do istniejących obiektów.
+
+To jest właściwy model dla „pliku przejściowego”, o którym piszesz.
+
+W następnym kroku mogę Ci rozpisać to już bardzo konkretnie jako checklistę:
+„usuń z CreateDatabase te funkcje i te bloki, zamień te linie na DELETE + append, dodaj ten walidator schematu”.
