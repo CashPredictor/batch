@@ -1,494 +1,370 @@
-Jasne. Poniżej masz gotowy kod do:
-	1.	ograniczenia indeksów tylko do wskazanych tabel,
-	2.	zrobienia pętli po PRAGMA table_info(...) dla brakujących tabel,
-	3.	zapisania wszystkiego do jednego Excela na osobnych arkuszach,
-	4.	wyciągnięcia brakujących widoków do osobnego arkusza,
-	5.	formuł do polskiego Excela, które z wierszy kolumn złożą fragment CREATE TABLE.
+Tak — w dużej mierze git, ale z ważnym rozdzieleniem:
 
-1. Lista brakujących tabel i widoków
+Co wrzucić do config.yaml już teraz
 
-Uzupełnij tylko listę brakujących widoków, jeśli już ją znasz.
+To są obiekty stabilne i nadają się do init:
 
-missing_tables = [
-    'invo',
-    'debc',
-    'clhs',
-    'dcmo',
-    'grouped_client_days',
-    'INVO_CLHS_JOINED_TAB',
-    'extended_grouped_client_days_tab',
-    'dataset',
-    'dataset_tab',
-    'group_cust_inv_days',
-    'summary_client_days_tab',
-    'statystyki_faktur',
-    'aggregated_data_temp'
-]
+TABLE
 
-missing_views = [
-    # wpisz tutaj brakujące widoki, np.
-    # 'my_view_1',
-    # 'my_view_2'
-]
+W first_model_params dodaj:
 
+query_create_invo_table: |
+  CREATE TABLE IF NOT EXISTS invo (
+    ...
+  );
 
-⸻
+query_create_debc_table: |
+  CREATE TABLE IF NOT EXISTS debc (
+    ...
+  );
 
-2. Indeksy tylko dla brakujących tabel
+query_create_clhs_table: |
+  CREATE TABLE IF NOT EXISTS clhs (
+    ...
+  );
 
-import pandas as pd
+query_create_dcmo_table: |
+  CREATE TABLE IF NOT EXISTS dcmo (
+    ...
+  );
 
-table_list_sql = ", ".join([f"'{t}'" for t in missing_tables])
+query_create_grouped_client_days_table: |
+  CREATE TABLE IF NOT EXISTS grouped_client_days (
+    ...
+  );
 
-df_indexes = pd.read_sql_query(f"""
-WITH tables AS (
-    SELECT name AS table_name
-    FROM sqlite_master
-    WHERE type = 'table'
-      AND name NOT LIKE 'sqlite_%'
-      AND name IN ({table_list_sql})
-),
-indexes AS (
-    SELECT
-        tbl_name AS table_name,
-        name     AS index_name
-    FROM sqlite_master
-    WHERE type = 'index'
-      AND name NOT LIKE 'sqlite_autoindex%'
-      AND tbl_name IN ({table_list_sql})
-),
-index_columns AS (
-    SELECT
-        il.tbl_name AS table_name,
-        il.name     AS index_name,
-        ii.seqno    AS seq,
-        ii.name     AS column_name
-    FROM sqlite_master il
-    JOIN pragma_index_info(il.name) ii
-    WHERE il.type = 'index'
-      AND il.name NOT LIKE 'sqlite_autoindex%'
-      AND il.tbl_name IN ({table_list_sql})
-)
-SELECT
-    t.table_name                       AS tabela,
-    i.index_name                       AS indeks,
-    group_concat(ic.column_name, ', ') AS kolumny
-FROM tables t
-LEFT JOIN indexes i
-       ON i.table_name = t.table_name
-LEFT JOIN index_columns ic
-       ON ic.table_name = t.table_name
-      AND ic.index_name = i.index_name
-GROUP BY
-    t.table_name,
-    i.index_name
-ORDER BY
-    t.table_name,
-    i.index_name;
-""", conn)
+query_create_invo_clhs_joined_tab_table: |
+  CREATE TABLE IF NOT EXISTS INVO_CLHS_JOINED_TAB (
+    ...
+  );
 
-df_indexes
+query_create_extended_grouped_client_days_tab_table: |
+  CREATE TABLE IF NOT EXISTS extended_grouped_client_days_tab (
+    ...
+  );
 
+query_create_dataset_table: |
+  CREATE TABLE IF NOT EXISTS dataset (
+    ...
+  );
 
-⸻
+VIEW
 
-3. PRAGMA table_info(...) dla wszystkich brakujących tabel
+Dodaj:
 
-To zepnie wszystko do jednego DataFrame i doda kolumnę table_name.
+query_create_DEBC_view: |
+  CREATE VIEW IF NOT EXISTS DEBC_view AS
+  SELECT
+    ...
+  ;
 
-table_info_dfs = []
+query_create_INVO_CLHS_JOINED: |
+  CREATE VIEW IF NOT EXISTS INVO_CLHS_JOINED AS
+  SELECT
+    ...
+  ;
 
-for table_name in missing_tables:
-    df_tmp = pd.read_sql_query(f'PRAGMA table_info("{table_name}");', conn)
-    df_tmp.insert(0, 'table_name', table_name)
-    table_info_dfs.append(df_tmp)
+query_create_clhs_view: |
+  CREATE VIEW IF NOT EXISTS clhs_view AS
+  SELECT
+    ...
+  ;
 
-df_table_info = pd.concat(table_info_dfs, ignore_index=True)
+query_create_dcmo_view: |
+  CREATE VIEW IF NOT EXISTS dcmo_view AS
+  WITH maxes AS (
+    ...
+  )
+  SELECT
+    ...
+  ;
 
-df_table_info
+query_create_extended_grouped_client_days_view: |
+  CREATE VIEW IF NOT EXISTS extended_grouped_client_days AS
+  SELECT
+    ...
+  ;
 
-Efekt będzie miał kolumny:
-	•	table_name
-	•	cid
-	•	name
-	•	type
-	•	notnull
-	•	dflt_value
-	•	pk
+query_create_invo_view: |
+  CREATE VIEW IF NOT EXISTS invo_view AS
+  SELECT
+    ...
+  ;
 
-⸻
-
-4. Brakujące widoki
-
-Jeśli chcesz tylko wskazane brakujące widoki:
-
-if missing_views:
-    view_list_sql = ", ".join([f"'{v}'" for v in missing_views])
-
-    df_views = pd.read_sql_query(f"""
-    SELECT
-        name AS view_name,
-        sql  AS view_sql
-    FROM sqlite_master
-    WHERE type = 'view'
-      AND name IN ({view_list_sql})
-    ORDER BY name;
-    """, conn)
-else:
-    df_views = pd.DataFrame(columns=['view_name', 'view_sql'])
-
-df_views
-
-Jeśli chcesz wszystkie widoki, to zamiast powyższego:
-
-df_views = pd.read_sql_query("""
-SELECT
-    name AS view_name,
-    sql  AS view_sql
-FROM sqlite_master
-WHERE type = 'view'
-ORDER BY name;
-""", conn)
-
-df_views
+query_create_summary_client_days_view: |
+  CREATE VIEW IF NOT EXISTS summary_client_days_view AS
+  SELECT
+    ...
+  ;
 
 
 ⸻
 
-5. Zapis do jednego Excela
+Czego nie wrzucać teraz do init
 
-Na 3 arkusze:
-	•	indexes
-	•	table_info
-	•	views
+Tego na razie nie przenoś do init, bo to jest runtime/dynamiczne:
 
-output_path = 'sqlite_metadata_missing_objects.xlsx'
+Nie dodawaj do init:
+	•	dataset_raw_view
+	•	stats_pivot_view
 
-with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-    df_indexes.to_excel(writer, sheet_name='indexes', index=False)
-    df_table_info.to_excel(writer, sheet_name='table_info', index=False)
-    df_views.to_excel(writer, sheet_name='views', index=False)
+Powód:
+	•	dataset_raw_view zależy od aktualnego stats_pivot_view
+	•	stats_pivot_view u Ciebie jest powiązany z wariantem shardów / filtrem runtime
+	•	to jest logika przetwarzania danych, nie bootstrap schematu
 
-print(f'Zapisano: {output_path}')
+Czyli:
+	•	schema tabel → init
+	•	widoki runtime zależne od konkretnego przebiegu → zostają w CreateDatabase
+
+⸻
+
+Jakie klucze z Twoich obecnych rzeczy już masz i zostają
+
+Tego nie ruszaj, bo już pasuje:
+	•	query_create_group_cust_inv_days
+	•	query_create_summary_client_days_tab2
+	•	query_create_dataset_tab
+	•	statystyki_faktur
+	•	query_swieta
+
+⸻
+
+Gdzie to wkleić w config.yaml
+
+Do sekcji:
+
+first_model_params:
+
+Czyli finalnie w first_model_params będziesz mieć:
+	•	stare query_create_*
+	•	nowe query_create_*_table
+	•	nowe query_create_*_view
+
+⸻
+
+Co dodać do db_init.py
+
+1. W sekcji TABLES dopisz:
+
+# --- TABLES ---
+exec_sql(conn, params.get("query_create_invo_table"), "query_create_invo_table")
+exec_sql(conn, params.get("query_create_debc_table"), "query_create_debc_table")
+exec_sql(conn, params.get("query_create_clhs_table"), "query_create_clhs_table")
+exec_sql(conn, params.get("query_create_dcmo_table"), "query_create_dcmo_table")
+
+exec_sql(conn, params.get("query_create_group_cust_inv_days"), "query_create_group_cust_inv_days")
+exec_sql(conn, params.get("query_create_grouped_client_days_table"), "query_create_grouped_client_days_table")
+exec_sql(conn, params.get("query_create_summary_client_days_tab2"), "query_create_summary_client_days_tab2")
+exec_sql(conn, params.get("query_create_dataset_tab"), "query_create_dataset_tab")
+exec_sql(conn, params.get("query_create_dataset_table"), "query_create_dataset_table")
+exec_sql(conn, params.get("query_create_invo_clhs_joined_tab_table"), "query_create_invo_clhs_joined_tab_table")
+exec_sql(conn, params.get("query_create_extended_grouped_client_days_tab_table"), "query_create_extended_grouped_client_days_tab_table")
+exec_sql(conn, params.get("statystyki_faktur"), "statystyki_faktur")
+exec_sql(conn, params.get("query_swieta"), "query_swieta")
 
 
 ⸻
 
-6. Dodatkowe kolumny do składania CREATE TABLE
+2. W sekcji VIEWS dopisz:
 
-Warto od razu w Pythonie dorzucić pomocnicze kolumny do Excela, żebyś potem łatwo poskładał definicje.
-
-df_table_info_excel = df_table_info.copy()
-
-def format_default(v):
-    if pd.isna(v):
-        return ''
-    return f' DEFAULT {v}'
-
-df_table_info_excel['col_def_python'] = (
-    df_table_info_excel['name'].astype(str) + ' ' +
-    df_table_info_excel['type'].fillna('').astype(str) +
-    df_table_info_excel['notnull'].apply(lambda x: ' NOT NULL' if x == 1 else '') +
-    df_table_info_excel['dflt_value'].apply(format_default) +
-    df_table_info_excel['pk'].apply(lambda x: ' PRIMARY KEY' if x == 1 else '')
-)
-
-df_table_info_excel
-
-Jeśli chcesz zapisywać właśnie tę wersję:
-
-with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-    df_indexes.to_excel(writer, sheet_name='indexes', index=False)
-    df_table_info_excel.to_excel(writer, sheet_name='table_info', index=False)
-    df_views.to_excel(writer, sheet_name='views', index=False)
+# --- VIEWS ---
+exec_sql(conn, params.get("query_create_invo_view"), "query_create_invo_view")
+exec_sql(conn, params.get("query_create_clhs_view"), "query_create_clhs_view")
+exec_sql(conn, params.get("query_create_DEBC_view"), "query_create_DEBC_view")
+exec_sql(conn, params.get("query_create_dcmo_view"), "query_create_dcmo_view")
+exec_sql(conn, params.get("query_create_INVO_CLHS_JOINED"), "query_create_INVO_CLHS_JOINED")
+exec_sql(conn, params.get("query_create_extended_grouped_client_days_view"), "query_create_extended_grouped_client_days_view")
+exec_sql(conn, params.get("query_create_summary_client_days_view"), "query_create_summary_client_days_view")
 
 
 ⸻
 
-7. Formuły do polskiego Excela
+3. Usuń z db_init.py
 
-Załóżmy, że w arkuszu table_info masz kolumny:
-	•	A = table_name
-	•	B = cid
-	•	C = name
-	•	D = type
-	•	E = notnull
-	•	F = dflt_value
-	•	G = pk
+Usuń wszystko, co:
+	•	buduje tabelę z widoku przez introspekcję
+	•	robi dynamiczne odgadywanie kolumn
 
-i chcesz w kolumnie H generować fragment definicji kolumny.
+Czyli wytnij:
+	•	create_table_from_view_schema(...)
+	•	ewentualne stare ręczne budowanie INVO_CLHS_JOINED_TAB z PRAGMA table_info
+	•	wszelkie stare fragmenty typu:
+	•	view_columns = get_columns(...)
+	•	column_definitions = []
+	•	DROP TABLE IF EXISTS ...
+	•	CREATE TABLE ... składane z pythona
 
-Formuła dla pojedynczej kolumny tabeli
+Bo teraz masz już jawne DDL w configu.
 
-W H2:
+⸻
 
-=C2&" "&D2&JEŻELI(E2=1;" NOT NULL";"")&JEŻELI(F2<>"";" DEFAULT "&F2;"")&JEŻELI(G2=1;" PRIMARY KEY";"")
+Co zostaje dynamiczne w CreateDatabase
 
-Jeśli F2 może zawierać naprawdę pustą komórkę albo None jako tekst, bezpieczniejsza wersja:
+Na ten moment:
+	•	inserty do invo/debc/clhs/dcmo
+	•	inserty do group_cust_inv_days
+	•	insert/select do INVO_CLHS_JOINED_TAB
+	•	insert/select do grouped_client_days
+	•	insert/select do extended_grouped_client_days_tab
+	•	insert/select do summary_client_days_tab
+	•	insert/select do statystyki_faktur
+	•	insert/select do dataset_tab
+	•	transformacja dataset_tab -> dataset
+	•	runtime views:
+	•	stats_pivot_view
+	•	dataset_raw_view
 
-=C2&" "&D2&JEŻELI(E2=1;" NOT NULL";"")&JEŻELI(LUB(F2="";F2="None");"";" DEFAULT "&F2)&JEŻELI(G2=1;" PRIMARY KEY";"")
+To jest sensowny podział na tym etapie.
+
+⸻
+
+Dwie ważne uwagi
+
+1. Twoje bardzo długie VIEW są ucięte
+
+W wiadomości:
+	•	extended_grouped_client_days
+	•	stats_pivot_view
+
+są wyraźnie ucięte. Tych wersji nie wklejaj jeszcze do configa, jeśli nie masz pełnego SQL-a.
+
+2. dataset_raw_view i stats_pivot_view zostaw poza init
+
+Nawet jeśli masz pełne SQL-e, na razie ich nie przenoś do init.
+
+⸻
+
+Minimalna lista nowych kluczy do dodania
+
+Dodaj te nazwy do config.yaml:
+
+query_create_invo_table
+query_create_debc_table
+query_create_clhs_table
+query_create_dcmo_table
+query_create_grouped_client_days_table
+query_create_invo_clhs_joined_tab_table
+query_create_extended_grouped_client_days_tab_table
+query_create_dataset_table
+query_create_extended_grouped_client_days_view
+
+A z istniejących używaj dalej:
+
+query_create_invo_view
+query_create_clhs_view
+query_create_DEBC_view
+query_create_dcmo_view
+query_create_INVO_CLHS_JOINED
+query_create_summary_client_days_view
+query_create_group_cust_inv_days
+query_create_summary_client_days_tab2
+query_create_dataset_tab
+statystyki_faktur
+query_swieta
 
 
 ⸻
 
-Początek skryptu CREATE TABLE
+Werdykt
 
-W osobnej komórce, np. J2:
+✅ Tak, kierunek jest dobry
 
-="CREATE TABLE "&A2&" ("
+Masz już komplet definicji dla najważniejszych tabel.
 
-To działa dobrze, jeśli dla danej tabeli bierzesz pierwszy wiersz tej tabeli.
+⚠️ Jeszcze nie wszystko przenoś
 
-⸻
+Nie przenoś teraz do init:
+	•	dataset_raw_view
+	•	stats_pivot_view
 
-Koniec skryptu
+✅ Następny krok
 
-W innej komórce, np. K2:
+Dodać powyższe klucze do configa i podmienić sekcje TABLES/VIEWS w db_init.py.
 
-=");"
-
-
-⸻
-
-Przecinek po kolumnie
-
-Jeżeli chcesz, żeby każda linia miała przecinek poza ostatnią kolumną danej tabeli, to w I2 możesz dać:
-
-=H2&JEŻELI(A2=A3;",";"")
-
-To zakłada, że wiersze są posortowane po table_name i cid.
-
-⸻
-
-Gotowy wiersz kolumny do wklejenia
-
-Jeśli chcesz od razu linię z wcięciem:
-
-="    "&H2&JEŻELI(A2=A3;",";"")
-
-albo z użyciem kolumny I:
-
-="    "&I2
+Jeśli chcesz, w następnym kroku mogę Ci od razu rozpisać gotowy blok first_model_params: z samymi nazwami i placeholderami do wklejenia w YAML.
 
 
-⸻
+Tak — przy takim założeniu to się upraszcza.
 
-8. Jak złożyć całe CREATE TABLE w Excelu
+Co zmienia Twoja decyzja
 
-Najwygodniej zrobić tak:
-	•	kolumna J: początek tylko dla pierwszego wiersza danej tabeli,
-	•	kolumna I: definicja kolumny z przecinkiem,
-	•	kolumna K: koniec tylko dla ostatniego wiersza danej tabeli.
+Jeżeli:
+	•	okna/statystyki są na sztywno,
+	•	shardy są na sztywno,
+	•	i dataset_raw_view / stats_pivot_view nie będą już składane dynamicznie w Pythonie,
 
-Początek tylko dla pierwszego wiersza tabeli
+to te widoki też można przenieść do configa i tworzyć w db_init.
 
-W J2:
+W praktyce
 
-=JEŻELI(A2<>A1;"CREATE TABLE "&A2&" (";"")
+To oznacza:
 
-Koniec tylko dla ostatniego wiersza tabeli
+Do config.yaml możesz dodać jeszcze:
 
-W K2:
+query_create_stats_pivot_view: |
+  CREATE VIEW IF NOT EXISTS stats_pivot_view AS
+  SELECT
+    ...
+  ;
 
-=JEŻELI(A2<>A3;");";"")
+query_create_dataset_raw_view: |
+  CREATE VIEW IF NOT EXISTS dataset_raw_view AS
+  SELECT
+    ...
+  ;
 
-Uwaga: dla pierwszego wiersza arkusza możesz zacząć od J2, bo odwołanie do A1 będzie nagłówkiem i i tak zadziała.
+A w db_init.py dopisać:
 
-⸻
+w sekcji VIEWS, po utworzeniu tabel i wcześniejszych widoków:
 
-9. Jeśli chcesz zrobić pełne CREATE TABLE już w Pythonie
+exec_sql(conn, params.get("query_create_stats_pivot_view"), "query_create_stats_pivot_view")
+exec_sql(conn, params.get("query_create_dataset_raw_view"), "query_create_dataset_raw_view")
 
-To nawet lepiej niż składanie ręcznie w Excelu.
+Ważna konsekwencja
 
-def build_create_table_script(df_one_table):
-    table_name = df_one_table['table_name'].iloc[0]
-    lines = []
+Skoro to ma być stałe, to w CreateDatabase powinieneś potem usunąć generowanie tych widoków w pętli, czyli wyciąć logikę typu:
+	•	pivot_sql = ...replace("{shard_condition}", ...)
+	•	raw_sql = ...replace("{shard_condition}", ...)
+	•	DROP VIEW IF EXISTS stats_pivot_view
+	•	DROP VIEW IF EXISTS dataset_raw_view
+	•	cursor.execute(pivot_sql)
+	•	cursor.execute(raw_sql)
 
-    for _, row in df_one_table.sort_values('cid').iterrows():
-        col_def = f'{row["name"]} {row["type"]}'
-        if row['notnull'] == 1:
-            col_def += ' NOT NULL'
-        if pd.notna(row['dflt_value']):
-            col_def += f' DEFAULT {row["dflt_value"]}'
-        if row['pk'] == 1:
-            col_def += ' PRIMARY KEY'
-        lines.append(f'    {col_def}')
+i zostawić tylko:
+	•	inserty do tabel,
+	•	INSERT INTO dataset_tab SELECT * FROM dataset_raw_view ...
 
-    sql = f'CREATE TABLE {table_name} (\n' + ',\n'.join(lines) + '\n);'
-    return sql
+Czyli docelowy podział będzie taki
 
-create_table_rows = []
-for table_name, df_grp in df_table_info.groupby('table_name'):
-    create_table_rows.append({
-        'table_name': table_name,
-        'create_table_sql': build_create_table_script(df_grp)
-    })
+db_init
 
-df_create_tables = pd.DataFrame(create_table_rows)
-df_create_tables
+trzyma:
+	•	wszystkie CREATE TABLE
+	•	wszystkie CREATE VIEW
+	•	wszystkie CREATE INDEX
 
-I to możesz dodać jako kolejny arkusz:
+CreateDatabase
 
-with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-    df_indexes.to_excel(writer, sheet_name='indexes', index=False)
-    df_table_info_excel.to_excel(writer, sheet_name='table_info', index=False)
-    df_create_tables.to_excel(writer, sheet_name='create_tables', index=False)
-    df_views.to_excel(writer, sheet_name='views', index=False)
+trzyma tylko:
+	•	ładowanie danych
+	•	czyszczenie danych klienta
+	•	inserty / appendy
+	•	przeliczenia i zasilenie tabel wynikowych
 
+Co to daje
 
-⸻
+To jest lepsze, bo:
+	•	schema jest w jednym miejscu,
+	•	CreateDatabase przestaje być pół-init, pół-loaderem,
+	•	jesteś bliżej późniejszego przejścia na PostgreSQL.
 
-10. Finalna wersja kompletna
+Jedno zastrzeżenie
 
-To już gotowy blok do odpalenia:
+Jeżeli nadal chcesz kiedyś wrócić do wielu shardów jako osobnych wariantów, to zamiast jednego dataset_raw_view lepiej byłoby mieć:
+	•	albo kilka nazwanych widoków,
+	•	albo od razu zrezygnować z view i robić INSERT ... SELECT ... WHERE ... z parametrem.
 
-import pandas as pd
+Ale na ten etap, przy sztywnym wariancie, Twoje podejście jest sensowne.
 
-missing_tables = [
-    'invo',
-    'debc',
-    'clhs',
-    'dcmo',
-    'grouped_client_days',
-    'INVO_CLHS_JOINED_TAB',
-    'extended_grouped_client_days_tab',
-    'dataset',
-    'dataset_tab',
-    'group_cust_inv_days',
-    'summary_client_days_tab',
-    'statystyki_faktur',
-    'aggregated_data_temp'
-]
-
-missing_views = [
-    # uzupełnij jeśli chcesz tylko wybrane
-]
-
-table_list_sql = ", ".join([f"'{t}'" for t in missing_tables])
-
-df_indexes = pd.read_sql_query(f"""
-WITH tables AS (
-    SELECT name AS table_name
-    FROM sqlite_master
-    WHERE type = 'table'
-      AND name NOT LIKE 'sqlite_%'
-      AND name IN ({table_list_sql})
-),
-indexes AS (
-    SELECT
-        tbl_name AS table_name,
-        name     AS index_name
-    FROM sqlite_master
-    WHERE type = 'index'
-      AND name NOT LIKE 'sqlite_autoindex%'
-      AND tbl_name IN ({table_list_sql})
-),
-index_columns AS (
-    SELECT
-        il.tbl_name AS table_name,
-        il.name     AS index_name,
-        ii.seqno    AS seq,
-        ii.name     AS column_name
-    FROM sqlite_master il
-    JOIN pragma_index_info(il.name) ii
-    WHERE il.type = 'index'
-      AND il.name NOT LIKE 'sqlite_autoindex%'
-      AND il.tbl_name IN ({table_list_sql})
-)
-SELECT
-    t.table_name                       AS tabela,
-    i.index_name                       AS indeks,
-    group_concat(ic.column_name, ', ') AS kolumny
-FROM tables t
-LEFT JOIN indexes i
-       ON i.table_name = t.table_name
-LEFT JOIN index_columns ic
-       ON ic.table_name = t.table_name
-      AND ic.index_name = i.index_name
-GROUP BY
-    t.table_name,
-    i.index_name
-ORDER BY
-    t.table_name,
-    i.index_name;
-""", conn)
-
-table_info_dfs = []
-for table_name in missing_tables:
-    df_tmp = pd.read_sql_query(f'PRAGMA table_info("{table_name}");', conn)
-    df_tmp.insert(0, 'table_name', table_name)
-    table_info_dfs.append(df_tmp)
-
-df_table_info = pd.concat(table_info_dfs, ignore_index=True)
-
-df_table_info_excel = df_table_info.copy()
-
-def format_default(v):
-    if pd.isna(v):
-        return ''
-    return f' DEFAULT {v}'
-
-df_table_info_excel['col_def_python'] = (
-    df_table_info_excel['name'].astype(str) + ' ' +
-    df_table_info_excel['type'].fillna('').astype(str) +
-    df_table_info_excel['notnull'].apply(lambda x: ' NOT NULL' if x == 1 else '') +
-    df_table_info_excel['dflt_value'].apply(format_default) +
-    df_table_info_excel['pk'].apply(lambda x: ' PRIMARY KEY' if x == 1 else '')
-)
-
-def build_create_table_script(df_one_table):
-    table_name = df_one_table['table_name'].iloc[0]
-    lines = []
-
-    for _, row in df_one_table.sort_values('cid').iterrows():
-        col_def = f'{row["name"]} {row["type"]}'
-        if row['notnull'] == 1:
-            col_def += ' NOT NULL'
-        if pd.notna(row['dflt_value']):
-            col_def += f' DEFAULT {row["dflt_value"]}'
-        if row['pk'] == 1:
-            col_def += ' PRIMARY KEY'
-        lines.append(f'    {col_def}')
-
-    return f'CREATE TABLE {table_name} (\n' + ',\n'.join(lines) + '\n);'
-
-df_create_tables = pd.DataFrame([
-    {
-        'table_name': table_name,
-        'create_table_sql': build_create_table_script(df_grp)
-    }
-    for table_name, df_grp in df_table_info.groupby('table_name')
-])
-
-if missing_views:
-    view_list_sql = ", ".join([f"'{v}'" for v in missing_views])
-    df_views = pd.read_sql_query(f"""
-    SELECT
-        name AS view_name,
-        sql  AS view_sql
-    FROM sqlite_master
-    WHERE type = 'view'
-      AND name IN ({view_list_sql})
-    ORDER BY name;
-    """, conn)
-else:
-    df_views = pd.read_sql_query("""
-    SELECT
-        name AS view_name,
-        sql  AS view_sql
-    FROM sqlite_master
-    WHERE type = 'view'
-    ORDER BY name;
-    """, conn)
-
-output_path = 'sqlite_metadata_missing_objects.xlsx'
-
-with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-    df_indexes.to_excel(writer, sheet_name='indexes', index=False)
-    df_table_info_excel.to_excel(writer, sheet_name='table_info', index=False)
-    df_create_tables.to_excel(writer, sheet_name='create_tables', index=False)
-    df_views.to_excel(writer, sheet_name='views', index=False)
-
-print(f'Zapisano: {output_path}')
-
-Jeśli chcesz, mogę Ci jeszcze przygotować drugą wersję, która od razu generuje też CREATE INDEX dla tych brakujących indeksów.
+Następny krok to już po prostu przygotować pełną listę kluczy configa, łącznie z tymi dwoma widokami.
