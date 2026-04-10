@@ -273,21 +273,6 @@ def remove_case_insensitive_duplicate_columns(df):
 
 def create_aggregated_data_temp(conn, data_end, data_start="2023-03-12"):
     cursor = conn.cursor()
-
-    # Tworzenie tabeli
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS aggregated_data_temp (
-        DZIEN DATE NOT NULL,
-        DZIS_DZIEN_TYG INTEGER NOT NULL,
-        DZIS_SOBOTA INTEGER NOT NULL,
-        DZIS_NIEDZIELA INTEGER NOT NULL
-    );
-    """)
-
-    cursor.execute("""
-    CREATE INDEX IF NOT EXISTS idx_ag_day
-        ON aggregated_data_temp (DZIEN); 
-    """)
     
     # Generowanie danych od 2023-03-12 do 2030-04-27
     rows_to_insert = generate_dates(data_start, data_end)
@@ -306,11 +291,6 @@ def create_and_import_swieta(conn, params, file_path):
     
     # Konwertuj kolumnę 'data' na typ daty
     data['data'] = pd.to_datetime(data['data'], format='%d.%m.%Y')
-    
-    # Tworzenie tabeli w bazie danych
-    create_table_query = params['query_swieta']
-    with conn:
-        conn.execute(create_table_query)
     
     # Import danych do tabeli
     data.to_sql('swieta', conn, if_exists='replace', index=False)
@@ -823,30 +803,6 @@ sqlite3.register_converter('DATETIME', convert_datetime)
 sqlite3.register_adapter(pd.Timestamp, adapt_pandas_timestamp)
 sqlite3.register_converter('DATETIME', convert_pandas_timestamp)
 
-def create_indexes(index_definitions, conn):
-    """
-    Tworzy indeksy na podstawie definicji w słowniku.
-    
-    :param index_definitions: Słownik zawierający nazwy tabel jako klucze i listy kolumn do indeksowania jako wartości.
-    """
-    try:
-        cursor = conn.cursor()
-
-        for table_name, columns in index_definitions.items():
-            for column in columns:
-                # Tworzenie nazwy indeksu
-                index_name = f"{table_name}_{column}_idx"
-                
-                # Tworzenie zapytania SQL do dodania indeksu
-                sql_query = f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} ({column});"
-                
-                # Wykonanie zapytania
-                cursor.execute(sql_query)
-        
-        conn.commit()
-    except sqlite3.Error as e:
-        print(f"Błąd podczas tworzenia indeksów: {e}")
-
 # Funkcja do pobrania listy kolumn z widoku
 def get_columns_from_view(cursor, view_name):
     cursor.execute(f"PRAGMA table_info({view_name});")
@@ -926,8 +882,8 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
         
         # czytelny wydruk: kolejność + ile rekordów ma każdy klient
         print("Kolejność przetwarzania (od najmniejszej liczby wierszy INVO):")
-        for rank, (cid, cnt) in enumerate(zip(_counts_filtered['INVO_CLNTNO'],
-                                              _counts_filtered['cnt']), start=1):
+        for rank, (cid, cnt) in enumerate(zip(_counts_sorted['INVO_CLNTNO'],
+                                              _counts_sorted['cnt']), start=1):
             print(f"{rank:>2}. klient {int(cid)} → {int(cnt)} wierszy INVO")     
         print("po client_ids = df_invo_all['INVO_CLNTNO'].dropna().unique() order by _counts.sort_values('cnt', ascending=True)['INVO_CLNTNO']")
 
@@ -1025,87 +981,10 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
             conn.close()
             continue
         
-        # Indeksy – UWAGA: klucze muszą odpowiadać NAZWOM TABEL w bazie (u Ciebie: invo/debc/clhs/dcmo małymi)
-        index_definitions = {
-            "invo": ["INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO"],
-            "debc": ["DEBC_NO", "DEBC_DEBH", "DEBC_ADMNO", "DEBC_CLNTNO", "DEBC_REINSURANCENUMBER"],
-            "clhs": ["CLHS_NO", "CLHS_DEBC_NO", "CLHS_DEBH_NO", "CLHS_ADMNO", "CLHS_CLNTNO", "CLHS_DATCHANGED", "CLHS_TIMCHANGED"],
-            "dcmo": ["DCMO_DEBC_NO", "DCMO_YEAR", "DCMO_MONTH"]
-        }
-        create_indexes(index_definitions, conn)
-    
-        sql_query = f"CREATE INDEX IF NOT EXISTS invo_idx_one_for_all ON invo  (INVO_ADMNO, INVO_DEBH_NO, INVO_DEBC_NO, INVO_INVDATE);"
-        cursor.execute(sql_query)
     
         #tabela do świąt
         # Ścieżka do pliku Excel
         create_and_import_swieta(conn, params, file_path = r'C:\Users\OE00SG\CashPredictor\dev3\co i jak baza\Arkusz w C  Users OQ38TT jupiter dev3 co i jak baza co i jak baza.xls')
-    
-    # bazowe widoki z konwersją typów dat na właściwe daty
-        query="DROP VIEW IF EXISTS invo_view;"
-        cursor.execute(query)
-        query=params['query_create_invo_view']
-        
-        cursor.execute(query)
-        query="DROP VIEW IF EXISTS clhs_view;"
-        cursor.execute(query)
-        query=params['query_create_clhs_view']
-        
-        cursor.execute(query)
-        query="DROP VIEW IF EXISTS DEBC_view;"
-        cursor.execute(query)
-        query=params['query_create_DEBC_view']
-    
-        cursor.execute(query)
-        query="DROP VIEW IF EXISTS dcmo_view;"
-        cursor.execute(query)
-        query=params['query_create_dcmo_view']
-        cursor.execute(query)
-    
-    # widok do tworzenia datasetu
-        query="DROP VIEW IF EXISTS INVO_CLHS_JOINED;"
-        cursor.execute(query)
-        query=params['query_create_INVO_CLHS_JOINED']
-        cursor.execute(query)
-        
-        # Pobranie kolumn z widoku
-        view_columns = get_columns(cursor, "INVO_CLHS_JOINED")
-        
-        # Definicja typów danych dla kolumn
-        column_definitions = []
-        for col, col_type in view_columns:
-            if col in [
-                "INVO_INVDATE", "INVO_VALUEDATE", "INVO_DUEDATE", "INVO_MARKCODESPECDATE", 
-                "INVO_MARKCODETEXTDATE", "INVO_FINALPAYMENTDATE", "INVO_BOOKINGDATE", 
-                "INVO_MAXFINANCETIMPASSED", "INVO_DATSTARTDELCREDEREINVST", "CLHS_CHANGED_DATETIME", 
-                "CLHS_DATVALID", "CLHS_DATPRINTED", "CLHS_NEXT_CHANGED_DATETIME"
-            ]:
-                column_definitions.append(f"{col} DATETIME")
-            elif col in ["INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "INVO_DEBC_NO", "CLHS_NO", "CLHS_ADMNO", "CLHS_DEBC_NO", "CLHS_DEBH_NO", "INVO_MARKCODESPEC", "INVO_NETDAYS"]:
-                column_definitions.append(f"{col} INTEGER")
-            elif col in ["INVO_CURRENCY", "INVO_INVO_INVOICENO", "INVO_TEXT", "INVO_HOLDCODE", "INVO_DUMMY", "CLHS_CURRENCYOLD", "CLHS_CURRENCYNEW", "CLHS_TEXTCODE1", "CLHS_TEXTCODE2", "CLHS_TEXTCODE3", "CLHS_VARIABLETEXT1", "CLHS_VARIABLETEXT2", "CLHS_USRID", "CLHS_AUTOMATICDECISION", "CLHS_NEWDEBTOR"]:
-                column_definitions.append(f"{col} TEXT")
-            elif col in ["INVO_AINITIALH", "INVO_AINITIALC"]:
-                column_definitions.append(f"{col} REAL")
-            else:
-                column_definitions.append(f"{col} REAL")
-        
-        # Tworzenie tabeli docelowej
-        cursor.execute("DROP TABLE IF EXISTS INVO_CLHS_JOINED_TAB;")
-        create_table_query = f"""
-            CREATE TABLE INVO_CLHS_JOINED_TAB (
-                {', '.join(column_definitions)}
-            );
-        """
-        cursor.execute(create_table_query)
-        print("Tabela 'INVO_CLHS_JOINED_TAB' została utworzona.")
-        
-        # Definicje tabel i kolumn do indeksowania
-        index_definitions = {
-            "INVO_CLHS_JOINED_TAB": ["INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "INVO_DEBC_NO", "CLHS_NEXT_CHANGED_DATETIME", "CLHS_CHANGED_DATETIME", "CLHS_LIMITOLD", "CLHS_LIMITNEW"]
-        }
-        # Wywołanie funkcji
-        create_indexes(index_definitions, conn)
         
         # Wstawianie danych z widoku do tabeli
         insert_query = """
@@ -1135,14 +1014,6 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
         conn.commit()
         
         print("Operacja zakończona sukcesem.")
-    
-    
-    # Usunięcie tabeli, jeśli już istnieje
-        cursor.execute("DROP TABLE IF EXISTS group_cust_inv_days;")
-        
-        # Tworzenie tabeli z kolumnami ROK i MIESIAC
-        create_table_query = params['query_create_group_cust_inv_days']
-        cursor.execute(create_table_query)
         
         # Pobranie danych z invo_view
         query_invo = f"""
@@ -1207,14 +1078,7 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
             INVO_NO, INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, INVO_INVDATE, DZIEN, ROK, MIESIAC, INVO_FINALPAYMENTDATE
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, data_to_insert)
-        
-        # Definicje tabel i kolumn do indeksowania
-        index_definitions = {
-            "group_cust_inv_days": ["INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "INVO_DEBC_NO", "DZIEN", "MIESIAC", "ROK"]
-        }
-        # Wywołanie funkcji
-        create_indexes(index_definitions, conn)
-        
+
         # Zatwierdzenie zmian
         conn.commit()
         
@@ -1229,13 +1093,6 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
         
         # Zapisanie DataFrame do tabeli SQLite (struktura tabeli tworzona automatycznie)
         df.to_sql("grouped_client_days", conn, if_exists="replace", index=False)
-        
-        # Definicje tabel i kolumn do indeksowania
-        index_definitions = {
-            "grouped_client_days": ["INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "INVO_DEBC_NO", "DZIEN", "MIESIAC", "ROK"]
-        }
-        # Wywołanie funkcji
-        create_indexes(index_definitions, conn)
         
         # Zatwierdzenie zmian i zamknięcie połączenia
         conn.commit()
@@ -1302,43 +1159,12 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
         query_create_summary_client_days_view = params['query_create_summary_client_days_view']
         cursor.execute(query_create_summary_client_days_view)
         
-        remove_summary_table=False
-        
-        if remove_summary_table:
-            # Usunięcie tabeli, jeśli już istnieje
-            cursor.execute("DROP TABLE IF EXISTS summary_client_days_tab;")
-            
-            # Jawne tworzenie tabeli z typami kolumn
-            create_table_query = params['query_create_summary_client_days_tab']
-            cursor.execute(create_table_query)
-            
-            # Definicje tabel i kolumn do indeksowania
-            index_definitions = {
-                "summary_client_days_tab": ["INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "DZIEN", "ROK", "MIESIAC"]
-            }
-            
-            # Wywołanie funkcji
-            create_indexes(index_definitions, conn)
-        else:
-            # Jeśli remove_summary_table=False, to tworzymy TYLKO jeżeli nie istnieje
-            # (w ten sposób nie usuniemy poprzednich danych)
-            create_table_query = params['query_create_summary_client_days_tab2']
-            cursor.execute(create_table_query)
-            conn.commit()
-            
-            print("remove_summary_table=False -> Nie usuwam starej tabeli. Kontynuuję od ostatnio wstawionego miesiąca.")
-            # Nie tworzymy indeksów tutaj, bo user życzy sobie tworzyć je TYLKO jeśli remove_summary_table=True
-        
         print("Rozpoczynam partiami wstawianie do 'summary_client_days_tab'...")
         
         # 3. Znajdujemy, od którego (ROK, MIESIAC) kontynuować.
         #    Szukamy w summary_client_days_tab największego ROK,MIESIAC wstawionego
         #    lub None, jeśli pusto.
         
-        sql_query = f"CREATE INDEX IF NOT EXISTS summary_client_days_tab_idx_one_for_all ON summary_client_days_tab  (ROK, MIESIAC);"
-        cursor.execute(sql_query)
-        sql_query = f"CREATE INDEX IF NOT EXISTS group_cust_inv_days_idx_year_month ON group_cust_inv_days  (ROK, MIESIAC);"
-        cursor.execute(sql_query)
         
         cursor.execute("""
             SELECT ROK, MIESIAC
@@ -1408,19 +1234,9 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
         cursor.execute(params['idx_clhs_joined_keys_datetime'])
         conn.commit()
         
-        cursor.execute("DROP TABLE IF EXISTS statystyki_faktur;")
-        
         # Pobranie świąt (jeśli istnieją)
         cursor.execute("SELECT data FROM swieta")
         holidays = {pd.Timestamp(row[0]) for row in cursor.fetchall()}
-        
-        # Tworzenie tabeli na statystyki faktur
-        query_statystyki_faktur = params['statystyki_faktur']
-        cursor.execute(query_statystyki_faktur)
-        conn.commit()
-        
-        cursor.execute(params['idx_statystyki_keys_day_param_scen'])
-        conn.commit()
         
         # Parametry wejściowe
         z_ilu_dni_values = [14, 30, 60, 90]
@@ -1655,22 +1471,7 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
             continue
         else:
             print(f"Zakres dat w widoku: {min_date} - {max_date}")
-            
-            # Tworzenie pustej tabeli z jawną definicją typu danych
-            cursor.execute("DROP TABLE IF EXISTS dataset_tab;")
-            query_create_dataset_tab = params['query_create_dataset_tab']
-            cursor.execute(query_create_dataset_tab)
-            print("Tabela 'dataset_tab' została pomyślnie utworzona.")
         
-            index_definitions = {
-                "dataset_tab": ["INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO","CLHS_NEXT_CHANGED_DATETIME", "CLHS_CHANGED_DATETIME", "CLHS_LIMITOLD", "CLHS_LIMITNEW", "DZIEN", "ROK", "MIESIAC"]
-            }    
-            
-            sql_query = f"CREATE INDEX IF NOT EXISTS statystyki_faktur_idx_one_for_all ON statystyki_faktur  (INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, DZIEN, PARAM_Z_ILU_DNI, SCENARIUSZ);"
-            cursor.execute(sql_query)
-            sql_query = f"CREATE INDEX IF NOT EXISTS group_cust_inv_days_idx_one_for_all ON group_cust_inv_days  (INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, DZIEN);"
-            cursor.execute(sql_query)
-            conn.commit()
         
         NUM_SHARDS = params['NUM_SHARDS']
         
@@ -1749,8 +1550,6 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
         )
         print(datetime.now().strftime("%H:%M:%S"))
         
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_dataset_inv_day ON dataset (INVO_NO, DZIEN DESC);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_dataset_clear ON dataset (INVO_FINALPAYMENTDATE);")
     
         create_aggregated_data_temp(conn, data_end_str)
     
