@@ -1,0 +1,348 @@
+Poniżej ocena nowego podejścia db_init.py względem starego CreateDatabase.
+
+Werdykt ogólny
+
+⚠️ Kierunek jest dobry, ale obecny db_init.py nie jest jeszcze poprawny produkcyjnie.
+Masz dobry podział odpowiedzialności na:
+	•	db_init = schema/bootstrap
+	•	CreateDatabase = ładowanie i przetwarzanie danych
+
+Ale w obecnej wersji są jeszcze błędy techniczne i braki w kompletności.
+
+⸻
+
+1. Kompletność schematu
+
+✅ OK
+
+Do db_init przeniosłeś część obiektów schematycznych:
+	•	swieta
+	•	group_cust_inv_days
+	•	summary_client_days_tab
+	•	dataset_tab
+	•	statystyki_faktur
+	•	widoki bazowe:
+	•	invo_view
+	•	clhs_view
+	•	DEBC_view
+	•	dcmo_view
+	•	INVO_CLHS_JOINED
+	•	summary_client_days_view
+
+⚠️ Ryzyko
+
+Brakuje pełnej spójności między tym, co db_init tworzy, a tym, czego potem używa runtime.
+
+Przykłady:
+	•	db_init tworzy indeksy na dataset, ale nie tworzy tabeli dataset.
+	•	db_init tworzy indeksy na invo, debc, clhs, dcmo, ale tych tabel też nie tworzy — zakładasz, że zrobi to loader. To może być OK tylko jeśli db_init odpalasz po załadowaniu RAW albo świadomie pomijasz błędy.
+	•	extended_grouped_client_days_tab i INVO_CLHS_JOINED_TAB są częściowo tworzone dynamicznie i to jest zgodne z Twoim założeniem, ale trzeba to jasno traktować jako poza init.
+
+❌ Błąd
+
+W db_init.py masz obiekty wyglądające jak pseudo-deklaracje, które nie robią nic:
+
+query_create_invo_clhs_joined_tab: """
+  CREATE TABLE IF NOT EXISTS INVO_CLHS_JOINED_TAB ( ... );
+"""
+
+To nie jest ani przypisanie, ani użycie. To jest martwy kod.
+
+⸻
+
+2. Poprawność kolejności inicjalizacji
+
+⚠️ Ryzyko
+
+Zasadniczo chciałeś zachować kolejność:
+	•	TABLE
+	•	VIEW
+	•	INDEX
+
+ale w praktyce nie jest ona w pełni zachowana.
+
+❌ Błąd
+
+W db_init.py tworzysz indeksy na tabelach, które mogą jeszcze nie istnieć:
+	•	dataset
+	•	invo
+	•	debc
+	•	clhs
+	•	dcmo
+
+Jeśli te tabele nie istnieją w momencie wywołania cursor.execute(...), to init się wywali.
+
+❌ Błąd
+
+Tworzysz widoki zależne od tabel RAW (invo, debc, clhs, dcmo), ale db_init ich sam nie tworzy.
+To oznacza, że:
+	•	albo db_init musi być uruchamiany po loaderze RAW
+	•	albo trzeba stworzyć puste RAW tables w init
+	•	albo rozdzielić init na dwa etapy:
+	•	schema base
+	•	derived/views
+
+✅ OK
+
+Samo założenie, że część struktur dynamicznych zostaje poza init, jest sensowne.
+
+⸻
+
+3. Porównanie PRZED vs PO
+
+✅ Przeniesione poprawnie
+
+Ze starego CreateDatabase do db_init trafiła logika stricte schematyczna dla:
+	•	części CREATE TABLE
+	•	części CREATE VIEW
+	•	części CREATE INDEX
+
+⚠️ Niepełne przeniesienie
+
+W starym kodzie były jeszcze tworzone lub przygotowywane:
+	•	aggregated_data_temp — w init częściowo, ale z błędem implementacyjnym
+	•	INVO_CLHS_JOINED_TAB
+	•	extended_grouped_client_days_tab
+	•	grouped_client_days
+	•	summary_client_days_tab
+	•	dataset_tab
+	•	indeksy dla wielu tabel pośrednich
+
+Nie wszystko zostało poprawnie i spójnie przeniesione.
+
+❌ Utracone / niespójne
+
+W nowym CreateDatabase usunąłeś część CREATE TABLE / INDEX / VIEW, ale nie wszystko zostało bezpiecznie zastąpione przez db_init.
+
+Największe luki:
+	•	brak pewności istnienia RAW tables przed tworzeniem widoków
+	•	indeksy na tabelach tworzonych dynamicznie nadal częściowo są poza init
+	•	aggregated_data_temp w db_init jest zrobione błędnie
+
+⸻
+
+4. Granica odpowiedzialności
+
+✅ OK
+
+Kierunek jest dobry:
+	•	db_init ma być od schematu
+	•	CreateDatabase ma ładować dane i robić przetwarzanie
+
+⚠️ Ryzyko
+
+db_init nadal zawiera trochę logiki, która nie jest czystą inicjalizacją schematu, tylko miesza bootstrap z późniejszą strukturą derived runtime.
+
+❌ Błąd
+
+CreateDatabase nadal zawiera sporo DDL, więc granica nie jest jeszcze czysta.
+
+W nowym CreateDatabase nadal masz m.in.:
+	•	DROP VIEW IF EXISTS extended_grouped_client_days
+	•	CREATE VIEW extended_grouped_client_days
+	•	create_table_from_view(...)
+	•	DROP VIEW IF EXISTS summary_client_days_view
+	•	inserty do tabel pośrednich wymagające istnienia obiektów schematu
+	•	dynamiczne budowanie dataset
+
+To nie jest jeszcze “tylko loader danych”.
+
+Wniosek
+	•	db_init przejął część odpowiedzialności
+	•	CreateDatabase nadal miesza:
+	•	loading danych
+	•	transformacje
+	•	dynamiczny schema materialization
+
+To jest akceptowalne jako etap przejściowy, ale jeszcze nie jest czysto rozdzielone.
+
+⸻
+
+5. Indeksy
+
+✅ OK
+
+Duża część kluczowych indeksów została zachowana:
+	•	po kluczach joinów
+	•	po (ROK, MIESIAC)
+	•	po (INVO_NO, DZIEN)
+	•	po kluczach CLHS
+	•	po summary_client_days_tab
+	•	po group_cust_inv_days
+
+⚠️ Ryzyko
+
+Masz potencjalne duplikaty / nakładanie się indeksów:
+	•	np. osobne indeksy na pojedynczych kolumnach i dodatkowo indeksy złożone na tych samych tabelach
+	•	część tworzona przez create_indexes(...), część ręcznie przez cursor.execute(...)
+
+To może być OK, ale wymaga przeglądu pod wydajność i koszt insertów.
+
+⚠️ Ryzyko
+
+Niektóre indeksy są tworzone na tabelach, których może jeszcze nie być.
+
+✅ Spójność logiczna
+
+Większość kluczy indeksów odpowiada realnym:
+	•	JOIN
+	•	WHERE
+	•	GROUP BY
+	•	filtrom po dacie / client_id
+
+To jest sensowne.
+
+⸻
+
+6. Gotowość produkcyjna
+
+❌ Błąd
+
+W obecnej postaci db_init.py nie jest w pełni idempotentny.
+
+Powody:
+	•	są DROP TABLE w części dynamicznej poza init, ale sam init nie jest jeszcze bezpieczny dla ponownych uruchomień na niepełnej bazie
+	•	tworzy indeksy i widoki zależne od tabel, które mogą nie istnieć
+	•	ma literówki / błędy zmiennych
+
+❌ Błąd techniczny
+
+W db_init.py używasz cursor, ale tworzysz cur:
+
+cur = conn.cursor()
+cursor.execute(...)
+
+To się wywali od razu.
+
+❌ Błąd techniczny
+
+Brakuje funkcji używanej w db_init.py:
+	•	get_columns(...)
+
+Jest używana, ale nie została zdefiniowana w tym pliku.
+
+⚠️ Ryzyko
+
+Do Azure Pipelines / CI to jeszcze nie jest gotowe, dopóki:
+	•	init nie będzie deterministyczny
+	•	nie będzie wiadomo, czy ma działać na pustej DB czy na DB po RAW load
+	•	nie usuniesz zależności od obiektów nieistniejących jeszcze w momencie bootstrapu
+
+Wniosek
+
+Na dziś:
+	•	jednorazowy bootstrap: ⚠️ częściowo
+	•	odbudowa po awarii: ❌ jeszcze niepewna
+	•	CI / Azure Pipelines: ❌ jeszcze nie
+
+⸻
+
+7. Ryzyka i rekomendacje
+
+❌ Krytyczne błędy do poprawy teraz
+	1.	cursor vs cur
+	•	init się wywali natychmiast
+	2.	brak get_columns() w db_init.py
+	•	init się wywali przy tworzeniu INVO_CLHS_JOINED_TAB
+	3.	tworzenie indeksów / widoków przed istnieniem tabel RAW
+	•	init nie jest bezpieczny na pustej bazie
+	4.	martwe pseudo-deklaracje
+	•	typu:
+
+query_create_invo_clhs_joined_tab: """ ... """
+
+do usunięcia
+
+⚠️ Ważne ryzyka architektoniczne
+	1.	db_init próbuje tworzyć obiekty zależne od danych i obiektów dynamicznych
+	2.	CreateDatabase nadal robi dużo DDL
+	3.	brak jasnego podziału:
+	•	base schema
+	•	derived schema
+	•	runtime materialized tables
+
+⸻
+
+Co zostało świadomie poza init i to NIE jest błąd
+
+To są obiekty dynamiczne / materializowane z danych i sensownie mogą zostać poza db_init na tym etapie:
+	•	dataset
+	•	extended_grouped_client_days_tab
+	•	summary_client_days_tab w sensie zasilania danymi
+	•	grouped_client_days w sensie materializacji z agregacji
+	•	INVO_CLHS_JOINED_TAB jeśli ma zależeć od aktualnych kolumn widoku
+	•	aggregated_data_temp w sensie zasilania wierszami dat
+	•	wszystkie INSERT INTO ... SELECT ...
+	•	tworzenie stats_pivot_view / dataset_raw_view per shard
+
+To jest OK jako etap przejściowy.
+
+⸻
+
+Rekomendowany docelowy podział
+
+Etap teraz
+
+Podziel jasno na 3 warstwy:
+
+1. db_init_base.py
+Tworzy tylko:
+	•	RAW tables
+	•	stałe helper tables
+	•	stałe indeksy RAW
+	•	ewentualnie puste output tables
+
+2. db_init_views.py
+Tworzy tylko:
+	•	widoki bazowe
+	•	widoki pochodne niezależne od danych runtime
+
+3. CreateDatabase/load_client
+Robi:
+	•	inserty danych
+	•	materializacje tabel pośrednich
+	•	batchowe przeliczenia
+	•	budowę dataset
+
+To będzie dużo czystsze.
+
+⸻
+
+Finalny werdykt
+
+1. Kompletność schematu
+
+⚠️ Ryzyko
+Część schematu jest przeniesiona, ale nie wszystko jest spójne i bezpieczne.
+
+2. Kolejność inicjalizacji
+
+❌ Błąd
+Są zależności od obiektów, które mogą jeszcze nie istnieć.
+
+3. PRZED vs PO
+
+⚠️ Ryzyko
+Refaktor idzie w dobrą stronę, ale część elementów została przeniesiona niepełnie.
+
+4. Granica odpowiedzialności
+
+⚠️ Ryzyko
+Lepsza niż wcześniej, ale nadal nieczysta.
+
+5. Indeksy
+
+⚠️ Ryzyko
+Dużo ważnych indeksów jest, ale są możliwe duplikaty i problemy z kolejnością tworzenia.
+
+6. Gotowość produkcyjna
+
+❌ Błąd
+W obecnej formie db_init.py nie jest jeszcze gotowy na bootstrap/CI.
+
+7. Kierunek architektoniczny
+
+✅ OK
+Sam pomysł wydzielenia db_init jest bardzo dobry i warto go kontynuować.
+
+Najkrócej: architektonicznie dobry kierunek, implementacyjnie jeszcze niegotowe.
