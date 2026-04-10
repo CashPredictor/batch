@@ -1,0 +1,84 @@
+mam już takie zapytanie i zapisuję je do excela
+
+df_indexes = pd.read_sql_query("""
+WITH tables AS (
+    SELECT name AS table_name
+    FROM sqlite_master
+    WHERE type = 'table'
+      AND name NOT LIKE 'sqlite_%'
+),
+indexes AS (
+    SELECT
+        tbl_name        AS table_name,
+        name            AS index_name
+    FROM sqlite_master
+    WHERE type = 'index'
+      AND name NOT LIKE 'sqlite_autoindex%'
+),
+index_columns AS (
+    SELECT
+        il.tbl_name     AS table_name,
+        il.name         AS index_name,
+        ii.seqno        AS seq,
+        ii.name         AS column_name
+    FROM sqlite_master il
+    JOIN pragma_index_info(il.name) ii
+    WHERE il.type = 'index'
+      AND il.name NOT LIKE 'sqlite_autoindex%'
+)
+
+SELECT
+    t.table_name                                               AS tabela,
+    i.index_name                                               AS indeks,
+    group_concat(ic.column_name, ', ')                         AS kolumny
+FROM tables t
+LEFT JOIN indexes i
+       ON i.table_name = t.table_name
+LEFT JOIN index_columns ic
+       ON ic.table_name = t.table_name
+      AND ic.index_name = i.index_name
+GROUP BY
+    t.table_name,
+    i.index_name
+ORDER BY
+    t.table_name,
+    i.index_name;
+
+""", conn)
+
+ogranicz to tylko do brakujących tabel:
+	•	invo
+	•	debc
+	•	clhs
+	•	dcmo
+	•	grouped_client_days
+	•	INVO_CLHS_JOINED_TAB
+	•	extended_grouped_client_days_tab
+	•	dataset
+	•	dataset_tab
+	•	group_cust_inv_days
+	•	summary_client_days_tab
+	•	statystyki_faktur
+	•	aggregated_data_temp
+
+dla:
+df_indexes = pd.read_sql_query("""
+PRAGMA table_info(invo);
+""", conn)
+df_indexes
+też dla brakujących tabel zrób mi pętle i zapisz wszystko do jednego excela z kolumnami:
+cid	name	type	notnull	dflt_value	pk
+0	0	INVO_NO	INTEGER	0	None	0
+plus kolumna dla tabeli
+
+oraz podaj mi formułę do polskiego excela, która dla każdej kolumny wygeneruje tekstowo fragment definicji tworzenia tej tabeli 
+oraz początek i koniec tego skryptu kóry później obuduję wszystkie te kolumny i wrzucę do configa treść tego skryptu create tablle bla bla bla INVO_NO INTEGER, ...
+
+to samo dla wszystkich brakujących widoków:
+df_indexes = pd.read_sql_query("""SELECT name, sql
+FROM sqlite_master
+WHERE type = 'view'
+ORDER BY name;
+""", conn)
+df_indexes
+czyli powyższe dla wszystkich brakujących widoków do excela i jedna tabela z nazwą widoku i skryptem create view ....
