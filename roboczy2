@@ -1,36 +1,78 @@
-mam już takie zapytanie i zapisuję je do excela
+Jasne. Poniżej masz gotowy kod do:
+	1.	ograniczenia indeksów tylko do wskazanych tabel,
+	2.	zrobienia pętli po PRAGMA table_info(...) dla brakujących tabel,
+	3.	zapisania wszystkiego do jednego Excela na osobnych arkuszach,
+	4.	wyciągnięcia brakujących widoków do osobnego arkusza,
+	5.	formuł do polskiego Excela, które z wierszy kolumn złożą fragment CREATE TABLE.
 
-df_indexes = pd.read_sql_query("""
+1. Lista brakujących tabel i widoków
+
+Uzupełnij tylko listę brakujących widoków, jeśli już ją znasz.
+
+missing_tables = [
+    'invo',
+    'debc',
+    'clhs',
+    'dcmo',
+    'grouped_client_days',
+    'INVO_CLHS_JOINED_TAB',
+    'extended_grouped_client_days_tab',
+    'dataset',
+    'dataset_tab',
+    'group_cust_inv_days',
+    'summary_client_days_tab',
+    'statystyki_faktur',
+    'aggregated_data_temp'
+]
+
+missing_views = [
+    # wpisz tutaj brakujące widoki, np.
+    # 'my_view_1',
+    # 'my_view_2'
+]
+
+
+⸻
+
+2. Indeksy tylko dla brakujących tabel
+
+import pandas as pd
+
+table_list_sql = ", ".join([f"'{t}'" for t in missing_tables])
+
+df_indexes = pd.read_sql_query(f"""
 WITH tables AS (
     SELECT name AS table_name
     FROM sqlite_master
     WHERE type = 'table'
       AND name NOT LIKE 'sqlite_%'
+      AND name IN ({table_list_sql})
 ),
 indexes AS (
     SELECT
-        tbl_name        AS table_name,
-        name            AS index_name
+        tbl_name AS table_name,
+        name     AS index_name
     FROM sqlite_master
     WHERE type = 'index'
       AND name NOT LIKE 'sqlite_autoindex%'
+      AND tbl_name IN ({table_list_sql})
 ),
 index_columns AS (
     SELECT
-        il.tbl_name     AS table_name,
-        il.name         AS index_name,
-        ii.seqno        AS seq,
-        ii.name         AS column_name
+        il.tbl_name AS table_name,
+        il.name     AS index_name,
+        ii.seqno    AS seq,
+        ii.name     AS column_name
     FROM sqlite_master il
     JOIN pragma_index_info(il.name) ii
     WHERE il.type = 'index'
       AND il.name NOT LIKE 'sqlite_autoindex%'
+      AND il.tbl_name IN ({table_list_sql})
 )
-
 SELECT
-    t.table_name                                               AS tabela,
-    i.index_name                                               AS indeks,
-    group_concat(ic.column_name, ', ')                         AS kolumny
+    t.table_name                       AS tabela,
+    i.index_name                       AS indeks,
+    group_concat(ic.column_name, ', ') AS kolumny
 FROM tables t
 LEFT JOIN indexes i
        ON i.table_name = t.table_name
@@ -43,42 +85,410 @@ GROUP BY
 ORDER BY
     t.table_name,
     i.index_name;
-
 """, conn)
 
-ogranicz to tylko do brakujących tabel:
-	•	invo
-	•	debc
-	•	clhs
-	•	dcmo
-	•	grouped_client_days
-	•	INVO_CLHS_JOINED_TAB
-	•	extended_grouped_client_days_tab
-	•	dataset
-	•	dataset_tab
-	•	group_cust_inv_days
-	•	summary_client_days_tab
-	•	statystyki_faktur
-	•	aggregated_data_temp
-
-dla:
-df_indexes = pd.read_sql_query("""
-PRAGMA table_info(invo);
-""", conn)
 df_indexes
-też dla brakujących tabel zrób mi pętle i zapisz wszystko do jednego excela z kolumnami:
-cid	name	type	notnull	dflt_value	pk
-0	0	INVO_NO	INTEGER	0	None	0
-plus kolumna dla tabeli
 
-oraz podaj mi formułę do polskiego excela, która dla każdej kolumny wygeneruje tekstowo fragment definicji tworzenia tej tabeli 
-oraz początek i koniec tego skryptu kóry później obuduję wszystkie te kolumny i wrzucę do configa treść tego skryptu create tablle bla bla bla INVO_NO INTEGER, ...
 
-to samo dla wszystkich brakujących widoków:
-df_indexes = pd.read_sql_query("""SELECT name, sql
+⸻
+
+3. PRAGMA table_info(...) dla wszystkich brakujących tabel
+
+To zepnie wszystko do jednego DataFrame i doda kolumnę table_name.
+
+table_info_dfs = []
+
+for table_name in missing_tables:
+    df_tmp = pd.read_sql_query(f'PRAGMA table_info("{table_name}");', conn)
+    df_tmp.insert(0, 'table_name', table_name)
+    table_info_dfs.append(df_tmp)
+
+df_table_info = pd.concat(table_info_dfs, ignore_index=True)
+
+df_table_info
+
+Efekt będzie miał kolumny:
+	•	table_name
+	•	cid
+	•	name
+	•	type
+	•	notnull
+	•	dflt_value
+	•	pk
+
+⸻
+
+4. Brakujące widoki
+
+Jeśli chcesz tylko wskazane brakujące widoki:
+
+if missing_views:
+    view_list_sql = ", ".join([f"'{v}'" for v in missing_views])
+
+    df_views = pd.read_sql_query(f"""
+    SELECT
+        name AS view_name,
+        sql  AS view_sql
+    FROM sqlite_master
+    WHERE type = 'view'
+      AND name IN ({view_list_sql})
+    ORDER BY name;
+    """, conn)
+else:
+    df_views = pd.DataFrame(columns=['view_name', 'view_sql'])
+
+df_views
+
+Jeśli chcesz wszystkie widoki, to zamiast powyższego:
+
+df_views = pd.read_sql_query("""
+SELECT
+    name AS view_name,
+    sql  AS view_sql
 FROM sqlite_master
 WHERE type = 'view'
 ORDER BY name;
 """, conn)
-df_indexes
-czyli powyższe dla wszystkich brakujących widoków do excela i jedna tabela z nazwą widoku i skryptem create view ....
+
+df_views
+
+
+⸻
+
+5. Zapis do jednego Excela
+
+Na 3 arkusze:
+	•	indexes
+	•	table_info
+	•	views
+
+output_path = 'sqlite_metadata_missing_objects.xlsx'
+
+with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+    df_indexes.to_excel(writer, sheet_name='indexes', index=False)
+    df_table_info.to_excel(writer, sheet_name='table_info', index=False)
+    df_views.to_excel(writer, sheet_name='views', index=False)
+
+print(f'Zapisano: {output_path}')
+
+
+⸻
+
+6. Dodatkowe kolumny do składania CREATE TABLE
+
+Warto od razu w Pythonie dorzucić pomocnicze kolumny do Excela, żebyś potem łatwo poskładał definicje.
+
+df_table_info_excel = df_table_info.copy()
+
+def format_default(v):
+    if pd.isna(v):
+        return ''
+    return f' DEFAULT {v}'
+
+df_table_info_excel['col_def_python'] = (
+    df_table_info_excel['name'].astype(str) + ' ' +
+    df_table_info_excel['type'].fillna('').astype(str) +
+    df_table_info_excel['notnull'].apply(lambda x: ' NOT NULL' if x == 1 else '') +
+    df_table_info_excel['dflt_value'].apply(format_default) +
+    df_table_info_excel['pk'].apply(lambda x: ' PRIMARY KEY' if x == 1 else '')
+)
+
+df_table_info_excel
+
+Jeśli chcesz zapisywać właśnie tę wersję:
+
+with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+    df_indexes.to_excel(writer, sheet_name='indexes', index=False)
+    df_table_info_excel.to_excel(writer, sheet_name='table_info', index=False)
+    df_views.to_excel(writer, sheet_name='views', index=False)
+
+
+⸻
+
+7. Formuły do polskiego Excela
+
+Załóżmy, że w arkuszu table_info masz kolumny:
+	•	A = table_name
+	•	B = cid
+	•	C = name
+	•	D = type
+	•	E = notnull
+	•	F = dflt_value
+	•	G = pk
+
+i chcesz w kolumnie H generować fragment definicji kolumny.
+
+Formuła dla pojedynczej kolumny tabeli
+
+W H2:
+
+=C2&" "&D2&JEŻELI(E2=1;" NOT NULL";"")&JEŻELI(F2<>"";" DEFAULT "&F2;"")&JEŻELI(G2=1;" PRIMARY KEY";"")
+
+Jeśli F2 może zawierać naprawdę pustą komórkę albo None jako tekst, bezpieczniejsza wersja:
+
+=C2&" "&D2&JEŻELI(E2=1;" NOT NULL";"")&JEŻELI(LUB(F2="";F2="None");"";" DEFAULT "&F2)&JEŻELI(G2=1;" PRIMARY KEY";"")
+
+
+⸻
+
+Początek skryptu CREATE TABLE
+
+W osobnej komórce, np. J2:
+
+="CREATE TABLE "&A2&" ("
+
+To działa dobrze, jeśli dla danej tabeli bierzesz pierwszy wiersz tej tabeli.
+
+⸻
+
+Koniec skryptu
+
+W innej komórce, np. K2:
+
+=");"
+
+
+⸻
+
+Przecinek po kolumnie
+
+Jeżeli chcesz, żeby każda linia miała przecinek poza ostatnią kolumną danej tabeli, to w I2 możesz dać:
+
+=H2&JEŻELI(A2=A3;",";"")
+
+To zakłada, że wiersze są posortowane po table_name i cid.
+
+⸻
+
+Gotowy wiersz kolumny do wklejenia
+
+Jeśli chcesz od razu linię z wcięciem:
+
+="    "&H2&JEŻELI(A2=A3;",";"")
+
+albo z użyciem kolumny I:
+
+="    "&I2
+
+
+⸻
+
+8. Jak złożyć całe CREATE TABLE w Excelu
+
+Najwygodniej zrobić tak:
+	•	kolumna J: początek tylko dla pierwszego wiersza danej tabeli,
+	•	kolumna I: definicja kolumny z przecinkiem,
+	•	kolumna K: koniec tylko dla ostatniego wiersza danej tabeli.
+
+Początek tylko dla pierwszego wiersza tabeli
+
+W J2:
+
+=JEŻELI(A2<>A1;"CREATE TABLE "&A2&" (";"")
+
+Koniec tylko dla ostatniego wiersza tabeli
+
+W K2:
+
+=JEŻELI(A2<>A3;");";"")
+
+Uwaga: dla pierwszego wiersza arkusza możesz zacząć od J2, bo odwołanie do A1 będzie nagłówkiem i i tak zadziała.
+
+⸻
+
+9. Jeśli chcesz zrobić pełne CREATE TABLE już w Pythonie
+
+To nawet lepiej niż składanie ręcznie w Excelu.
+
+def build_create_table_script(df_one_table):
+    table_name = df_one_table['table_name'].iloc[0]
+    lines = []
+
+    for _, row in df_one_table.sort_values('cid').iterrows():
+        col_def = f'{row["name"]} {row["type"]}'
+        if row['notnull'] == 1:
+            col_def += ' NOT NULL'
+        if pd.notna(row['dflt_value']):
+            col_def += f' DEFAULT {row["dflt_value"]}'
+        if row['pk'] == 1:
+            col_def += ' PRIMARY KEY'
+        lines.append(f'    {col_def}')
+
+    sql = f'CREATE TABLE {table_name} (\n' + ',\n'.join(lines) + '\n);'
+    return sql
+
+create_table_rows = []
+for table_name, df_grp in df_table_info.groupby('table_name'):
+    create_table_rows.append({
+        'table_name': table_name,
+        'create_table_sql': build_create_table_script(df_grp)
+    })
+
+df_create_tables = pd.DataFrame(create_table_rows)
+df_create_tables
+
+I to możesz dodać jako kolejny arkusz:
+
+with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+    df_indexes.to_excel(writer, sheet_name='indexes', index=False)
+    df_table_info_excel.to_excel(writer, sheet_name='table_info', index=False)
+    df_create_tables.to_excel(writer, sheet_name='create_tables', index=False)
+    df_views.to_excel(writer, sheet_name='views', index=False)
+
+
+⸻
+
+10. Finalna wersja kompletna
+
+To już gotowy blok do odpalenia:
+
+import pandas as pd
+
+missing_tables = [
+    'invo',
+    'debc',
+    'clhs',
+    'dcmo',
+    'grouped_client_days',
+    'INVO_CLHS_JOINED_TAB',
+    'extended_grouped_client_days_tab',
+    'dataset',
+    'dataset_tab',
+    'group_cust_inv_days',
+    'summary_client_days_tab',
+    'statystyki_faktur',
+    'aggregated_data_temp'
+]
+
+missing_views = [
+    # uzupełnij jeśli chcesz tylko wybrane
+]
+
+table_list_sql = ", ".join([f"'{t}'" for t in missing_tables])
+
+df_indexes = pd.read_sql_query(f"""
+WITH tables AS (
+    SELECT name AS table_name
+    FROM sqlite_master
+    WHERE type = 'table'
+      AND name NOT LIKE 'sqlite_%'
+      AND name IN ({table_list_sql})
+),
+indexes AS (
+    SELECT
+        tbl_name AS table_name,
+        name     AS index_name
+    FROM sqlite_master
+    WHERE type = 'index'
+      AND name NOT LIKE 'sqlite_autoindex%'
+      AND tbl_name IN ({table_list_sql})
+),
+index_columns AS (
+    SELECT
+        il.tbl_name AS table_name,
+        il.name     AS index_name,
+        ii.seqno    AS seq,
+        ii.name     AS column_name
+    FROM sqlite_master il
+    JOIN pragma_index_info(il.name) ii
+    WHERE il.type = 'index'
+      AND il.name NOT LIKE 'sqlite_autoindex%'
+      AND il.tbl_name IN ({table_list_sql})
+)
+SELECT
+    t.table_name                       AS tabela,
+    i.index_name                       AS indeks,
+    group_concat(ic.column_name, ', ') AS kolumny
+FROM tables t
+LEFT JOIN indexes i
+       ON i.table_name = t.table_name
+LEFT JOIN index_columns ic
+       ON ic.table_name = t.table_name
+      AND ic.index_name = i.index_name
+GROUP BY
+    t.table_name,
+    i.index_name
+ORDER BY
+    t.table_name,
+    i.index_name;
+""", conn)
+
+table_info_dfs = []
+for table_name in missing_tables:
+    df_tmp = pd.read_sql_query(f'PRAGMA table_info("{table_name}");', conn)
+    df_tmp.insert(0, 'table_name', table_name)
+    table_info_dfs.append(df_tmp)
+
+df_table_info = pd.concat(table_info_dfs, ignore_index=True)
+
+df_table_info_excel = df_table_info.copy()
+
+def format_default(v):
+    if pd.isna(v):
+        return ''
+    return f' DEFAULT {v}'
+
+df_table_info_excel['col_def_python'] = (
+    df_table_info_excel['name'].astype(str) + ' ' +
+    df_table_info_excel['type'].fillna('').astype(str) +
+    df_table_info_excel['notnull'].apply(lambda x: ' NOT NULL' if x == 1 else '') +
+    df_table_info_excel['dflt_value'].apply(format_default) +
+    df_table_info_excel['pk'].apply(lambda x: ' PRIMARY KEY' if x == 1 else '')
+)
+
+def build_create_table_script(df_one_table):
+    table_name = df_one_table['table_name'].iloc[0]
+    lines = []
+
+    for _, row in df_one_table.sort_values('cid').iterrows():
+        col_def = f'{row["name"]} {row["type"]}'
+        if row['notnull'] == 1:
+            col_def += ' NOT NULL'
+        if pd.notna(row['dflt_value']):
+            col_def += f' DEFAULT {row["dflt_value"]}'
+        if row['pk'] == 1:
+            col_def += ' PRIMARY KEY'
+        lines.append(f'    {col_def}')
+
+    return f'CREATE TABLE {table_name} (\n' + ',\n'.join(lines) + '\n);'
+
+df_create_tables = pd.DataFrame([
+    {
+        'table_name': table_name,
+        'create_table_sql': build_create_table_script(df_grp)
+    }
+    for table_name, df_grp in df_table_info.groupby('table_name')
+])
+
+if missing_views:
+    view_list_sql = ", ".join([f"'{v}'" for v in missing_views])
+    df_views = pd.read_sql_query(f"""
+    SELECT
+        name AS view_name,
+        sql  AS view_sql
+    FROM sqlite_master
+    WHERE type = 'view'
+      AND name IN ({view_list_sql})
+    ORDER BY name;
+    """, conn)
+else:
+    df_views = pd.read_sql_query("""
+    SELECT
+        name AS view_name,
+        sql  AS view_sql
+    FROM sqlite_master
+    WHERE type = 'view'
+    ORDER BY name;
+    """, conn)
+
+output_path = 'sqlite_metadata_missing_objects.xlsx'
+
+with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+    df_indexes.to_excel(writer, sheet_name='indexes', index=False)
+    df_table_info_excel.to_excel(writer, sheet_name='table_info', index=False)
+    df_create_tables.to_excel(writer, sheet_name='create_tables', index=False)
+    df_views.to_excel(writer, sheet_name='views', index=False)
+
+print(f'Zapisano: {output_path}')
+
+Jeśli chcesz, mogę Ci jeszcze przygotować drugą wersję, która od razu generuje też CREATE INDEX dla tych brakujących indeksów.
