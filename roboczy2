@@ -1,454 +1,270 @@
-Tak — w dużej mierze git, ale z ważnym rozdzieleniem:
-
-Co wrzucić do config.yaml już teraz
-
-To są obiekty stabilne i nadają się do init:
-
-TABLE
-
-W first_model_params dodaj:
-
-query_create_invo_table: |
-  CREATE TABLE IF NOT EXISTS invo (
-    ...
-  );
-
-query_create_debc_table: |
-  CREATE TABLE IF NOT EXISTS debc (
-    ...
-  );
-
-query_create_clhs_table: |
-  CREATE TABLE IF NOT EXISTS clhs (
-    ...
-  );
+faktycznie extended_grouped_client_days jest ucięty, jak pobrać pełną definicję widoku z sqllite żeby dodać ją do configa?
 
-query_create_dcmo_table: |
-  CREATE TABLE IF NOT EXISTS dcmo (
-    ...
-  );
-
-query_create_grouped_client_days_table: |
-  CREATE TABLE IF NOT EXISTS grouped_client_days (
-    ...
-  );
+poniżej aktualny init po dodaniu wszystkich skryptów do configa i użycia ich w init:
+# db_init.py
+import argparse
+import os
+import sqlite3
+import sys
+import yaml
+
 
-query_create_invo_clhs_joined_tab_table: |
-  CREATE TABLE IF NOT EXISTS INVO_CLHS_JOINED_TAB (
-    ...
-  );
+def load_config(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def exec_sql(conn: sqlite3.Connection, sql: str | None, label: str = "") -> None:
+    if not sql:
+        return
+    try:
+        conn.executescript(sql)
+    except sqlite3.Error as e:
+        raise RuntimeError(f"Błąd podczas wykonywania SQL [{label}]: {e}") from e
+
+
+def table_exists(cursor: sqlite3.Cursor, table_name: str) -> bool:
+    cursor.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table' AND name = ?
+        LIMIT 1
+        """,
+        (table_name,),
+    )
+    return cursor.fetchone() is not None
+
+
+def view_exists(cursor: sqlite3.Cursor, view_name: str) -> bool:
+    cursor.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'view' AND name = ?
+        LIMIT 1
+        """,
+        (view_name,),
+    )
+    return cursor.fetchone() is not None
+
+
+def get_columns(cursor: sqlite3.Cursor, view_name: str):
+    cursor.execute(f"PRAGMA table_info({view_name});")
+    return [(col[1], col[2]) for col in cursor.fetchall()]
+
+
+def get_columns_from_view(cursor: sqlite3.Cursor, view_name: str):
+    cursor.execute(f"PRAGMA table_info({view_name});")
+    return [col[1] for col in cursor.fetchall()]
+
+
+def create_indexes(index_definitions: dict[str, list[str]], conn: sqlite3.Connection) -> None:
+    cursor = conn.cursor()
+
+    for table_name, columns in index_definitions.items():
+        if not table_exists(cursor, table_name):
+            print(f"[WARN] Pomijam indeksy dla '{table_name}' – tabela jeszcze nie istnieje.")
+            continue
+
+        for column in columns:
+            index_name = f"{table_name}_{column}_idx"
+            sql_query = f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} ({column});"
+            cursor.execute(sql_query)
+
+    conn.commit()
+
+
+def create_aggregated_data_temp_schema(cursor: sqlite3.Cursor) -> None:
+    cursor.execute(params.get("query_aggregated_data_temp"))
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ag_day
+        ON aggregated_data_temp (DZIEN);
+    """)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="SQLite DB schema initialization")
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--db-path", required=True)
+    args = parser.parse_args()
+
+    # 1. Fail, jeśli DB już istnieje
+    if os.path.exists(args.db_path):
+        print(f"[ERROR] Baza już istnieje: {args.db_path}")
+        sys.exit(1)
+
+    os.makedirs(os.path.dirname(args.db_path), exist_ok=True)
+
+    cfg = load_config(args.config)
+    params = cfg["first_model_params"]
+
+    conn = sqlite3.connect(args.db_path)
+    cursor = conn.cursor()
+
+    try:
+        # ============================================================
+        # 2. Tabele statyczne / deterministyczne
+        # ============================================================
+        create_aggregated_data_temp_schema(cursor)
+
+        exec_sql(conn, params.get("query_swieta"), "query_swieta")
+        exec_sql(conn, params.get("query_create_group_cust_inv_days"), "query_create_group_cust_inv_days")
+        exec_sql(conn, params.get("query_create_summary_client_days_tab2"), "query_create_summary_client_days_tab2")
+        exec_sql(conn, params.get("query_create_dataset_tab"), "query_create_dataset_tab")
+        exec_sql(conn, params.get("statystyki_faktur"), "statystyki_faktur")
+
+        exec_sql(conn, params.get("query_create_invo_table"), "query_create_invo_table")
+        exec_sql(conn, params.get("query_create_debc_table"), "query_create_debc_table")
+        exec_sql(conn, params.get("query_create_clhs_table"), "query_create_clhs_table")
+        exec_sql(conn, params.get("query_create_dcmo_table"), "query_create_dcmo_table")
+        
+        exec_sql(conn, params.get("query_create_grouped_client_days_table"), "query_create_grouped_client_days_table")
+        exec_sql(conn, params.get("query_create_dataset"), "query_create_dataset")
+        exec_sql(conn, params.get("query_create_invo_clhs_joined_tab_table"), "query_create_invo_clhs_joined_tab_table")
+        exec_sql(conn, params.get("query_create_extended_grouped_client_days_tab_table"), "query_create_extended_grouped_client_days_tab_table")
+        exec_sql(conn, params.get("statystyki_faktur"), "statystyki_faktur")
+        exec_sql(conn, params.get("query_swieta"), "query_swieta")        
+
+        conn.commit()
+
+        # ============================================================
+        # 3. Widoki bazowe – tylko jeśli ich tabele źródłowe już istnieją
+        #    (na dziś najpewniej jeszcze nie istnieją na pustej DB)
+        # ============================================================
+        raw_tables = ["invo", "debc", "clhs", "dcmo"]
+        raw_ready = all(table_exists(cursor, t) for t in raw_tables)
+
+        if raw_ready:
+            exec_sql(conn, params.get("query_create_invo_view"), "query_create_invo_view")
+            exec_sql(conn, params.get("query_create_clhs_view"), "query_create_clhs_view")
+            exec_sql(conn, params.get("query_create_DEBC_view"), "query_create_DEBC_view")
+            exec_sql(conn, params.get("query_create_dcmo_view"), "query_create_dcmo_view")
+            exec_sql(conn, params.get("query_create_INVO_CLHS_JOINED"), "query_create_INVO_CLHS_JOINED")
+            exec_sql(conn, params.get("query_create_summary_client_days_view"), "query_create_summary_client_days_view")
+            exec_sql(conn, params.get("query_create_invo_view"), "query_create_invo_view")
+            exec_sql(conn, params.get("query_create_clhs_view"), "query_create_clhs_view")
+            exec_sql(conn, params.get("query_create_DEBC_view"), "query_create_DEBC_view")
+            exec_sql(conn, params.get("query_create_dcmo_view"), "query_create_dcmo_view")
+            exec_sql(conn, params.get("query_create_INVO_CLHS_JOINED"), "query_create_INVO_CLHS_JOINED")
+            exec_sql(conn, params.get("query_create_extended_grouped_client_days_view"), "query_create_extended_grouped_client_days_view")
+            exec_sql(conn, params.get("query_create_summary_client_days_view"), "query_create_summary_client_days_view")            
+            conn.commit()
+        else:
+            print(
+                "[WARN] Pomijam tworzenie widoków bazowych, bo brakuje tabel RAW: "
+                "invo / debc / clhs / dcmo."
+            )
+
+
+        # ============================================================
+        # 5. Indeksy na znanych tabelach
+        # ============================================================
+        index_definitions = {
+            "invo": ["INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO"],
+            "debc": ["DEBC_NO", "DEBC_DEBH", "DEBC_ADMNO", "DEBC_CLNTNO", "DEBC_REINSURANCENUMBER"],
+            "clhs": ["CLHS_NO", "CLHS_DEBC_NO", "CLHS_DEBH_NO", "CLHS_ADMNO", "CLHS_CLNTNO", "CLHS_DATCHANGED", "CLHS_TIMCHANGED"],
+            "dcmo": ["DCMO_DEBC_NO", "DCMO_YEAR", "DCMO_MONTH"],
+            "group_cust_inv_days": ["INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "INVO_DEBC_NO", "DZIEN", "MIESIAC", "ROK"],
+            "grouped_client_days": ["INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "INVO_DEBC_NO", "DZIEN", "MIESIAC", "ROK"],
+            "INVO_CLHS_JOINED_TAB": ["INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "INVO_DEBC_NO", "CLHS_NEXT_CHANGED_DATETIME", "CLHS_CHANGED_DATETIME", "CLHS_LIMITOLD", "CLHS_LIMITNEW"],
+        }
+        create_indexes(index_definitions, conn)
+
+        # indeksy jawnie z configu: idx_*
+        for key, sql in params.items():
+            if not key.startswith("idx_"):
+                continue
+            try:
+                exec_sql(conn, sql, key)
+            except RuntimeError as e:
+                print(f"[WARN] Pomijam {key}: {e}")
+
+        # kilka jawnych indeksów, jeśli tabele istnieją
+        if table_exists(cursor, "dataset"):
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dataset_inv_day ON dataset (INVO_NO, INVO_CLNTNO, DZIEN DESC);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dataset_clear ON dataset (INVO_CLNTNO, INVO_FINALPAYMENTDATE);")
+
+        if table_exists(cursor, "summary_client_days_tab"):
+            cursor.execute("CREATE INDEX IF NOT EXISTS summary_client_days_tab_idx_one_for_all ON summary_client_days_tab (ROK, MIESIAC);")
+
+        if table_exists(cursor, "group_cust_inv_days"):
+            cursor.execute("CREATE INDEX IF NOT EXISTS group_cust_inv_days_idx_year_month ON group_cust_inv_days (ROK, MIESIAC);")
+
+        if table_exists(cursor, "invo"):
+            cursor.execute("CREATE INDEX IF NOT EXISTS invo_idx_one_for_all ON invo (INVO_ADMNO, INVO_DEBH_NO, INVO_DEBC_NO, INVO_INVDATE);")
+
+        conn.commit()
+
+        print(f"[OK] Database schema initialized: {args.db_path}")
+
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
+
+
+sprawdź czy mamy już wszystkie tabele i indeksy, poniżej masz listę ich wszystkich jakie powinny być:
+tabela	indeks	kolumny
+INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_CLHS_CHANGED_DATETIME_idx	CLHS_CHANGED_DATETIME
+INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_CLHS_LIMITNEW_idx	CLHS_LIMITNEW
+INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_CLHS_LIMITOLD_idx	CLHS_LIMITOLD
+INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_CLHS_NEXT_CHANGED_DATETIME_idx	CLHS_NEXT_CHANGED_DATETIME
+INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_INVO_ADMNO_idx	INVO_ADMNO
+INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_INVO_CLNTNO_idx	INVO_CLNTNO
+INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_INVO_DEBC_NO_idx	INVO_DEBC_NO
+INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_INVO_DEBH_NO_idx	INVO_DEBH_NO
+INVO_CLHS_JOINED_TAB	INVO_CLHS_JOINED_TAB_INVO_NO_idx	INVO_NO
+INVO_CLHS_JOINED_TAB	idx_clhs_joined_keys_datetime	CLHS_CHANGED_DATETIME, INVO_ADMNO, INVO_CLNTNO, INVO_DEBC_NO, INVO_DEBH_NO, INVO_NO
+aggregated_data_temp	idx_ag_day	DZIEN
+clhs	clhs_CLHS_ADMNO_idx	CLHS_ADMNO
+clhs	clhs_CLHS_CLNTNO_idx	CLHS_CLNTNO
+clhs	clhs_CLHS_DATCHANGED_idx	CLHS_DATCHANGED
+clhs	clhs_CLHS_DEBC_NO_idx	CLHS_DEBC_NO
+clhs	clhs_CLHS_DEBH_NO_idx	CLHS_DEBH_NO
+clhs	clhs_CLHS_NO_idx	CLHS_NO
+clhs	clhs_CLHS_TIMCHANGED_idx	CLHS_TIMCHANGED
+dataset	idx_dataset_clear	INVO_FINALPAYMENTDATE
+dataset	idx_dataset_inv_day	DZIEN, INVO_NO
+dataset_tab		
+dcmo	dcmo_DCMO_DEBC_NO_idx	DCMO_DEBC_NO
+dcmo	dcmo_DCMO_MONTH_idx	DCMO_MONTH
+dcmo	dcmo_DCMO_YEAR_idx	DCMO_YEAR
+debc	debc_DEBC_ADMNO_idx	DEBC_ADMNO
+debc	debc_DEBC_CLNTNO_idx	DEBC_CLNTNO
+debc	debc_DEBC_DEBH_idx	DEBC_DEBH
+debc	debc_DEBC_NO_idx	DEBC_NO
+debc	debc_DEBC_REINSURANCENUMBER_idx	DEBC_REINSURANCENUMBER
+extended_grouped_client_days_tab	idx_ext_days_ids_dzien	DZIEN, INVO_ADMNO, INVO_CLNTNO, INVO_DEBC_NO, INVO_DEBH_NO
+group_cust_inv_days	group_cust_inv_days_DZIEN_idx	DZIEN
+group_cust_inv_days	group_cust_inv_days_INVO_ADMNO_idx	INVO_ADMNO
+group_cust_inv_days	group_cust_inv_days_INVO_CLNTNO_idx	INVO_CLNTNO
+group_cust_inv_days	group_cust_inv_days_INVO_DEBC_NO_idx	INVO_DEBC_NO
+group_cust_inv_days	group_cust_inv_days_INVO_DEBH_NO_idx	INVO_DEBH_NO
+group_cust_inv_days	group_cust_inv_days_INVO_NO_idx	INVO_NO
+group_cust_inv_days	group_cust_inv_days_MIESIAC_idx	MIESIAC
+group_cust_inv_days	group_cust_inv_days_ROK_idx	ROK
+group_cust_inv_days	group_cust_inv_days_idx_one_for_all	DZIEN, INVO_ADMNO, INVO_CLNTNO, INVO_DEBC_NO, INVO_DEBH_NO
+group_cust_inv_days	group_cust_inv_days_idx_year_month	MIESIAC, ROK
+grouped_client_days	grouped_client_days_DZIEN_idx	DZIEN
+grouped_client_days	grouped_client_days_INVO_ADMNO_idx	INVO_ADMNO
+grouped_client_days	grouped_client_days_INVO_CLNTNO_idx	INVO_CLNTNO
+grouped_client_days	grouped_client_days_INVO_DEBC_NO_idx	INVO_DEBC_NO
+grouped_client_days	grouped_client_days_INVO_DEBH_NO_idx	INVO_DEBH_NO
+grouped_client_days	grouped_client_days_MIESIAC_idx	MIESIAC
+grouped_client_days	grouped_client_days_ROK_idx	ROK
+invo	idx_invo_debcno_invdate	INVO_DEBC_NO, INVO_INVDATE
+invo	idx_invo_debcno_invdate_etc	INVO_ADMNO, INVO_CLNTNO, INVO_DEBC_NO, INVO_DEBH_NO, INVO_INVDATE
+invo	invo_INVO_ADMNO_idx	INVO_ADMNO
+invo	invo_INVO_CLNTNO_idx	INVO_CLNTNO
+invo	invo_INVO_DEBH_NO_idx	INVO_DEBH_NO
+invo	invo_INVO_NO_idx	INVO_NO
+invo	invo_idx_one_for_all	INVO_ADMNO, INVO_DEBC_NO, INVO_DEBH_NO, INVO_INVDATE
+statystyki_faktur	idx_statystyki_keys_day_param_scen	DZIEN, INVO_ADMNO, INVO_CLNTNO, INVO_DEBC_NO, INVO_DEBH_NO, PARAM_Z_ILU_DNI, SCENARIUSZ
+statystyki_faktur	statystyki_faktur_idx_one_for_all	DZIEN, INVO_ADMNO, INVO_CLNTNO, INVO_DEBC_NO, INVO_DEBH_NO, PARAM_Z_ILU_DNI, SCENARIUSZ
+summary_client_days_tab	idx_summary_days_ids_dzien	DZIEN, INVO_CLNTNO, INVO_DEBC_NO, INVO_DEBH_NO
+summary_client_days_tab	summary_client_days_tab_idx_one_for_all	MIESIAC, ROK
+jeżeli czegoś brakuje w init to podaj mi kod jaki mam dodać do configa aby je utworzyć i podaj mi wywołanie w init
 
-query_create_extended_grouped_client_days_tab_table: |
-  CREATE TABLE IF NOT EXISTS extended_grouped_client_days_tab (
-    ...
-  );
-
-query_create_dataset_table: |
-  CREATE TABLE IF NOT EXISTS dataset (
-    ...
-  );
-
-VIEW
-
-Dodaj:
-
-query_create_DEBC_view: |
-  CREATE VIEW IF NOT EXISTS DEBC_view AS
-  SELECT
-    ...
-  ;
-
-query_create_INVO_CLHS_JOINED: |
-  CREATE VIEW IF NOT EXISTS INVO_CLHS_JOINED AS
-  SELECT
-    ...
-  ;
-
-query_create_clhs_view: |
-  CREATE VIEW IF NOT EXISTS clhs_view AS
-  SELECT
-    ...
-  ;
-
-query_create_dcmo_view: |
-  CREATE VIEW IF NOT EXISTS dcmo_view AS
-  WITH maxes AS (
-    ...
-  )
-  SELECT
-    ...
-  ;
-
-query_create_extended_grouped_client_days_view: |
-  CREATE VIEW IF NOT EXISTS extended_grouped_client_days AS
-  SELECT
-    ...
-  ;
-
-query_create_invo_view: |
-  CREATE VIEW IF NOT EXISTS invo_view AS
-  SELECT
-    ...
-  ;
-
-query_create_summary_client_days_view: |
-  CREATE VIEW IF NOT EXISTS summary_client_days_view AS
-  SELECT
-    ...
-  ;
-
-
-⸻
-
-Czego nie wrzucać teraz do init
-
-Tego na razie nie przenoś do init, bo to jest runtime/dynamiczne:
-
-Nie dodawaj do init:
-	•	dataset_raw_view
-	•	stats_pivot_view
-
-Powód:
-	•	dataset_raw_view zależy od aktualnego stats_pivot_view
-	•	stats_pivot_view u Ciebie jest powiązany z wariantem shardów / filtrem runtime
-	•	to jest logika przetwarzania danych, nie bootstrap schematu
-
-Czyli:
-	•	schema tabel → init
-	•	widoki runtime zależne od konkretnego przebiegu → zostają w CreateDatabase
-
-⸻
-
-Jakie klucze z Twoich obecnych rzeczy już masz i zostają
-
-Tego nie ruszaj, bo już pasuje:
-	•	query_create_group_cust_inv_days
-	•	query_create_summary_client_days_tab2
-	•	query_create_dataset_tab
-	•	statystyki_faktur
-	•	query_swieta
-
-⸻
-
-Gdzie to wkleić w config.yaml
-
-Do sekcji:
-
-first_model_params:
-
-Czyli finalnie w first_model_params będziesz mieć:
-	•	stare query_create_*
-	•	nowe query_create_*_table
-	•	nowe query_create_*_view
-
-⸻
-
-Co dodać do db_init.py
-
-1. W sekcji TABLES dopisz:
-
-# --- TABLES ---
-exec_sql(conn, params.get("query_create_invo_table"), "query_create_invo_table")
-exec_sql(conn, params.get("query_create_debc_table"), "query_create_debc_table")
-exec_sql(conn, params.get("query_create_clhs_table"), "query_create_clhs_table")
-exec_sql(conn, params.get("query_create_dcmo_table"), "query_create_dcmo_table")
-
-exec_sql(conn, params.get("query_create_group_cust_inv_days"), "query_create_group_cust_inv_days")
-exec_sql(conn, params.get("query_create_grouped_client_days_table"), "query_create_grouped_client_days_table")
-exec_sql(conn, params.get("query_create_summary_client_days_tab2"), "query_create_summary_client_days_tab2")
-exec_sql(conn, params.get("query_create_dataset_tab"), "query_create_dataset_tab")
-exec_sql(conn, params.get("query_create_dataset_table"), "query_create_dataset_table")
-exec_sql(conn, params.get("query_create_invo_clhs_joined_tab_table"), "query_create_invo_clhs_joined_tab_table")
-exec_sql(conn, params.get("query_create_extended_grouped_client_days_tab_table"), "query_create_extended_grouped_client_days_tab_table")
-exec_sql(conn, params.get("statystyki_faktur"), "statystyki_faktur")
-exec_sql(conn, params.get("query_swieta"), "query_swieta")
-
-
-⸻
-
-2. W sekcji VIEWS dopisz:
-
-# --- VIEWS ---
-exec_sql(conn, params.get("query_create_invo_view"), "query_create_invo_view")
-exec_sql(conn, params.get("query_create_clhs_view"), "query_create_clhs_view")
-exec_sql(conn, params.get("query_create_DEBC_view"), "query_create_DEBC_view")
-exec_sql(conn, params.get("query_create_dcmo_view"), "query_create_dcmo_view")
-exec_sql(conn, params.get("query_create_INVO_CLHS_JOINED"), "query_create_INVO_CLHS_JOINED")
-exec_sql(conn, params.get("query_create_extended_grouped_client_days_view"), "query_create_extended_grouped_client_days_view")
-exec_sql(conn, params.get("query_create_summary_client_days_view"), "query_create_summary_client_days_view")
-
-
-⸻
-
-3. Usuń z db_init.py
-
-Usuń wszystko, co:
-	•	buduje tabelę z widoku przez introspekcję
-	•	robi dynamiczne odgadywanie kolumn
-
-Czyli wytnij:
-	•	create_table_from_view_schema(...)
-	•	ewentualne stare ręczne budowanie INVO_CLHS_JOINED_TAB z PRAGMA table_info
-	•	wszelkie stare fragmenty typu:
-	•	view_columns = get_columns(...)
-	•	column_definitions = []
-	•	DROP TABLE IF EXISTS ...
-	•	CREATE TABLE ... składane z pythona
-
-Bo teraz masz już jawne DDL w configu.
-
-⸻
-
-Co zostaje dynamiczne w CreateDatabase
-
-Na ten moment:
-	•	inserty do invo/debc/clhs/dcmo
-	•	inserty do group_cust_inv_days
-	•	insert/select do INVO_CLHS_JOINED_TAB
-	•	insert/select do grouped_client_days
-	•	insert/select do extended_grouped_client_days_tab
-	•	insert/select do summary_client_days_tab
-	•	insert/select do statystyki_faktur
-	•	insert/select do dataset_tab
-	•	transformacja dataset_tab -> dataset
-	•	runtime views:
-	•	stats_pivot_view
-	•	dataset_raw_view
-
-To jest sensowny podział na tym etapie.
-
-⸻
-
-Dwie ważne uwagi
-
-1. Twoje bardzo długie VIEW są ucięte
-
-W wiadomości:
-	•	extended_grouped_client_days
-	•	stats_pivot_view
-
-są wyraźnie ucięte. Tych wersji nie wklejaj jeszcze do configa, jeśli nie masz pełnego SQL-a.
-
-2. dataset_raw_view i stats_pivot_view zostaw poza init
-
-Nawet jeśli masz pełne SQL-e, na razie ich nie przenoś do init.
-
-⸻
-
-Minimalna lista nowych kluczy do dodania
-
-Dodaj te nazwy do config.yaml:
-
-query_create_invo_table
-query_create_debc_table
-query_create_clhs_table
-query_create_dcmo_table
-query_create_grouped_client_days_table
-query_create_invo_clhs_joined_tab_table
-query_create_extended_grouped_client_days_tab_table
-query_create_dataset_table
-query_create_extended_grouped_client_days_view
-
-A z istniejących używaj dalej:
-
-query_create_invo_view
-query_create_clhs_view
-query_create_DEBC_view
-query_create_dcmo_view
-query_create_INVO_CLHS_JOINED
-query_create_summary_client_days_view
-query_create_group_cust_inv_days
-query_create_summary_client_days_tab2
-query_create_dataset_tab
-statystyki_faktur
-query_swieta
-
-
-⸻
-
-Werdykt
-
-✅ Tak, kierunek jest dobry
-
-Masz już komplet definicji dla najważniejszych tabel.
-
-⚠️ Jeszcze nie wszystko przenoś
-
-Nie przenoś teraz do init:
-	•	dataset_raw_view
-	•	stats_pivot_view
-
-✅ Następny krok
-
-Dodać powyższe klucze do configa i podmienić sekcje TABLES/VIEWS w db_init.py.
-
-Jeśli chcesz, w następnym kroku mogę Ci od razu rozpisać gotowy blok first_model_params: z samymi nazwami i placeholderami do wklejenia w YAML.
-
-
-Tak — przy takim założeniu to się upraszcza.
-
-Co zmienia Twoja decyzja
-
-Jeżeli:
-	•	okna/statystyki są na sztywno,
-	•	shardy są na sztywno,
-	•	i dataset_raw_view / stats_pivot_view nie będą już składane dynamicznie w Pythonie,
-
-to te widoki też można przenieść do configa i tworzyć w db_init.
-
-W praktyce
-
-To oznacza:
-
-Do config.yaml możesz dodać jeszcze:
-
-query_create_stats_pivot_view: |
-  CREATE VIEW IF NOT EXISTS stats_pivot_view AS
-  SELECT
-    ...
-  ;
-
-query_create_dataset_raw_view: |
-  CREATE VIEW IF NOT EXISTS dataset_raw_view AS
-  SELECT
-    ...
-  ;
-
-A w db_init.py dopisać:
-
-w sekcji VIEWS, po utworzeniu tabel i wcześniejszych widoków:
-
-exec_sql(conn, params.get("query_create_stats_pivot_view"), "query_create_stats_pivot_view")
-exec_sql(conn, params.get("query_create_dataset_raw_view"), "query_create_dataset_raw_view")
-
-Ważna konsekwencja
-
-Skoro to ma być stałe, to w CreateDatabase powinieneś potem usunąć generowanie tych widoków w pętli, czyli wyciąć logikę typu:
-	•	pivot_sql = ...replace("{shard_condition}", ...)
-	•	raw_sql = ...replace("{shard_condition}", ...)
-	•	DROP VIEW IF EXISTS stats_pivot_view
-	•	DROP VIEW IF EXISTS dataset_raw_view
-	•	cursor.execute(pivot_sql)
-	•	cursor.execute(raw_sql)
-
-i zostawić tylko:
-	•	inserty do tabel,
-	•	INSERT INTO dataset_tab SELECT * FROM dataset_raw_view ...
-
-Czyli docelowy podział będzie taki
-
-db_init
-
-trzyma:
-	•	wszystkie CREATE TABLE
-	•	wszystkie CREATE VIEW
-	•	wszystkie CREATE INDEX
-
-CreateDatabase
-
-trzyma tylko:
-	•	ładowanie danych
-	•	czyszczenie danych klienta
-	•	inserty / appendy
-	•	przeliczenia i zasilenie tabel wynikowych
-
-Co to daje
-
-To jest lepsze, bo:
-	•	schema jest w jednym miejscu,
-	•	CreateDatabase przestaje być pół-init, pół-loaderem,
-	•	jesteś bliżej późniejszego przejścia na PostgreSQL.
-
-Jedno zastrzeżenie
-
-Jeżeli nadal chcesz kiedyś wrócić do wielu shardów jako osobnych wariantów, to zamiast jednego dataset_raw_view lepiej byłoby mieć:
-	•	albo kilka nazwanych widoków,
-	•	albo od razu zrezygnować z view i robić INSERT ... SELECT ... WHERE ... z parametrem.
-
-Ale na ten etap, przy sztywnym wariancie, Twoje podejście jest sensowne.
-
-drugi
-
-Tak — przy takim założeniu to się upraszcza.
-
-Co zmienia Twoja decyzja
-
-Jeżeli:
-	•	okna/statystyki są na sztywno,
-	•	shardy są na sztywno,
-	•	i dataset_raw_view / stats_pivot_view nie będą już składane dynamicznie w Pythonie,
-
-to te widoki też można przenieść do configa i tworzyć w db_init.
-
-W praktyce
-
-To oznacza:
-
-Do config.yaml możesz dodać jeszcze:
-
-query_create_stats_pivot_view: |
-  CREATE VIEW IF NOT EXISTS stats_pivot_view AS
-  SELECT
-    ...
-  ;
-
-query_create_dataset_raw_view: |
-  CREATE VIEW IF NOT EXISTS dataset_raw_view AS
-  SELECT
-    ...
-  ;
-
-A w db_init.py dopisać:
-
-w sekcji VIEWS, po utworzeniu tabel i wcześniejszych widoków:
-
-exec_sql(conn, params.get("query_create_stats_pivot_view"), "query_create_stats_pivot_view")
-exec_sql(conn, params.get("query_create_dataset_raw_view"), "query_create_dataset_raw_view")
-
-Ważna konsekwencja
-
-Skoro to ma być stałe, to w CreateDatabase powinieneś potem usunąć generowanie tych widoków w pętli, czyli wyciąć logikę typu:
-	•	pivot_sql = ...replace("{shard_condition}", ...)
-	•	raw_sql = ...replace("{shard_condition}", ...)
-	•	DROP VIEW IF EXISTS stats_pivot_view
-	•	DROP VIEW IF EXISTS dataset_raw_view
-	•	cursor.execute(pivot_sql)
-	•	cursor.execute(raw_sql)
-
-i zostawić tylko:
-	•	inserty do tabel,
-	•	INSERT INTO dataset_tab SELECT * FROM dataset_raw_view ...
-
-Czyli docelowy podział będzie taki
-
-db_init
-
-trzyma:
-	•	wszystkie CREATE TABLE
-	•	wszystkie CREATE VIEW
-	•	wszystkie CREATE INDEX
-
-CreateDatabase
-
-trzyma tylko:
-	•	ładowanie danych
-	•	czyszczenie danych klienta
-	•	inserty / appendy
-	•	przeliczenia i zasilenie tabel wynikowych
-
-Co to daje
-
-To jest lepsze, bo:
-	•	schema jest w jednym miejscu,
-	•	CreateDatabase przestaje być pół-init, pół-loaderem,
-	•	jesteś bliżej późniejszego przejścia na PostgreSQL.
-
-Jedno zastrzeżenie
-
-Jeżeli nadal chcesz kiedyś wrócić do wielu shardów jako osobnych wariantów, to zamiast jednego dataset_raw_view lepiej byłoby mieć:
-	•	albo kilka nazwanych widoków,
-	•	albo od razu zrezygnować z view i robić INSERT ... SELECT ... WHERE ... z parametrem.
-
-Ale na ten etap, przy sztywnym wariancie, Twoje podejście jest sensowne.
-
-Następny krok to już po prostu przygotować pełną listę kluczy configa, łącznie z tymi dwoma widokami.
