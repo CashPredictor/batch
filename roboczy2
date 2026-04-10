@@ -367,4 +367,88 @@ Jeżeli nadal chcesz kiedyś wrócić do wielu shardów jako osobnych wariantów
 
 Ale na ten etap, przy sztywnym wariancie, Twoje podejście jest sensowne.
 
+drugi
+
+Tak — przy takim założeniu to się upraszcza.
+
+Co zmienia Twoja decyzja
+
+Jeżeli:
+	•	okna/statystyki są na sztywno,
+	•	shardy są na sztywno,
+	•	i dataset_raw_view / stats_pivot_view nie będą już składane dynamicznie w Pythonie,
+
+to te widoki też można przenieść do configa i tworzyć w db_init.
+
+W praktyce
+
+To oznacza:
+
+Do config.yaml możesz dodać jeszcze:
+
+query_create_stats_pivot_view: |
+  CREATE VIEW IF NOT EXISTS stats_pivot_view AS
+  SELECT
+    ...
+  ;
+
+query_create_dataset_raw_view: |
+  CREATE VIEW IF NOT EXISTS dataset_raw_view AS
+  SELECT
+    ...
+  ;
+
+A w db_init.py dopisać:
+
+w sekcji VIEWS, po utworzeniu tabel i wcześniejszych widoków:
+
+exec_sql(conn, params.get("query_create_stats_pivot_view"), "query_create_stats_pivot_view")
+exec_sql(conn, params.get("query_create_dataset_raw_view"), "query_create_dataset_raw_view")
+
+Ważna konsekwencja
+
+Skoro to ma być stałe, to w CreateDatabase powinieneś potem usunąć generowanie tych widoków w pętli, czyli wyciąć logikę typu:
+	•	pivot_sql = ...replace("{shard_condition}", ...)
+	•	raw_sql = ...replace("{shard_condition}", ...)
+	•	DROP VIEW IF EXISTS stats_pivot_view
+	•	DROP VIEW IF EXISTS dataset_raw_view
+	•	cursor.execute(pivot_sql)
+	•	cursor.execute(raw_sql)
+
+i zostawić tylko:
+	•	inserty do tabel,
+	•	INSERT INTO dataset_tab SELECT * FROM dataset_raw_view ...
+
+Czyli docelowy podział będzie taki
+
+db_init
+
+trzyma:
+	•	wszystkie CREATE TABLE
+	•	wszystkie CREATE VIEW
+	•	wszystkie CREATE INDEX
+
+CreateDatabase
+
+trzyma tylko:
+	•	ładowanie danych
+	•	czyszczenie danych klienta
+	•	inserty / appendy
+	•	przeliczenia i zasilenie tabel wynikowych
+
+Co to daje
+
+To jest lepsze, bo:
+	•	schema jest w jednym miejscu,
+	•	CreateDatabase przestaje być pół-init, pół-loaderem,
+	•	jesteś bliżej późniejszego przejścia na PostgreSQL.
+
+Jedno zastrzeżenie
+
+Jeżeli nadal chcesz kiedyś wrócić do wielu shardów jako osobnych wariantów, to zamiast jednego dataset_raw_view lepiej byłoby mieć:
+	•	albo kilka nazwanych widoków,
+	•	albo od razu zrezygnować z view i robić INSERT ... SELECT ... WHERE ... z parametrem.
+
+Ale na ten etap, przy sztywnym wariancie, Twoje podejście jest sensowne.
+
 Następny krok to już po prostu przygotować pełną listę kluczy configa, łącznie z tymi dwoma widokami.
