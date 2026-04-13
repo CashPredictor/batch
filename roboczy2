@@ -1,69 +1,11 @@
-Najbardziej zwarty format do configa to nie lista słowników YAML, tylko lista list. Dzięki temu nie powtarzasz nazw pól 144 razy.
+mam takie:
+  swieta_columns: ["nazwa", "rodzaj", "data", "rok", "mies", "dzien", "dzien_tyg"]
+    - ["Nowy Rok", "stałe", "2022-01-01", 2022, 1, 1, "sobota"]
+    - ["Trzech Króli", "stałe", "2022-01-06", 2022, 1, 6, "czwartek"]
 
-Najlepiej zrobić to tak:
+teraz jak to wykorzystać? czyli co mam dla tych świat wstawić do init? konkretny kod.
 
-swieta_columns: ["nazwa", "rodzaj", "data", "rok", "mies", "dzien", "dzien_tyg"]
+co do tego:
+	4.	Ustalić, że DBInit jest obowiązkowy przed CreateDatabase — bo CreateDatabase zakłada już gotowe tabele i widoki. To wynika z samego układu nowego kodu: loader nie tworzy już pełnego schematu, tylko zasila istniejące obiekty.  ￼  ￼
+to jak to zabezpieczyć, jak to robię teraz czy źle czy dobrze, czy zmienić i na co?
 
-swieta_rows:
-  - ["Nowy Rok", "stałe", "2022-01-01", 2022, 1, 1, "sobota"]
-  - ["Trzech Króli", "stałe", "2022-01-06", 2022, 1, 6, "czwartek"]
-  - ...
-
-To jest dużo krótsze niż:
-
-- nazwa: ...
-  rodzaj: ...
-  data: ...
-
-Jak to zrobić w Excelu
-
-Zakładam:
-	•	A = nazwa
-	•	B = rodzaj
-	•	C = data
-	•	D = rok
-	•	E = mies
-	•	F = dzien
-	•	G = dzien_tyg
-	•	H = wynik do wklejenia
-
-1. Nagłówek do configa
-
-W dowolnej komórce, na przykład H1, wpisz ręcznie:
-
-swieta_columns: ["nazwa", "rodzaj", "data", "rok", "mies", "dzien", "dzien_tyg"]
-
-swieta_rows:
-
-2. Formuła dla każdego rekordu
-
-W H2 wstaw:
-
-="  - ["""&A2&""", """&B2&""", """&TEKST(C2;"rrrr-mm-dd")&""", "&D2&", "&E2&", "&F2&", """&G2&"""]"
-
-I przeciągnij w dół.
-
-To da Ci wiersze w stylu:
-
-  - ["Nowy Rok", "stałe", "2022-01-01", 2022, 1, 1, "sobota"]
-
-Jak wkleić do configa
-
-Potem:
-	1.	kopiujesz H1,
-	2.	pod nim kopiujesz wszystkie wartości z H2:H145,
-	3.	wklejasz do YAML.
-
-Jeszcze krótsza wersja
-
-Da się zrobić jeszcze ciaśniej, jako jeden JSON-owy blok w jednej linii, ale w configu byłoby to mniej czytelne i trudniejsze do edycji. Do YAML najlepszy kompromis to właśnie:
-	•	jeden nagłówek swieta_columns
-	•	potem swieta_rows jako lista list.
-
-Jeśli chcesz mieć wszystko od razu w jednej komórce
-
-Możesz też zbudować cały blok jednym zlepieniem, ale przy 144 wierszach to bywa niewygodne. Lepsze jest:
-	•	H1 nagłówek,
-	•	H2:H145 rekordy.
-
-Jeżeli chcesz, mogę od razu podać też funkcję Pythona do DBInit, która odczyta taki układ swieta_columns + swieta_rows z configa i zrobi INSERT.
