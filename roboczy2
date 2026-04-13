@@ -1,176 +1,201 @@
-Tak — warto dodać także client_filter do stats_pivot_sql.
+Podsumowanie założeń, które przyjmuję
+	1.	DBInit ma robić tylko bootstrap schematu: tabele, widoki, indeksy.
+	2.	CreateDatabase ma tylko zasilać istniejące obiekty: DELETE/INSERT per client, bez budowania schematu.
+	3.	Stara logika ma być zachowana funkcjonalnie, ale:
+	•	dynamiczne tworzenie schematu ma zniknąć z runtime,
+	•	wydajnościowe mechanizmy batch/shard mają zostać odtworzone,
+	•	obróbka ma działać per client_id.
+	4.	Config jest źródłem definicji SQL i służy do weryfikacji, czy potrzebne definicje istnieją.
 
-Nie dlatego, że bez tego wynik będzie zawsze logicznie zły, tylko dlatego, że:
-	•	stats_pivot_view / stats_pivot_select liczy agregację na bazie group_cust_inv_days g
-	•	a potem dataset_raw_select jeszcze raz joinuje to po INVO_CLNTNO
-	•	więc bez filtra klienta w stats_pivot_select liczysz pivot dla wszystkich klientów, choć finalnie i tak bierzesz tylko jednego klienta
-	•	to oznacza niepotrzebny koszt, szczególnie przy shardach i dużej tabeli
+Mój werdykt na dziś:
 
-Czyli:
-	•	funkcyjnie da się bez tego
-	•	wydajnościowo lepiej dodać
-	•	przy Twoim celu „ma działać tak lekko jak wcześniej” — tak, dodać
+Kierunek refaktoru jest dobry, ale całość nie jest jeszcze domknięta.
+To nie jest stan „już wszystko OK”, tylko raczej: duża część została dobrze przeniesiona, ale nadal są 2–3 krytyczne naruszenia granicy odpowiedzialności i kilka luk logicznych.
 
-Co dodać do configa
+1. Co zostało przeniesione poprawnie
 
-W query_stats_pivot_select na końcu WHERE dodaj placeholder:
+✅ Dobrze przeniesione z CreateDatabase do DBInit
 
-z:
+Ze starego CreateDatabase wynika, że wcześniej w runtime były tworzone:
+	•	raw tabele invo/debc/clhs/dcmo,
+	•	widoki bazowe invo_view, clhs_view, DEBC_view, dcmo_view,
+	•	INVO_CLHS_JOINED,
+	•	tabele pochodne jak INVO_CLHS_JOINED_TAB, group_cust_inv_days, grouped_client_days, summary_client_days_tab, extended_grouped_client_days_tab, dataset_tab, dataset,
+	•	oraz indeksy.  ￼  ￼
 
-WHERE {shard_condition}
+W nowym DBInit widać, że tworzysz już tabelaryczny szkielet i część widoków z configa: query_create_group_cust_inv_days, query_create_summary_client_days_tab2, query_create_dataset_tab, statystyki_faktur, query_create_invo_table, query_create_debc_table, query_create_clhs_table, query_create_dcmo_table, query_create_grouped_client_days_table, query_create_dataset, query_create_invo_clhs_joined_tab_table, query_create_extended_grouped_client_days_tab_table, a potem także widoki bazowe.  ￼
 
-na:
+To jest zgodne z docelową zasadą: schemat ma być gotowy przed loaderem.
 
-WHERE {shard_condition}
-{client_filter}
+✅ Dobrze uproszczone w nowym CreateDatabase
 
-czyli końcówka ma wyglądać tak:
+Najważniejsza poprawa to przejście z DROP TABLE na DELETE ... WHERE client_id + append, więc CreateDatabase przestał niszczyć cały raw layer i działa per klient. Widać to dla invo, debc, clhs, dcmo oraz później dla tabel pochodnych jak INVO_CLHS_JOINED_TAB.  ￼  ￼
 
-FROM 
-    group_cust_inv_days g
-LEFT JOIN statystyki_faktur stats_pivot
-ON g.INVO_ADMNO = stats_pivot.INVO_ADMNO
-   AND g.INVO_CLNTNO = stats_pivot.INVO_CLNTNO
-   AND g.INVO_DEBH_NO = stats_pivot.INVO_DEBH_NO
-   AND (g.INVO_DEBH_NO = stats_pivot.INVO_DEBH_NO AND g.INVO_DEBC_NO = stats_pivot.INVO_DEBC_NO)
-   AND DATE(g.DZIEN) = DATE(stats_pivot.DZIEN)
-WHERE {shard_condition}
-{client_filter}
-GROUP BY
-    g.INVO_ADMNO,
-    g.INVO_CLNTNO,
-    g.INVO_DEBH_NO,
-    g.INVO_DEBC_NO,
-    g.DZIEN;
+To jest dokładnie to, czego chcieliście.
 
+2. Co nadal jest niepoprawne
 
-⸻
+❌ DBInit nadal zawiera logikę danych
 
-Co dodać w Pythonie
+W załączonym db_init (1).py nadal jest funkcja create_and_import_swieta(...), która czyta Excela i robi to_sql, czyli ładuje dane, a nie tylko tworzy schemat. Co gorsza, w main() jest wywołanie create_and_import_swieta(conn_new, ...), mimo że w tym pliku nie ma conn_new, tylko conn. To jest jednocześnie:
+	•	naruszenie granicy odpowiedzialności,
+	•	oraz najpewniej błąd wykonania.  ￼
 
-Musisz ten sam client_filter wstrzyknąć do stats_pivot_sql, nie tylko do dataset_raw_sql.
+To jest obecnie największy twardy błąd w DBInit.
 
-Czyli:
+❌ CreateDatabase nadal ładuje swieta
 
-client_filter = """
-    AND g.INVO_CLNTNO = ?
-    AND DATE(g.DZIEN) >= DATE(?)
-    AND DATE(g.DZIEN) <= DATE(?)
-"""
+Nowy CreateDatabase wciąż wywołuje create_and_import_swieta(...) przy buildzie klienta.  ￼
 
-i potem:
+To znaczy, że:
+	•	swieta nadal jest częścią runtime-load,
+	•	a nie w pełni ustabilizowanym bootstrapem.
 
-stats_pivot_sql = params['query_stats_pivot_select'] \
-    .replace("{shard_condition}", shard_condition) \
-    .replace("{client_filter}", client_filter)
+Macie więc teraz zły stan pośredni:
+	•	DBInit próbuje ładować swieta,
+	•	CreateDatabase też próbuje ładować swieta.
 
-dataset_raw_sql = params['query_dataset_raw_select'] \
-    .replace("{stats_pivot_select}", stats_pivot_sql) \
-    .replace("{shard_condition}", shard_condition) \
-    .replace("{client_filter}", client_filter)
+Czyli ta odpowiedzialność jest zdublowana i nieustalona.
 
+⚠️ DBInit nie jest jeszcze „czystym init”
 
-⸻
+Nawet pomijając swieta, sam komentarz i logika „Widoki bazowe – tylko jeśli ich tabele źródłowe już istnieją” są już nieaktualne względem nowego modelu, bo DBInit chwilę wcześniej tworzy raw tables, więc raw_ready będzie prawie zawsze prawdziwe.  ￼
 
-Ale tu jest ważny detal
+To nie rozwala działania, ale pokazuje, że kod nie został jeszcze domknięty po zmianie koncepcji.
 
-Jeżeli dataset_raw_sql zawiera w środku stats_pivot_sql, to parametry ? z stats_pivot_sql i dataset_raw_sql się sumują. To znaczy, że przy cursor.execute(...) musisz przekazać argumenty w odpowiedniej kolejności.
+3. Porównanie PRZED vs PO — co zachowaliście, a co zmieniliście
 
-Jeżeli:
-	•	stats_pivot_sql ma ? ? ?
-	•	i zewnętrzny dataset_raw_sql też ma ? ? ?
+✅ Zachowana logika biznesowa
 
-to do execute() musisz przekazać 6 wartości.
+Nowy CreateDatabase nadal robi:
+	•	import raw,
+	•	materializację INVO_CLHS_JOINED_TAB,
+	•	deduplikację po INVO_NO, INVO_CLNTNO, INVO_ADMNO, INVO_DEBH_NO, INVO_DEBC_NO, CLHS_CHANGED_DATETIME,
+	•	generowanie group_cust_inv_days,
+	•	budowę grouped_client_days,
+	•	ładowanie extended_grouped_client_days_tab,
+	•	liczenie statystyki_faktur,
+	•	ładowanie dataset_tab,
+	•	przebudowę dataset.  ￼  ￼
 
-Wtedy wywołanie będzie takie
+Czyli ogólny pipeline działania nie został zgubiony.
 
-cursor.execute(
-    query_batch_insert,
-    (
-        client_id,
-        current_date.strftime('%Y-%m-%d'),
-        next_date.strftime('%Y-%m-%d'),
-        client_id,
-        current_date.strftime('%Y-%m-%d'),
-        next_date.strftime('%Y-%m-%d'),
-    )
-)
+✅ Dobrze zastąpiona dynamiczna budowa dataset
 
-Pierwsze 3 pójdą do osadzonego stats_pivot_select, kolejne 3 do zewnętrznego dataset_raw_select.
+W starym kodzie dataset był tworzony funkcją create_and_insert_processed_table_chunked, która w pierwszej partii robiła DROP TABLE + CREATE TABLE, a potem append.  ￼
 
-⸻
+W nowym kodzie jest refill_dataset_for_client(...), które:
+	•	najpierw czyści klienta z dataset,
+	•	potem idzie batchami po datach,
+	•	przetwarza chunk,
+	•	i tylko insertem uzupełnia istniejącą tabelę dataset.  ￼  ￼
 
-Rekomendacja praktyczna
+To jest bardzo dobra zmiana i zgodna z nową architekturą.
 
-Tak to zrób:
+✅ Dobrze zastąpiona dynamiczna budowa extended_grouped_client_days
 
-1. W query_stats_pivot_select
+W starym kodzie generowaliście widok przez generate_view_query_complete(...) i potem tabelę CREATE TABLE FROM VIEW.  ￼
 
-dodaj:
+W nowym układzie ta definicja jest już przeniesiona do configa jako query_create_extended_grouped_client_days_view, a CreateDatabase tylko zasila tabelę wynikową. To jest kierunkowo poprawne.  ￼
 
-{client_filter}
+4. Shardy i wydajność — tutaj zmiana jest sensowna
 
-po WHERE {shard_condition}
+✅ To wygląda już dobrze
 
-2. W query_dataset_raw_select
+Najważniejszy punkt wydajnościowy: stary kod przebudowywał stats_pivot_view i dataset_raw_view per shard, co było wydajne, ale mieszało schemat i runtime.  ￼
 
-też zostaw:
-
-{client_filter}
-
-3. W Pythonie
-
-wstrzykuj client_filter do obu
-
-4. W cursor.execute(...)
-
-przekaż parametry podwójnie, bo placeholdery wystąpią dwa razy
-
-⸻
-
-Gotowy minimalny fragment do podmiany
-
-client_filter = """
-    AND g.INVO_CLNTNO = ?
-    AND DATE(g.DZIEN) >= DATE(?)
-    AND DATE(g.DZIEN) <= DATE(?)
-"""
-
-stats_pivot_sql = params['query_stats_pivot_select'] \
-    .replace("{shard_condition}", shard_condition) \
-    .replace("{client_filter}", client_filter)
-
-dataset_raw_sql = params['query_dataset_raw_select'] \
-    .replace("{stats_pivot_select}", stats_pivot_sql) \
-    .replace("{shard_condition}", shard_condition) \
-    .replace("{client_filter}", client_filter)
-
-query_batch_insert = f"""
-INSERT INTO dataset_tab
-{dataset_raw_sql}
-"""
-
-cursor.execute(
-    query_batch_insert,
-    (
-        client_id,
-        current_date.strftime('%Y-%m-%d'),
-        next_date.strftime('%Y-%m-%d'),
-        client_id,
-        current_date.strftime('%Y-%m-%d'),
-        next_date.strftime('%Y-%m-%d'),
-    )
-)
-
-
-⸻
-
-Krótka odpowiedź na meritum
-
-Tak, stats_pivot_sql też powinien dostać client_filter, żeby:
-	•	nie liczyć agregacji dla wszystkich klientów,
-	•	zachować wydajność bliższą staremu podejściu.
-
-Jeżeli chcesz, w następnym kroku rozpiszę Ci gotowe finalne wersje obu definicji configowych:
+W nowym CreateDatabase widać, że przeszliście na:
 	•	query_stats_pivot_select
 	•	query_dataset_raw_select
+	•	wstrzykiwanie shard_condition i client_filter
+	•	oraz batchowe INSERT INTO dataset_tab ... {dataset_raw_sql}.  ￼
+
+To jest dobra odpowiedź na wcześniejszy problem:
+	•	schemat pozostaje statyczny,
+	•	a wydajnościowe zawężanie nadal dzieje się per shard i per klient.
+
+To uważam za jedną z najlepiej zrobionych części refaktoru.
+
+5. Indeksy
+
+✅ Duża część została przeniesiona sensownie
+
+W starym przepływie indeksy były robione częściowo w CreateDatabase, częściowo w init.  ￼
+
+W nowym DBInit widać:
+	•	indeksy bazowe na raw tabelach,
+	•	indeksy na group_cust_inv_days, grouped_client_days, INVO_CLHS_JOINED_TAB,
+	•	indeksy jawnie z configa, np. idx_invo_debcno_invdate, idx_invo_debcno_invdate_etc, idx_summary_days_ids_dzien, idx_ext_days_ids_dzien, idx_clhs_joined_keys_datetime.  ￼
+
+To jest dobry kierunek.
+
+⚠️ Ale nadal macie niespójność organizacyjną
+
+Skoro celem jest „całe tworzenie schematu zostało usunięte z CreateDatabase”, to:
+	•	wszystkie indeksy powinny być ostatecznie tworzone tylko w DBInit,
+	•	a nie częściowo jeszcze rozproszone lub zależne od loadera.
+
+W obecnym stanie jest już blisko, ale nie nazwałbym tego jeszcze w 100% domkniętym.
+
+6. Kompletność schematu
+
+⚠️ Koncepcyjnie prawie kompletne, ale praktycznie zależy od configa
+
+Z runtime nowego CreateDatabase wynika, że potrzebne są co najmniej:
+	•	raw tables: invo, debc, clhs, dcmo,
+	•	widoki: invo_view, clhs_view, DEBC_view, dcmo_view, INVO_CLHS_JOINED, summary_client_days_view, extended_grouped_client_days_view,
+	•	tabele materializowane: INVO_CLHS_JOINED_TAB, group_cust_inv_days, grouped_client_days, extended_grouped_client_days_tab, summary_client_days_tab, statystyki_faktur, dataset_tab, dataset, aggregated_data_temp, swieta.  ￼  ￼
+
+DBInit tworzy prawie cały ten zestaw.  ￼
+
+Natomiast bezpośrednio z przesłanych fragmentów nie jestem w stanie potwierdzić liniowo każdej jednej definicji w configu dla wszystkich query_create_*_table, bo część configa jest ucięta. Na poziomie koncepcyjnym wygląda to dobrze, ale ten punkt oznaczam jako prawie kompletne, nie stuprocentowo zweryfikowane liniowo.
+
+7. Gotowość produkcyjna / bootstrap
+
+❌ DBInit nie jest jeszcze gotowy jako czysty bootstrap
+
+Powody są trzy:
+	•	wywołuje logikę danych (swieta),
+	•	ma błędne conn_new zamiast conn,
+	•	nie jest czysto idempotentny w sensie praktycznego „odpal jeszcze raz i przejdzie”, bo z góry failuje, jeśli plik DB już istnieje.  ￼
+
+Ten ostatni punkt może być świadomą decyzją dla „one-shot bootstrap”, ale wtedy:
+	•	to jest OK dla pierwszego utworzenia,
+	•	ale nie jest OK jako „odbudowa / naprawa / CI rerun”.
+
+Czyli:
+	•	jednorazowy bootstrap — prawie,
+	•	odbudowa po awarii / CI rerun — jeszcze nie.
+
+8. Rekomendacja końcowa
+
+Co jest już OK
+
+✅ Podział architektoniczny jest właściwy.
+✅ Per-client DELETE + INSERT w CreateDatabase to dobra zmiana.
+✅ dataset został przebudowany zgodnie z nową logiką.
+✅ Shardy zostały odtworzone w sposób wydajny bez dynamicznego DROP/CREATE VIEW.
+✅ Większość schematu rzeczywiście została przeniesiona do init.
+
+Co jeszcze trzeba poprawić przed uznaniem refaktoru za domknięty
+
+❌ Usunąć z DBInit całe create_and_import_swieta(...) oraz jego wywołanie.
+❌ Naprawić błąd conn_new w DBInit.
+❌ Ustalić jedno miejsce odpowiedzialne za swieta:
+	•	albo osobny loader referencyjny,
+	•	albo jednorazowe zasilenie po init,
+	•	ale nie jednocześnie DBInit i CreateDatabase.
+⚠️ Doprecyzować, czy DBInit ma być tylko „create if missing”, czy też ma wspierać rerun/recovery.
+⚠️ Posprzątać komentarze i warunki typu raw_ready, bo są jeszcze z poprzedniej koncepcji.
+
+Mój końcowy werdykt
+
+Nie: jeszcze nie jest „wszystko OK”.
+Tak: najważniejszy kierunek i większość przeniesienia są zrobione dobrze.
+
+Najkrócej:
+	•	DBInit: ⚠️ dobry kierunek, ale jeszcze nieczysty i z błędem wykonania.
+	•	CreateDatabase: ✅ dużo lepszy niż stary, ale wciąż ma resztki odpowiedzialności za dane referencyjne (swieta).
+	•	Całość refaktoru: ⚠️ około 80–90% dobrze domknięte, ale nie gotowe do uznania za finalne bez jeszcze jednej rundy czyszczenia.
+
+Najbardziej krytyczny punkt na teraz: wyczyścić DBInit z ładowania danych i naprawić jego uruchamialność.
