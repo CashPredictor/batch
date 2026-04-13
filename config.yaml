@@ -498,6 +498,8 @@ first_model_params:
         g.ROK
     FROM 
         group_cust_inv_days g
+    WHERE
+        g.INVO_CLNTNO = ?
     GROUP BY 
         g.INVO_ADMNO,
         g.INVO_CLNTNO,
@@ -753,8 +755,7 @@ first_model_params:
   
   shard_condition: ""
   
-  query_create_stats_pivot_view: |
-    CREATE VIEW stats_pivot_view AS  
+  query_stats_pivot_select: |
     SELECT 
         g.INVO_ADMNO,
         g.INVO_CLNTNO,
@@ -1040,6 +1041,7 @@ first_model_params:
        AND (g.INVO_DEBH_NO = stats_pivot.INVO_DEBH_NO AND g.INVO_DEBC_NO = stats_pivot.INVO_DEBC_NO)
        AND DATE(g.DZIEN) = DATE(stats_pivot.DZIEN)
     WHERE {shard_condition}
+    {client_filter}
     GROUP BY
         g.INVO_ADMNO,
         g.INVO_CLNTNO,
@@ -1047,8 +1049,7 @@ first_model_params:
         g.INVO_DEBC_NO,
         g.DZIEN;
 
-  query_create_dataset_raw_view: |
-    CREATE VIEW dataset_raw_view AS
+  query_dataset_raw_select: |
     SELECT 
         g.INVO_NO,
         g.INVO_ADMNO,
@@ -1680,7 +1681,8 @@ first_model_params:
        AND g.INVO_DEBH_NO = pivot.INVO_DEBH_NO
        AND (g.INVO_DEBH_NO = pivot.INVO_DEBH_NO AND g.INVO_DEBC_NO = pivot.INVO_DEBC_NO)
        AND DATE(g.DZIEN) = DATE(pivot.DZIEN)
-    WHERE {shard_condition};
+    WHERE {shard_condition}
+    {client_filter};
        
   query_create_dataset_tab: |
     CREATE TABLE dataset_tab (
