@@ -1,282 +1,176 @@
-Tak to przerób.
+Tak — warto dodać także client_filter do stats_pivot_sql.
 
-Masz tu gotowy fragment pod nową logikę:
-	•	bez CREATE VIEW,
-	•	z użyciem SQL z configa,
-	•	z zachowaniem shardów,
-	•	z zachowaniem batchowania po dacie,
-	•	i potem zasileniem dataset z dataset_tab.
+Nie dlatego, że bez tego wynik będzie zawsze logicznie zły, tylko dlatego, że:
+	•	stats_pivot_view / stats_pivot_select liczy agregację na bazie group_cust_inv_days g
+	•	a potem dataset_raw_select jeszcze raz joinuje to po INVO_CLNTNO
+	•	więc bez filtra klienta w stats_pivot_select liczysz pivot dla wszystkich klientów, choć finalnie i tak bierzesz tylko jednego klienta
+	•	to oznacza niepotrzebny koszt, szczególnie przy shardach i dużej tabeli
 
-Zakładam, że w configu masz:
-	•	query_stats_pivot_select
-	•	query_dataset_raw_select
+Czyli:
+	•	funkcyjnie da się bez tego
+	•	wydajnościowo lepiej dodać
+	•	przy Twoim celu „ma działać tak lekko jak wcześniej” — tak, dodać
 
-oraz że query_dataset_raw_select zawiera:
-	•	{stats_pivot_select}
-	•	{shard_condition}
+Co dodać do configa
 
-czyli np. przez WITH stats_pivot_view AS (...).
+W query_stats_pivot_select na końcu WHERE dodaj placeholder:
 
-Nowy fragment
+z:
 
-        NUM_SHARDS = params['NUM_SHARDS']
-        batch_size = 1000
-        total_inserted_all = 0
-
-        cursor.execute("DELETE FROM dataset_tab WHERE INVO_CLNTNO = ?", (client_id,))
-        conn.commit()
-
-        for shard in range(NUM_SHARDS + 1):
-            if shard < NUM_SHARDS:
-                shard_condition = f"""
-                    (
-                        g.INVO_DEBC_NO IS NOT NULL
-                        AND g.INVO_DEBC_NO NOT GLOB '*[^0-9]*'
-                        AND (CAST(g.INVO_DEBC_NO AS INTEGER) % {NUM_SHARDS}) = {shard}
-                    )
-                """
-            else:
-                shard_condition = """
-                    (
-                        g.INVO_DEBC_NO IS NULL
-                        OR g.INVO_DEBC_NO GLOB '*[^0-9]*'
-                    )
-                """
-
-            stats_pivot_sql = params['query_stats_pivot_select'].replace(
-                "{shard_condition}",
-                shard_condition
-            )
-
-            dataset_raw_sql = params['query_dataset_raw_select'] \
-                .replace("{stats_pivot_select}", stats_pivot_sql) \
-                .replace("{shard_condition}", shard_condition)
-
-            current_date = pd.to_datetime(min_date)
-            total_inserted_shard = 0
-
-            while current_date <= pd.to_datetime(data_end_str):
-                next_date = current_date + pd.Timedelta(days=batch_size - 1)
-
-                query_batch_insert = f"""
-                INSERT INTO dataset_tab
-                {dataset_raw_sql}
-                AND g.INVO_CLNTNO = ?
-                AND DATE(g.DZIEN) >= DATE(?)
-                AND DATE(g.DZIEN) <= DATE(?)
-                """
-
-                cursor.execute(
-                    query_batch_insert,
-                    (
-                        client_id,
-                        current_date.strftime('%Y-%m-%d'),
-                        next_date.strftime('%Y-%m-%d'),
-                    )
-                )
-                conn.commit()
-
-                batch_inserted = cursor.rowcount if cursor.rowcount != -1 else 0
-                total_inserted_shard += batch_inserted
-                total_inserted_all += batch_inserted
-
-                print(
-                    f"Dla client={client_id}, shard={shard} zaimportowano "
-                    f"{batch_inserted} rekordów dla dni "
-                    f"{current_date.strftime('%Y-%m-%d')} - {next_date.strftime('%Y-%m-%d')}."
-                )
-                print(datetime.now().strftime("%H:%M:%S"))
-
-                current_date = next_date + pd.Timedelta(days=1)
-
-            print(
-                f"[INFO] Client={client_id}, shard={shard} zakończony. "
-                f"Łącznie w shardzie: {total_inserted_shard}"
-            )
-
-        cursor.execute("DELETE FROM dataset WHERE INVO_CLNTNO = ?", (client_id,))
-        conn.commit()
-
-        refill_dataset_for_client(
-            conn,
-            client_id=client_id,
-            source_table="dataset_tab",
-            target_table="dataset",
-            batch_days=params.get("dataset_batch_days", 31)
-        )
-        print(datetime.now().strftime("%H:%M:%S"))
-
-
-⸻
-
-Ale uwaga: to zadziała poprawnie tylko wtedy, gdy query_dataset_raw_select kończy się na WHERE {shard_condition} albo ma taki układ, że można mu bezpiecznie dokleić kolejne AND
-
-Najlepiej, żeby w configu query_dataset_raw_select miało końcówkę dokładnie taką:
-
-...
-LEFT JOIN stats_pivot_view pivot
-ON ...
 WHERE {shard_condition}
 
-Wtedy powyższy kod jest OK, bo dokleja:
+na:
 
-AND g.INVO_CLNTNO = ?
-AND DATE(g.DZIEN) >= DATE(?)
-AND DATE(g.DZIEN) <= DATE(?)
-
-
-⸻
-
-Wersja bezpieczniejsza
-
-Lepsza jest taka, żeby do configa dodać jeszcze placeholder:
-	•	{client_filter}
-
-i wtedy w Pythonie nie doklejasz ręcznie AND ..., tylko wstrzykujesz cały warunek.
-
-Wtedy fragment wygląda tak
-
-        NUM_SHARDS = params['NUM_SHARDS']
-        batch_size = 1000
-        total_inserted_all = 0
-
-        cursor.execute("DELETE FROM dataset_tab WHERE INVO_CLNTNO = ?", (client_id,))
-        conn.commit()
-
-        for shard in range(NUM_SHARDS + 1):
-            if shard < NUM_SHARDS:
-                shard_condition = f"""
-                    (
-                        g.INVO_DEBC_NO IS NOT NULL
-                        AND g.INVO_DEBC_NO NOT GLOB '*[^0-9]*'
-                        AND (CAST(g.INVO_DEBC_NO AS INTEGER) % {NUM_SHARDS}) = {shard}
-                    )
-                """
-            else:
-                shard_condition = """
-                    (
-                        g.INVO_DEBC_NO IS NULL
-                        OR g.INVO_DEBC_NO GLOB '*[^0-9]*'
-                    )
-                """
-
-            client_filter = """
-                AND g.INVO_CLNTNO = ?
-                AND DATE(g.DZIEN) >= DATE(?)
-                AND DATE(g.DZIEN) <= DATE(?)
-            """
-
-            stats_pivot_sql = params['query_stats_pivot_select'].replace(
-                "{shard_condition}",
-                shard_condition
-            )
-
-            dataset_raw_sql = params['query_dataset_raw_select'] \
-                .replace("{stats_pivot_select}", stats_pivot_sql) \
-                .replace("{shard_condition}", shard_condition) \
-                .replace("{client_filter}", client_filter)
-
-            current_date = pd.to_datetime(min_date)
-            total_inserted_shard = 0
-
-            while current_date <= pd.to_datetime(data_end_str):
-                next_date = current_date + pd.Timedelta(days=batch_size - 1)
-
-                query_batch_insert = f"""
-                INSERT INTO dataset_tab
-                {dataset_raw_sql}
-                """
-
-                cursor.execute(
-                    query_batch_insert,
-                    (
-                        client_id,
-                        current_date.strftime('%Y-%m-%d'),
-                        next_date.strftime('%Y-%m-%d'),
-                    )
-                )
-                conn.commit()
-
-                batch_inserted = cursor.rowcount if cursor.rowcount != -1 else 0
-                total_inserted_shard += batch_inserted
-                total_inserted_all += batch_inserted
-
-                print(
-                    f"Dla client={client_id}, shard={shard} zaimportowano "
-                    f"{batch_inserted} rekordów dla dni "
-                    f"{current_date.strftime('%Y-%m-%d')} - {next_date.strftime('%Y-%m-%d')}."
-                )
-                print(datetime.now().strftime("%H:%M:%S"))
-
-                current_date = next_date + pd.Timedelta(days=1)
-
-            print(
-                f"[INFO] Client={client_id}, shard={shard} zakończony. "
-                f"Łącznie w shardzie: {total_inserted_shard}"
-            )
-
-        cursor.execute("DELETE FROM dataset WHERE INVO_CLNTNO = ?", (client_id,))
-        conn.commit()
-
-        refill_dataset_for_client(
-            conn,
-            client_id=client_id,
-            source_table="dataset_tab",
-            target_table="dataset",
-            batch_days=params.get("dataset_batch_days", 31)
-        )
-        print(datetime.now().strftime("%H:%M:%S"))
-
-
-⸻
-
-I to jest wersja, którą polecam
-
-Bo:
-	•	nie sklejasz SQL „na ślepo” po WHERE,
-	•	masz pełną kontrolę w configu,
-	•	łatwiej utrzymać.
-
-⸻
-
-Jak powinien wyglądać query_dataset_raw_select
-
-Końcówka powinna być taka:
-
-LEFT JOIN stats_pivot_view pivot
-ON g.INVO_ADMNO = pivot.INVO_ADMNO
-   AND g.INVO_CLNTNO = pivot.INVO_CLNTNO
-   AND g.INVO_DEBH_NO = pivot.INVO_DEBH_NO
-   AND (g.INVO_DEBH_NO = pivot.INVO_DEBH_NO AND g.INVO_DEBC_NO = pivot.INVO_DEBC_NO)
-   AND DATE(g.DZIEN) = DATE(pivot.DZIEN)
 WHERE {shard_condition}
 {client_filter}
 
-A jeśli nie chcesz nowego placeholdera, to zostań przy pierwszej wersji.
+czyli końcówka ma wyglądać tak:
+
+FROM 
+    group_cust_inv_days g
+LEFT JOIN statystyki_faktur stats_pivot
+ON g.INVO_ADMNO = stats_pivot.INVO_ADMNO
+   AND g.INVO_CLNTNO = stats_pivot.INVO_CLNTNO
+   AND g.INVO_DEBH_NO = stats_pivot.INVO_DEBH_NO
+   AND (g.INVO_DEBH_NO = stats_pivot.INVO_DEBH_NO AND g.INVO_DEBC_NO = stats_pivot.INVO_DEBC_NO)
+   AND DATE(g.DZIEN) = DATE(stats_pivot.DZIEN)
+WHERE {shard_condition}
+{client_filter}
+GROUP BY
+    g.INVO_ADMNO,
+    g.INVO_CLNTNO,
+    g.INVO_DEBH_NO,
+    g.INVO_DEBC_NO,
+    g.DZIEN;
+
 
 ⸻
 
-Jeszcze jedna ważna rzecz
+Co dodać w Pythonie
 
-W wiadomości napisałeś:
+Musisz ten sam client_filter wstrzyknąć do stats_pivot_sql, nie tylko do dataset_raw_sql.
 
-podaj mi ten fragment z wykorzystaniem query_dataset_raw_select i query_dataset_raw_select
+Czyli:
 
-Tu jest literówka. Powinno być:
-	•	query_stats_pivot_select
-	•	query_dataset_raw_select
+client_filter = """
+    AND g.INVO_CLNTNO = ?
+    AND DATE(g.DZIEN) >= DATE(?)
+    AND DATE(g.DZIEN) <= DATE(?)
+"""
 
-I właśnie tak to rozpisałem.
+i potem:
+
+stats_pivot_sql = params['query_stats_pivot_select'] \
+    .replace("{shard_condition}", shard_condition) \
+    .replace("{client_filter}", client_filter)
+
+dataset_raw_sql = params['query_dataset_raw_select'] \
+    .replace("{stats_pivot_select}", stats_pivot_sql) \
+    .replace("{shard_condition}", shard_condition) \
+    .replace("{client_filter}", client_filter)
+
 
 ⸻
 
-Najkrótsza rekomendacja
+Ale tu jest ważny detal
 
-Wdrażaj wersję z:
+Jeżeli dataset_raw_sql zawiera w środku stats_pivot_sql, to parametry ? z stats_pivot_sql i dataset_raw_sql się sumują. To znaczy, że przy cursor.execute(...) musisz przekazać argumenty w odpowiedniej kolejności.
+
+Jeżeli:
+	•	stats_pivot_sql ma ? ? ?
+	•	i zewnętrzny dataset_raw_sql też ma ? ? ?
+
+to do execute() musisz przekazać 6 wartości.
+
+Wtedy wywołanie będzie takie
+
+cursor.execute(
+    query_batch_insert,
+    (
+        client_id,
+        current_date.strftime('%Y-%m-%d'),
+        next_date.strftime('%Y-%m-%d'),
+        client_id,
+        current_date.strftime('%Y-%m-%d'),
+        next_date.strftime('%Y-%m-%d'),
+    )
+)
+
+Pierwsze 3 pójdą do osadzonego stats_pivot_select, kolejne 3 do zewnętrznego dataset_raw_select.
+
+⸻
+
+Rekomendacja praktyczna
+
+Tak to zrób:
+
+1. W query_stats_pivot_select
+
+dodaj:
+
+{client_filter}
+
+po WHERE {shard_condition}
+
+2. W query_dataset_raw_select
+
+też zostaw:
+
+{client_filter}
+
+3. W Pythonie
+
+wstrzykuj client_filter do obu
+
+4. W cursor.execute(...)
+
+przekaż parametry podwójnie, bo placeholdery wystąpią dwa razy
+
+⸻
+
+Gotowy minimalny fragment do podmiany
+
+client_filter = """
+    AND g.INVO_CLNTNO = ?
+    AND DATE(g.DZIEN) >= DATE(?)
+    AND DATE(g.DZIEN) <= DATE(?)
+"""
+
+stats_pivot_sql = params['query_stats_pivot_select'] \
+    .replace("{shard_condition}", shard_condition) \
+    .replace("{client_filter}", client_filter)
+
+dataset_raw_sql = params['query_dataset_raw_select'] \
+    .replace("{stats_pivot_select}", stats_pivot_sql) \
+    .replace("{shard_condition}", shard_condition) \
+    .replace("{client_filter}", client_filter)
+
+query_batch_insert = f"""
+INSERT INTO dataset_tab
+{dataset_raw_sql}
+"""
+
+cursor.execute(
+    query_batch_insert,
+    (
+        client_id,
+        current_date.strftime('%Y-%m-%d'),
+        next_date.strftime('%Y-%m-%d'),
+        client_id,
+        current_date.strftime('%Y-%m-%d'),
+        next_date.strftime('%Y-%m-%d'),
+    )
+)
+
+
+⸻
+
+Krótka odpowiedź na meritum
+
+Tak, stats_pivot_sql też powinien dostać client_filter, żeby:
+	•	nie liczyć agregacji dla wszystkich klientów,
+	•	zachować wydajność bliższą staremu podejściu.
+
+Jeżeli chcesz, w następnym kroku rozpiszę Ci gotowe finalne wersje obu definicji configowych:
 	•	query_stats_pivot_select
 	•	query_dataset_raw_select
-	•	dodatkowym placeholderem {client_filter}
-
-bo to jest najczystsze i najmniej kruche.
-
-Jeżeli chcesz, mogę od razu rozpisać Ci gotową definicję query_dataset_raw_select w configu z {stats_pivot_select}, {shard_condition} i {client_filter} w poprawnym układzie.
