@@ -191,14 +191,7 @@ def CreateOneDbForAll(train_start, train_end, params, t0):
     conn_new.execute("PRAGMA journal_mode=WAL;")
     conn_new.execute("PRAGMA busy_timeout=60000;")
     cursor_new = conn_new.cursor()
-    
-    # Tworzenie zapytania CREATE TABLE
-    create_table_query = f"CREATE TABLE dataset ({', '.join([f'{col} {dtype}' for col, dtype in field_types.items()])});"
-    cursor_new.execute("DROP TABLE IF EXISTS dataset;")  # Usuwamy tabelę, jeśli już istnieje
-    logging.debug(f"[CreateOneDbForAll] About to DROP TABLE dataset on connection id={id(conn_new)}")
-    cursor_new.execute(create_table_query)
-    conn_new.commit()
-    
+     
     # Przenoszenie danych z każdej bazy
     for client_id in params['train_client_id']:
         db_path = fr'databases\2026-03-02\2026-03-02\CashPredictorT_{client_id}.db'
@@ -206,7 +199,6 @@ def CreateOneDbForAll(train_start, train_end, params, t0):
             migrate_data(train_start, train_end, params, field_types, db_path, conn_new)
 
     create_aggregated_data_temp(conn_new, data_end_str)
-    create_and_import_swieta(conn_new, params, file_path = r'C:\Users\OE00SG\CashPredictor\dev3\co i jak baza\Arkusz w C  Users OQ38TT jupiter dev3 co i jak baza co i jak baza.xls')
     
     conn_new.commit()
     conn_new.close()
@@ -273,27 +265,18 @@ def remove_case_insensitive_duplicate_columns(df):
 
 def create_aggregated_data_temp(conn, data_end, data_start="2023-03-12"):
     cursor = conn.cursor()
-    
-    # Generowanie danych od 2023-03-12 do 2030-04-27
+
     rows_to_insert = generate_dates(data_start, data_end)
-    
-    # Wstawianie danych do tabeli
-    insert_query = "INSERT INTO aggregated_data_temp (DZIEN, DZIS_DZIEN_TYG, DZIS_SOBOTA, DZIS_NIEDZIELA) VALUES (?, ?, ?, ?)"
+
+    insert_query = """
+        INSERT OR IGNORE INTO aggregated_data_temp
+        (DZIEN, DZIS_DZIEN_TYG, DZIS_SOBOTA, DZIS_NIEDZIELA)
+        VALUES (?, ?, ?, ?)
+    """
     cursor.executemany(insert_query, rows_to_insert)
     conn.commit()
-    
-    print(f"Wstawiono {len(rows_to_insert)} wierszy do tabeli 'aggregated_data_temp'.")
 
-def create_and_import_swieta(conn, params, file_path):
-
-    # Wczytaj dane z pliku Excel
-    data = pd.read_excel(file_path)
-    
-    # Konwertuj kolumnę 'data' na typ daty
-    data['data'] = pd.to_datetime(data['data'], format='%d.%m.%Y')
-    
-    # Import danych do tabeli
-    data.to_sql('swieta', conn, if_exists='replace', index=False)
+    print(f"Próbowano wstawić {len(rows_to_insert)} wierszy do aggregated_data_temp (duplikaty pominięte).")
 
 def sanitize_column_names(df):
     """
@@ -310,215 +293,98 @@ def sanitize_column_names(df):
     df.columns = new_columns
     return df
 
-def create_and_insert_processed_table_chunked(
+def refill_dataset_for_client(
     conn,
-    original_table_name: str,
-    target_table_name: str,
-    limit_first_batch: int = 500000
+    client_id,
+    source_table="dataset_tab",
+    target_table="dataset",
+    batch_days=31
 ):
-    """
-    Ładuje dane z 'original_table_name' partiami (miesiącami w tym przykładzie).
-    Pierwsza partia: >= limit_first_batch rekordów (ale do końca miesiąca).
-    Tworzy TABELĘ docelową (DROP + CREATE) i wstawia tę partię.
-    Kolejne partie: dołącza wiersze (bez drop table), 
-    za każdym razem uruchamia:
-      - process_dataset_tab(...)
-      - remove_case_insensitive_duplicate_columns(...)
-      - sanitize_column_names(...)
-    z mapowaniem typów kolumn z original_table_name (jeśli istnieją).
-    """
-
     cursor = conn.cursor()
 
-    # ----------------------------------------------------------------------------
-    # 1. Pomocnicza funkcja: pobranie mapy {kolumna: typ_sql} z oryginalnej tabeli
-    # ----------------------------------------------------------------------------
-    def get_column_types(cursor, table_name):
-        """Zwraca słownik {col_name: col_type} wg PRAGMA table_info."""
-        cursor.execute(f"PRAGMA table_info({table_name});")
-        columns_info = cursor.fetchall()  # (cid, name, type, notnull, dflt_value, pk)
-        return {col[1]: (col[2] if col[2] else "TEXT") for col in columns_info}
-    
-    original_column_types = get_column_types(cursor, original_table_name)
+    cursor.execute(f"DELETE FROM {target_table} WHERE INVO_CLNTNO = ?", (client_id,))
+    conn.commit()
 
-    # ----------------------------------------------------------------------------
-    # 2. Pomocnicze funkcje do preprocessing
-    # ----------------------------------------------------------------------------
-    def preprocess_df(df: pd.DataFrame) -> pd.DataFrame:
-        # a) Zbierz info o kolumnach (nazwa, typ) – do process_dataset_tab
-        #    W oryg. kodzie kolumny były w formie [(col_name, col_type), ...].
-        columns_info = [(k, v) for k, v in original_column_types.items()]
-
-        # b) process_dataset_tab
-        df_processed = process_dataset_tab(df, columns_info)
-
-        # c) remove_case_insensitive_duplicate_columns
-        df_processed = remove_case_insensitive_duplicate_columns(df_processed)
-
-        # d) sanitize_column_names
-        df_processed = sanitize_column_names(df_processed)
-
-        # e) ewentualna redukcja float64->float32 / zaokrąglenie:
-        float_cols = df_processed.select_dtypes(include=[np.float64, np.float32]).columns
-        df_processed[float_cols] = df_processed[float_cols].round(4)
-        for c in float_cols:
-            df_processed[c] = df_processed[c].astype("float32")
-
-        return df_processed
-
-    # ----------------------------------------------------------------------------
-    # 3. Pomocnicza funkcja do tworzenia definicji CREATE TABLE
-    #    na podstawie kolumn w df + original_column_types
-    # ----------------------------------------------------------------------------
-    def create_table_sql_for_df(df: pd.DataFrame, table_name: str) -> str:
-        columns_sql = []
-        for col in df.columns:
-            if col in original_column_types:
-                col_type = original_column_types[col]
-            else:
-                # Rozpoznanie typu z df
-                if pd.api.types.is_integer_dtype(df[col]):
-                    col_type = "INTEGER"
-                elif pd.api.types.is_float_dtype(df[col]):
-                    col_type = "REAL"
-                elif pd.api.types.is_datetime64_any_dtype(df[col]):
-                    col_type = "DATETIME"
-                else:
-                    col_type = "TEXT"
-            columns_sql.append(f"{col} {col_type}")
-        
-        create_sql = f"CREATE TABLE {table_name} ({', '.join(columns_sql)});"
-        return create_sql
-
-    # ----------------------------------------------------------------------------
-    # 4. Pomocnicza funkcja do wstawienia wierszy z df (po preprocessing) 
-    #    metodą placeholders & executemany
-    # ----------------------------------------------------------------------------
-    def insert_rows_with_placeholders(df: pd.DataFrame, table_name: str):
-        placeholders = ", ".join(["?" for _ in df.columns])
-        insert_query = f"INSERT INTO {table_name} VALUES ({placeholders});"
-
-        def _to_sqlite_safe(v):
-            if pd.isna(v):
-                return None
-            if isinstance(v, (np.datetime64, )):
-                v = pd.to_datetime(v)
-            if isinstance(v, pd.Timestamp):
-                return v.to_pydatetime()
-            return v
-        
-        df = df.where(pd.notna(df), None)
-
-        # Zamieniamy df na listę tuple
-        data_tuples = [
-            tuple(_to_sqlite_safe(v) for v in row)
-            for row in df.itertuples(index=False, name=None)
-        ]
-        cursor.executemany(insert_query, data_tuples)
-
-    # ----------------------------------------------------------------------------
-    # 5. Odczyt listy (ROK, MIESIAC) w sortowaniu rosnącym
-    #    (zmień na swoje kryterium chunkowania, jeśli inny styl)
-    # ----------------------------------------------------------------------------
     cursor.execute(f"""
-        SELECT DISTINCT ROK, MIESIAC
-        FROM {original_table_name}
-        ORDER BY ROK, MIESIAC
-    """)
-    year_months = cursor.fetchall()  # np. [(2020,1),(2020,2),...]
+        SELECT MIN(DATE(DZIEN)), MAX(DATE(DZIEN))
+        FROM {source_table}
+        WHERE INVO_CLNTNO = ?
+    """, (client_id,))
+    min_date, max_date = cursor.fetchone()
 
-    if not year_months:
-        print(f"[INFO] Brak danych w {original_table_name} lub brak ROK/MIESIAC.")
+    if not min_date or not max_date:
+        print(f"[INFO] Brak danych dla klienta {client_id} w {source_table}.")
         return
 
-    # ----------------------------------------------------------------------------
-    # 6. Przechodzimy po ROK,MIESIĄC – budujemy PARTIĘ do momentu >= limit_first_batch
-    # ----------------------------------------------------------------------------
-    accumulated_df = pd.DataFrame()
-    rowcount_accum = 0
-    first_batch_done = False
+    cursor.execute(f"PRAGMA table_info({source_table});")
+    columns_info_raw = cursor.fetchall()
+    columns_info = [(col[1], col[2] if col[2] else "TEXT") for col in columns_info_raw]
 
-    for (year, month) in year_months:
-        # wczytanie chunku
-        chunk_sql = f"""
+    current_date = pd.to_datetime(min_date)
+    end_date = pd.to_datetime(max_date)
+
+    total_inserted = 0
+
+    while current_date <= end_date:
+        next_date = current_date + pd.Timedelta(days=batch_days - 1)
+
+        chunk_df = pd.read_sql_query(
+            f"""
             SELECT *
-            FROM {original_table_name}
-            WHERE ROK = {year}
-              AND MIESIAC = {month}
-        """
-        chunk_df = pd.read_sql_query(chunk_sql, conn)
-        chunk_len = len(chunk_df)
-        if chunk_len == 0:
-            continue
+            FROM {source_table}
+            WHERE INVO_CLNTNO = ?
+              AND DATE(DZIEN) >= DATE(?)
+              AND DATE(DZIEN) <= DATE(?)
+            ORDER BY DZIEN, INVO_NO
+            """,
+            conn,
+            params=(client_id, current_date.strftime("%Y-%m-%d"), next_date.strftime("%Y-%m-%d"))
+        )
 
-        candidate_count = rowcount_accum + chunk_len
+        if not chunk_df.empty:
+            processed_df = process_dataset_tab(chunk_df, columns_info)
+            processed_df = remove_case_insensitive_duplicate_columns(processed_df)
+            processed_df = sanitize_column_names(processed_df)
 
-        if not first_batch_done:
-										
-            if candidate_count < limit_first_batch:
-                if accumulated_df.empty:
-                    accumulated_df = chunk_df.copy()
-                else:
-                    accumulated_df = pd.concat([accumulated_df, chunk_df], ignore_index=True)
-                rowcount_accum = candidate_count
-            else:
-                if accumulated_df.empty:
-                    accumulated_df = chunk_df.copy()
-                else:
-                    accumulated_df = pd.concat([accumulated_df, chunk_df], ignore_index=True)
-                rowcount_accum = candidate_count 
+            float_cols = processed_df.select_dtypes(include=[np.float64, np.float32]).columns
+            if len(float_cols) > 0:
+                processed_df[float_cols] = processed_df[float_cols].round(4)
+                for c in float_cols:
+                    processed_df[c] = processed_df[c].astype("float32")
 
-                # Mamy całą pierwszą partię -> PREPROCESS
-                df_preproc = preprocess_df(accumulated_df)
+            processed_df = processed_df.where(pd.notna(processed_df), None)
 
-                # DROP TABLE + CREATE TABLE
-                cursor.execute(f"DROP TABLE IF EXISTS {target_table_name};")
-                create_table_query = create_table_sql_for_df(df_preproc, target_table_name)
-                cursor.execute(create_table_query)
+            placeholders = ", ".join(["?" for _ in processed_df.columns])
+            insert_sql = f"INSERT INTO {target_table} VALUES ({placeholders})"
 
-                # INSERT ROWS
-                insert_rows_with_placeholders(df_preproc, target_table_name)
-                conn.commit()
+            def _to_sqlite_safe(v):
+                if pd.isna(v):
+                    return None
+                if isinstance(v, np.datetime64):
+                    v = pd.to_datetime(v)
+                if isinstance(v, pd.Timestamp):
+                    return v.to_pydatetime()
+                return v
 
-                print(f"[INFO] Pierwsza partia: ~{rowcount_accum} wierszy (w tym ROK={year}, MIESIAC={month}). "
-                      f"Utworzono tabelę {target_table_name} i zaimportowano {len(df_preproc)}.")
-                
-                first_batch_done = True
-                # Czyścimy akumulator
-                accumulated_df = pd.DataFrame()
-                rowcount_accum = 0
-        else:
-            # Pierwsza partia już zrobiona -> przerabiamy chunk "od razu"
-            df_preproc = preprocess_df(chunk_df)
+            rows = [
+                tuple(_to_sqlite_safe(v) for v in row)
+                for row in processed_df.itertuples(index=False, name=None)
+            ]
 
-            # Dopisujemy do istn. tabeli (bez DROP)
-            insert_rows_with_placeholders(df_preproc, target_table_name)
+            cursor.executemany(insert_sql, rows)
             conn.commit()
 
-            print(f"[INFO] Dodano ROK={year}, MIESIAC={month}, wierszy={len(df_preproc)} do {target_table_name} (append).")
+            inserted_now = len(rows)
+            total_inserted += inserted_now
+            print(
+                f"[INFO] dataset: client={client_id}, "
+                f"{current_date.strftime('%Y-%m-%d')}..{next_date.strftime('%Y-%m-%d')}, "
+                f"inserted={inserted_now}, total={total_inserted}"
+            )
 
-    # ----------------------------------------------------------------------------
-    # 7. Jeśli nigdy nie przekroczyliśmy limitu, to first_batch_done=False do końca
-    # ----------------------------------------------------------------------------
-    if not first_batch_done:
-        # Całe dane w 1 partii, a nie osiągnęliśmy limit_first_batch
-        if not accumulated_df.empty:
-            df_preproc = preprocess_df(accumulated_df)
+        current_date = next_date + pd.Timedelta(days=1)
 
-            cursor.execute(f"DROP TABLE IF EXISTS {target_table_name};")
-            create_table_query = create_table_sql_for_df(df_preproc, target_table_name)
-            cursor.execute(create_table_query)
-
-            insert_rows_with_placeholders(df_preproc, target_table_name)
-            conn.commit()
-
-            print(f"[INFO] Wszystkie dane to jedna partia < {limit_first_batch}. "
-                  f"Utworzono {target_table_name} i wstawiono {len(df_preproc)} wierszy.")
-        else:
-            print("[INFO] Brak danych do przetworzenia (accumulated_df pusty).")
-
-    print("[INFO] Zakończono create_and_insert_processed_table_chunked().")
-
+    print(f"[OK] dataset rebuilt for client {client_id}, total rows inserted: {total_inserted}")
 
 def validate_and_convert_dates(df, columns):
     invalid_values = []
@@ -668,103 +534,6 @@ def get_next_working_day(termin_platnosci, holidays):
     while termin_platnosci.weekday() >= 5 or termin_platnosci in holidays:
         termin_platnosci += timedelta(days=1)
     return termin_platnosci
-
-# Funkcja do generowania widoku z pełną listą kolumn
-def generate_view_query_complete(dcmo_columns, offsets):
-    base_query = """
-    CREATE VIEW extended_grouped_client_days AS
-    SELECT 
-        g.INVO_ADMNO,
-        g.INVO_CLNTNO,
-        g.INVO_DEBH_NO,
-        g.INVO_DEBC_NO,
-        g.DZIEN,
-        g.MIESIAC,
-        g.ROK
-    """
-    
-    # Kolumny bieżącego miesiąca
-    current_month_cols = [f", d.{col} AS {col}_M" for col in dcmo_columns]
-
-    # Kolumny przesunięć miesięcznych
-    offset_cols = [
-        f", d{offset}.{col} AS {col}_M{offset}" for offset in offsets for col in dcmo_columns
-    ]
-    
-    # Kolumny pochodnych
-    derivative_cols = []
-    for col in dcmo_columns:
-        derivative_cols.extend([
-            f"""
-            , CASE 
-                WHEN d.{col} IS NOT NULL AND d1.{col} IS NOT NULL THEN (d.{col} - d1.{col})
-                ELSE NULL 
-              END AS {col}_D1_3M
-            """,
-            f"""
-            , CASE 
-                WHEN d.{col} IS NOT NULL AND d1.{col} IS NOT NULL AND d2.{col} IS NOT NULL THEN ((d.{col} - d1.{col}) - (d1.{col} - d2.{col}))
-                ELSE NULL 
-              END AS {col}_D2_3M
-            """,
-            f"""
-            , CASE 
-                WHEN d.{col} IS NOT NULL AND d1.{col} IS NOT NULL THEN (d.{col} - d1.{col})
-                ELSE NULL 
-              END AS {col}_D1_6M
-            """,
-            f"""
-            , CASE 
-                WHEN d.{col} IS NOT NULL AND d1.{col} IS NOT NULL AND d2.{col} IS NOT NULL THEN ((d.{col} - d1.{col}) - (d1.{col} - d2.{col}))
-                ELSE NULL 
-              END AS {col}_D2_6M
-            """
-        ])
-
-    joins = """
-    FROM grouped_client_days g
-    LEFT JOIN dcmo_view d
-        ON g.INVO_ADMNO = d.DEBC_ADMNO
-        AND g.INVO_CLNTNO = d.DEBC_CLNTNO
-        AND g.INVO_DEBH_NO = d.DEBC_DEBH
-        AND g.INVO_DEBC_NO = d.DEBC_NO
-        AND d.DCMO_YEAR  = CAST(strftime('%Y', date(g.DZIEN,'start of month','-1 day')) AS INTEGER)
-        AND d.DCMO_MONTH = CAST(strftime('%m', date(g.DZIEN,'start of month','-1 day')) AS INTEGER)
-    """
-    
-    # Joins dla przesunięć miesięcznych
-    for offset in offsets:
-        joins += f"""
-        LEFT JOIN dcmo_view d{offset}
-            ON g.INVO_ADMNO = d{offset}.DEBC_ADMNO
-            AND (g.INVO_DEBH_NO = d{offset}.DEBC_DEBH AND g.INVO_DEBC_NO = d{offset}.DEBC_NO)
-            AND g.INVO_CLNTNO = d{offset}.DEBC_CLNTNO
-            AND d{offset}.DCMO_YEAR  = CAST(strftime('%Y', date(g.DZIEN,'start of month','-1 day', '-' || {offset} || ' months')) AS INTEGER)
-            AND d{offset}.DCMO_MONTH = CAST(strftime('%m', date(g.DZIEN,'start of month','-1 day', '-' || {offset} || ' months')) AS INTEGER)
-        """
-    
-    return base_query + "\n".join(current_month_cols + offset_cols + derivative_cols) + joins + ";"
-
-# Funkcja do generowania tabeli na podstawie widoku
-def create_table_from_view(cursor, view_name, table_name):
-    # Pobranie kolumn z widoku
-    view_columns = get_columns_from_view(cursor, view_name)
-    # Dodanie typów danych dla każdej kolumny
-    column_definitions = [
-        f"{col} {'DATETIME' if col == 'DZIEN' else 'INTEGER' if col in ['ROK', 'MIESIAC'] else 'TEXT' if col in ['INVO_ADMNO', 'INVO_CLNTNO', 'INVO_DEBH_NO', 'INVO_DEBC_NO'] else 'REAL'}"
-        for col in view_columns
-    ]
-
-    # Generowanie zapytania CREATE TABLE
-    create_table_query = f"""
-    CREATE TABLE {table_name} (
-        {', '.join(column_definitions)}
-    );
-    """
-    # Usunięcie starej tabeli, jeśli istnieje, i utworzenie nowej
-    cursor.execute(f"DROP TABLE IF EXISTS {table_name};")
-    cursor.execute(create_table_query)
-    print(f"Tabela '{table_name}' została utworzona.")
 
 # Funkcja do wstawienia danych z widoku do tabeli
 def insert_data_from_view(cursor, view_name, table_name):
@@ -960,11 +729,11 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
     
         # --- RAW tables: invo/debc/clhs/dcmo ---
         if not skip_raw_tables:
-            cursor.execute("DROP table IF EXISTS invo;")
-            cursor.execute("DROP table IF EXISTS debc;")
-            cursor.execute("DROP table IF EXISTS clhs;")
-            cursor.execute("DROP table IF EXISTS dcmo;")
-        
+            cursor.execute("DELETE FROM invo WHERE INVO_CLNTNO = ?", (client_id,))
+            cursor.execute("DELETE FROM debc WHERE DEBC_CLNTNO = ?", (client_id,))
+            cursor.execute("DELETE FROM clhs WHERE CLHS_CLNTNO = ?", (client_id,))
+            cursor.execute("DELETE FROM dcmo WHERE DEBC_CLNTNO = ?", (client_id,))
+            
             df_invo.to_sql('invo', conn, if_exists='append', index=False)
             df_debc.to_sql('debc', conn, if_exists='append', index=False)
             df_clhs.to_sql('clhs', conn, if_exists='append', index=False)
@@ -987,11 +756,13 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
         create_and_import_swieta(conn, params, file_path = r'C:\Users\OE00SG\CashPredictor\dev3\co i jak baza\Arkusz w C  Users OQ38TT jupiter dev3 co i jak baza co i jak baza.xls')
         
         # Wstawianie danych z widoku do tabeli
+        cursor.execute("DELETE FROM INVO_CLHS_JOINED_TAB WHERE INVO_CLNTNO = ?", (client_id,))
         insert_query = """
         INSERT INTO INVO_CLHS_JOINED_TAB
-        SELECT * FROM INVO_CLHS_JOINED;
+        SELECT * FROM INVO_CLHS_JOINED
+        WHERE INVO_CLNTNO = ?;
         """
-        cursor.execute(insert_query)
+        cursor.execute(insert_query, (client_id,))
         print("Dane zostały skopiowane z widoku do tabeli 'INVO_CLHS_JOINED_TAB'.")
 
         remove_duplicates_query = """
@@ -1027,7 +798,8 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
             INVO_FINALPAYMENTDATE
         FROM invo_view
         WHERE INVO_INVDATE IS NOT NULL
-        and date(INVO_INVDATE) >= {params['od_dnia']} ;
+        and date(INVO_INVDATE) >= {params['od_dnia']}
+        AND INVO_CLNTNO = {client_id};
         """
         cursor.execute(query_invo)
         rows = cursor.fetchall()
@@ -1073,6 +845,8 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
                 ))
         
         # Wstawianie danych do tabeli
+        cursor.execute("DELETE FROM group_cust_inv_days WHERE INVO_CLNTNO = ?", (client_id,))
+
         cursor.executemany("""
         INSERT INTO group_cust_inv_days (
             INVO_NO, INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, INVO_INVDATE, DZIEN, ROK, MIESIAC, INVO_FINALPAYMENTDATE
@@ -1082,18 +856,19 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
         # Zatwierdzenie zmian
         conn.commit()
         
-        print("Tabela 'group_cust_inv_days' została pomyślnie utworzona i wypełniona.")
+        print("Tabela 'group_cust_inv_days' została pomyślnie wypełniona.")
         print(datetime.now().strftime("%H:%M:%S"))
     
-    # Pobranie danych z group_cust_inv_days z grupowaniem
+        # Pobranie danych z group_cust_inv_days z grupowaniem
         grouped_query = params['grouped_query']
         
         # Wczytanie danych do DataFrame
-        df = pd.read_sql_query(grouped_query, conn)
+        df = pd.read_sql_query(grouped_query, conn, params=(client_id,))
         
         # Zapisanie DataFrame do tabeli SQLite (struktura tabeli tworzona automatycznie)
-        df.to_sql("grouped_client_days", conn, if_exists="replace", index=False)
-        
+        cursor.execute("DELETE FROM grouped_client_days WHERE INVO_CLNTNO = ?", (client_id,))
+        df.to_sql("grouped_client_days", conn, if_exists="append", index=False)
+
         # Zatwierdzenie zmian i zamknięcie połączenia
         conn.commit()
     
@@ -1110,16 +885,7 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
             "DCMO_NINVOICESOUTSTANDING", "DCMO_PAIDAMOUNTDISPUTES", "DCMO_PAIDAMOUNTPARTIALPAYM"
         ]
         offsets = [1, 2, 3, 6, 12]
-        
-        # Generowanie widoku
-        view_query = generate_view_query_complete(dcmo_columns, offsets)
-        cursor.execute("DROP VIEW IF EXISTS extended_grouped_client_days;")
-        cursor.execute(view_query)
-        print("Widok 'extended_grouped_client_days' został zaktualizowany.")
-        
-        # Tworzenie tabeli na podstawie widoku
-        create_table_from_view(cursor, "extended_grouped_client_days", "extended_grouped_client_days_tab")
-        
+
         print("Rozpoczynam partiami wstawianie do 'extended_grouped_client_days_tab'...")
     
         # 1. Pobieramy listę (ROK, MIESIAC) występujących w widoku
@@ -1129,6 +895,8 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
             ORDER BY ROK, MIESIAC
         """)
         year_month_rows = cursor.fetchall()
+
+        cursor.execute("DELETE FROM extended_grouped_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
         
         # 2. Iterujemy po każdej parze (ROK, MIESIAC)
         for (year, month) in year_month_rows:
@@ -1138,7 +906,8 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
             FROM extended_grouped_client_days
             WHERE ROK = {year}
               AND MIESIAC = {month}
-              AND date(DZIEN) >= {params['od_dnia']};
+              AND date(DZIEN) >= {params['od_dnia']}
+              AND INVO_CLNTNO = {client_id};
             """
             cursor.execute(insert_sql)
             conn.commit()  # commit po każdej partii
@@ -1153,11 +922,6 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
         # Zatwierdzenie zmian
         conn.commit()
         print("Proces zakończony.")
-    
-        cursor.execute("DROP VIEW IF EXISTS summary_client_days_view;")
-        
-        query_create_summary_client_days_view = params['query_create_summary_client_days_view']
-        cursor.execute(query_create_summary_client_days_view)
         
         print("Rozpoczynam partiami wstawianie do 'summary_client_days_tab'...")
         
@@ -1169,9 +933,10 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
         cursor.execute("""
             SELECT ROK, MIESIAC
             FROM summary_client_days_tab
+            AND INVO_CLNTNO = ?
             ORDER BY ROK DESC, MIESIAC DESC
             LIMIT 1
-        """)
+        """, (client_id))
         last_row = cursor.fetchone()
         if last_row:
             (last_inserted_year, last_inserted_month) = last_row
@@ -1186,12 +951,14 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
         cursor.execute("""
             SELECT DISTINCT ROK, MIESIAC
             FROM extended_grouped_client_days
+            where INVO_CLNTNO = ?
             ORDER BY ROK, MIESIAC
-        """)
+        """, (client_id))
         all_rows = cursor.fetchall()
         
         inserted_count = 0
-        
+        cursor.execute("DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
+
         for (year, month) in all_rows:
             # Sprawdzamy, czy to (ROK, MIESIAC) jest > ostatnio wstawionego
             # Konwertujemy do "liczby" = ROK*12 + MIESIAC
@@ -1211,7 +978,8 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
             SELECT *
             FROM summary_client_days_view
             WHERE ROK = {year}
-              AND MIESIAC = {month};
+              AND MIESIAC = {month}
+              AND INVO_CLNTNO = {client_id};
             """
             cursor.execute(insert_sql)
             conn.commit()
@@ -1243,7 +1011,8 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
         maksymalna_data = pd.Timestamp(data_end_str)
         log_triggered = False
         inserted_count = 0
-        
+
+        cursor.execute("DELETE FROM statystyki_faktur WHERE INVO_CLNTNO = ?", (client_id,))
         for z_ilu_dni in z_ilu_dni_values:
             # Pobranie danych klientów i dni
             query = f"""
@@ -1252,7 +1021,8 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
                 WHERE DZIEN <= '{maksymalna_data.strftime('%Y-%m-%d %H:%M:%S')}'
             """
             customer_days = pd.read_sql_query(query, conn)
-        
+
+            
             # Iteracja po klientach i dniach
             for _, row in customer_days.iterrows():
                 invo_admno = row['INVO_ADMNO']
@@ -1420,7 +1190,7 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
                 
                         avg_dni_opoznienia = float(days_late.mean()) if not days_late.empty else np.nan
                         stdev_dni_opoznienia = float(days_late.std()) if len(days_late) > 1 else np.nan
-                
+
                     # Wstawianie wyników do tabeli
                     cursor.execute("""
                         INSERT INTO statystyki_faktur (
@@ -1474,20 +1244,13 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
         
         
         NUM_SHARDS = params['NUM_SHARDS']
-        
-        for shard in range(NUM_SHARDS + 1):  # dodatkowy shard 10 = nie-numeryczne
-            if shard < NUM_SHARDS:
-                shard_condition = f"""
-                    (
-                        CAST(g.INVO_DEBC_NO AS INTEGER) IS NOT NULL
-                        AND (CAST(g.INVO_DEBC_NO AS INTEGER) % {NUM_SHARDS}) = {shard}
-                    )
-                """
-            else:
-                shard_condition = "CAST(g.INVO_DEBC_NO AS INTEGER) IS NULL"
-        
+        batch_size = 1000
+        total_inserted_all = 0
+
+        cursor.execute("DELETE FROM dataset_tab WHERE INVO_CLNTNO = ?", (client_id,))
+        conn.commit()
+
         for shard in range(NUM_SHARDS + 1):
-        
             if shard < NUM_SHARDS:
                 shard_condition = f"""
                     (
@@ -1502,51 +1265,74 @@ def CreateDatabase(params, t0, create_many_dbs_from_one_excel=False, skip_raw_ta
                         g.INVO_DEBC_NO IS NULL
                         OR g.INVO_DEBC_NO GLOB '*[^0-9]*'
                     )
-                """            
-            # Wstrzyknięcie warunku do SQL
-            pivot_sql = params['query_create_stats_pivot_view'].replace("{shard_condition}", shard_condition)
-            raw_sql   = params['query_create_dataset_raw_view'].replace("{shard_condition}", shard_condition)
-                
-            cursor.execute("DROP VIEW IF EXISTS stats_pivot_view;")
-            cursor.execute(pivot_sql)
-            
-            cursor.execute("DROP VIEW IF EXISTS dataset_raw_view;")
-            cursor.execute(raw_sql)
-            
-            # Insertowanie danych partiami
-            batch_size = 1000  # Liczba dni w jednej partii
+                """
+
+            client_filter = """
+                AND g.INVO_CLNTNO = ?
+                AND DATE(g.DZIEN) >= DATE(?)
+                AND DATE(g.DZIEN) <= DATE(?)
+            """
+
+            stats_pivot_sql = params['query_stats_pivot_select'] \
+                .replace("{shard_condition}", shard_condition) \
+                .replace("{client_filter}", client_filter)
+
+            dataset_raw_sql = params['query_dataset_raw_select'] \
+                .replace("{stats_pivot_select}", stats_pivot_sql) \
+                .replace("{shard_condition}", shard_condition) \
+                .replace("{client_filter}", client_filter)
+
             current_date = pd.to_datetime(min_date)
-            total_inserted = 0
-        
+            total_inserted_shard = 0
+
             while current_date <= pd.to_datetime(data_end_str):
                 next_date = current_date + pd.Timedelta(days=batch_size - 1)
-                
-                # Zapytanie dla bieżącego zakresu
+
                 query_batch_insert = f"""
-                INSERT INTO dataset_tab 
-                SELECT * FROM dataset_raw_view
-                WHERE dzien >= '{current_date.strftime('%Y-%m-%d')}' AND dzien <= '{next_date.strftime('%Y-%m-%d')}';
+                INSERT INTO dataset_tab
+                {dataset_raw_sql}
                 """
-                
-                cursor.execute(query_batch_insert)
+
+                cursor.execute(
+                    query_batch_insert,
+                    (
+                        client_id,
+                        current_date.strftime('%Y-%m-%d'),
+                        next_date.strftime('%Y-%m-%d'),
+                        client_id,
+                        current_date.strftime('%Y-%m-%d'),
+                        next_date.strftime('%Y-%m-%d'),
+                    )
+                )
                 conn.commit()
-        
-                # Liczba rekordów z bieżącej partii
-                batch_inserted = cursor.rowcount
-                total_inserted += batch_inserted
-                
-                # Wyświetlanie statystyk
-                print(f"Dla shard = {shard} zaimportowano {batch_inserted} rekordów dla dni {current_date.strftime('%Y-%m-%d')} - {next_date.strftime('%Y-%m-%d')}.")
+
+                batch_inserted = cursor.rowcount if cursor.rowcount != -1 else 0
+                total_inserted_shard += batch_inserted
+                total_inserted_all += batch_inserted
+
+                print(
+                    f"Dla client={client_id}, shard={shard} zaimportowano "
+                    f"{batch_inserted} rekordów dla dni "
+                    f"{current_date.strftime('%Y-%m-%d')} - {next_date.strftime('%Y-%m-%d')}."
+                )
                 print(datetime.now().strftime("%H:%M:%S"))
-        
-                # Przejście do następnej partii
+
                 current_date = next_date + pd.Timedelta(days=1)
-        
-        create_and_insert_processed_table_chunked(
+
+            print(
+                f"[INFO] Client={client_id}, shard={shard} zakończony. "
+                f"Łącznie w shardzie: {total_inserted_shard}"
+            )
+
+        cursor.execute("DELETE FROM dataset WHERE INVO_CLNTNO = ?", (client_id,))
+        conn.commit()
+
+        refill_dataset_for_client(
             conn,
-            original_table_name="dataset_tab",
-            target_table_name="dataset",
-            limit_first_batch=params['data_limit']  # lub inny
+            client_id=client_id,
+            source_table="dataset_tab",
+            target_table="dataset",
+            batch_days=params.get("dataset_batch_days", 31)
         )
         print(datetime.now().strftime("%H:%M:%S"))
         
