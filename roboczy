@@ -1,287 +1,69 @@
-Tak — to najlepiej zrobić właśnie tak: skoro swieta są stałe, to przenieść je do configa jako dane statyczne i zasilać je od razu w DBInit. Obecnie swieta są tylko definiowane jako tabela przez query_swieta w configu, a loader Excela nadal siedzi i w CreateDatabase, i nawet omyłkowo w DBInit; dodatkowo w nowym db_init (1).py jest realny błąd conn_new, mimo że w tym pliku pracujesz na conn.  ￼  ￼  ￼
-
-1. Jak przekonwertować polski Excel do treści do configa
-
-Najprościej zapisać to w YAML jako listę rekordów, na przykład:
-
-  swieta_rows:
-    - nazwa: "Nowy Rok"
-      rodzaj: "stałe"
-      data: "2022-01-01"
-      rok: 2022
-      mies: 1
-      dzien: 1
-      dzien_tyg: "sobota"
-    - nazwa: "Trzech Króli"
-      rodzaj: "stałe"
-      data: "2022-01-06"
-      rok: 2022
-      mies: 1
-      dzien: 6
-      dzien_tyg: "czwartek"
-
-Do wygenerowania takiego bloku z Excela użyj tego kodu w Pythonie:
-
-import pandas as pd
+teraz mam takie:
+import argparse
+from datetime import datetime
 import yaml
+import CreateDatabase
 
-xlsx_path = r"C:\Users\...\swieta.xlsx"
+def load_config(path="config.yaml"):
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
-df = pd.read_excel(xlsx_path)
+def parse_client_ids(raw):
+    if raw is None:
+        return None
+    return [int(x.strip()) for x in raw.split(",") if x.strip()]
 
-# normalizacja kolumn
-expected_cols = ["nazwa", "rodzaj", "data", "rok", "mies", "dzien", "dzien_tyg"]
-df = df[expected_cols].copy()
+def main():
+    parser = argparse.ArgumentParser(description="Build per-client SQLite DBs from single Excel file")
 
-# data -> YYYY-MM-DD
-df["data"] = pd.to_datetime(df["data"], errors="coerce").dt.strftime("%Y-%m-%d")
-
-# liczby jako int tam gdzie się da
-for col in ["rok", "mies", "dzien"]:
-    df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
-
-rows = []
-for _, row in df.iterrows():
-    rows.append({
-        "nazwa": None if pd.isna(row["nazwa"]) else str(row["nazwa"]),
-        "rodzaj": None if pd.isna(row["rodzaj"]) else str(row["rodzaj"]),
-        "data": None if pd.isna(row["data"]) else str(row["data"]),
-        "rok": None if pd.isna(row["rok"]) else int(row["rok"]),
-        "mies": None if pd.isna(row["mies"]) else int(row["mies"]),
-        "dzien": None if pd.isna(row["dzien"]) else int(row["dzien"]),
-        "dzien_tyg": None if pd.isna(row["dzien_tyg"]) else str(row["dzien_tyg"]),
-    })
-
-payload = {"swieta_rows": rows}
-
-print(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False))
-
-To wklei Ci gotowy blok YAML do configa.
-
-2. Co dodać do configa
-
-Pod first_model_params dodaj nowy klucz swieta_rows. Sama definicja tabeli query_swieta może zostać bez zmian, bo już jest poprawna.  ￼
-
-Czyli w configu masz zostawić:
-
-  query_swieta: |
-    CREATE TABLE IF NOT EXISTS swieta (
-        nazwa TEXT,
-        rodzaj TEXT,
-        data DATE,
-        rok INTEGER,
-        mies INTEGER,
-        dzien INTEGER,
-        dzien_tyg TEXT
-    );
-
-i dopisać zaraz pod tym:
-
-  swieta_rows:
-    - nazwa: "Nowy Rok"
-      rodzaj: "stałe"
-      data: "2022-01-01"
-      rok: 2022
-      mies: 1
-      dzien: 1
-      dzien_tyg: "sobota"
-
-3. Co zmienić w DBInit
-
-Usuń starą funkcję Excela
-
-Masz teraz w db_init (1).py funkcję:
-
-def create_and_import_swieta(conn, params, file_path):
-    data = pd.read_excel(file_path)
-    data['data'] = pd.to_datetime(data['data'], format='%d.%m.%Y')
-    data.to_sql('swieta', conn, if_exists='append', index=False)
-
-Ta funkcja nie powinna tam zostać, bo:
-	•	ładuje dane zamiast tylko korzystać z configa,
-	•	używa pd, a ten plik nawet nie importuje pandas,
-	•	i jest częścią starej koncepcji.  ￼
-
-Usuń ją w całości i wstaw zamiast niej:
-
-def insert_static_swieta(conn: sqlite3.Connection, rows: list[dict] | None) -> None:
-    if not rows:
-        return
-
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM swieta;")
-
-    data_to_insert = [
-        (
-            row.get("nazwa"),
-            row.get("rodzaj"),
-            row.get("data"),
-            row.get("rok"),
-            row.get("mies"),
-            row.get("dzien"),
-            row.get("dzien_tyg"),
-        )
-        for row in rows
-    ]
-
-    cursor.executemany(
-        """
-        INSERT INTO swieta (nazwa, rodzaj, data, rok, mies, dzien, dzien_tyg)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        data_to_insert,
+    parser.add_argument(
+        "--t0",
+        required=True,
+        help="Current date in YYYY-MM-DD"
     )
-    conn.commit()
-
-Napraw conn_new
-
-W tej chwili w main() masz:
-
-create_aggregated_data_temp_schema(cursor, params)
-create_and_import_swieta(conn_new, params, file_path = r'...')
-
-To jest błędne, bo w tym pliku masz tylko conn = sqlite3.connect(args.db_path). conn_new tu nie istnieje.  ￼
-
-Zastąp te linie tym:
-
-create_aggregated_data_temp_schema(cursor, params)
-
-exec_sql(conn, params.get("query_swieta"), "query_swieta")
-insert_static_swieta(conn, params.get("swieta_rows"))
-
-Czyli kolejność ma być:
-	1.	tworzysz tabelę swieta,
-	2.	zasypujesz ją danymi z configa.
-
-Posprzątaj raw_ready
-
-Teraz masz komentarz i warunek:
-
-# 3. Widoki bazowe – tylko jeśli ich tabele źródłowe już istnieją
-#    (na dziś najpewniej jeszcze nie istnieją na pustej DB)
-raw_tables = ["invo", "debc", "clhs", "dcmo"]
-raw_ready = all(table_exists(cursor, t) for t in raw_tables)
-
-if raw_ready:
-    ...
-else:
-    print(...)
-
-To jest już relikt starej koncepcji, bo chwilę wcześniej sam tworzysz invo/debc/clhs/dcmo przez query_create_*_table, więc ten warunek jest praktycznie zbędny.  ￼
-
-Najprościej zamień cały ten blok na bezwarunkowe tworzenie widoków:
-
-        # ============================================================
-        # 3. Widoki bazowe
-        # ============================================================
-        exec_sql(conn, params.get("query_create_invo_view"), "query_create_invo_view")
-        exec_sql(conn, params.get("query_create_clhs_view"), "query_create_clhs_view")
-        exec_sql(conn, params.get("query_create_DEBC_view"), "query_create_DEBC_view")
-        exec_sql(conn, params.get("query_create_dcmo_view"), "query_create_dcmo_view")
-        exec_sql(conn, params.get("query_create_INVO_CLHS_JOINED"), "query_create_INVO_CLHS_JOINED")
-        exec_sql(conn, params.get("query_create_summary_client_days_view"), "query_create_summary_client_days_view")
-        exec_sql(conn, params.get("query_create_extended_grouped_client_days_view"), "query_create_extended_grouped_client_days_view")
-        exec_sql(conn, params.get("query_create_stats_pivot_view"), "query_create_stats_pivot_view")
-        exec_sql(conn, params.get("query_create_dataset_raw_view"), "query_create_dataset_raw_view")
-        conn.commit()
-
-I usuń:
-	•	raw_tables = ...
-	•	raw_ready = ...
-	•	cały if raw_ready: ... else: ...
-
-4. Co zmienić w CreateDatabase
-
-W CreateDatabase (3).py nadal masz:
-
-create_and_import_swieta(conn, params, file_path = r'...')
-
-To trzeba po prostu usunąć w całości, bo swieta mają już być gotowe po DBInit.  ￼
-
-Usuń ten fragment:
-
-        #tabela do świąt
-        # Ścieżka do pliku Excel
-        create_and_import_swieta(conn, params, file_path = r'C:\Users\OE00SG\CashPredictor\dev3\co i jak baza\Arkusz w C  Users OQ38TT jupiter dev3 co i jak baza co i jak baza.xls')
-
-I niczym go nie zastępuj.
-
-5. Co jeszcze brakuje do „jednorazowy bootstrap — prawie”
-
-Na teraz, po Twoich zmianach, do sensownego jednorazowego bootstrapu brakuje głównie tych rzeczy:
-	1.	Wywalić z DBInit ładowanie z Excela i błąd conn_new — to jest twardy blocker.  ￼
-	2.	Usunąć z CreateDatabase ładowanie swieta, żeby nie mieszać schematu i zasilania danych stałych.  ￼
-	3.	Posprzątać raw_ready, bo jest już martwym warunkiem po zmianie modelu bootstrapu.  ￼
-	4.	Ustalić, że DBInit jest obowiązkowy przed CreateDatabase — bo CreateDatabase zakłada już gotowe tabele i widoki. To wynika z samego układu nowego kodu: loader nie tworzy już pełnego schematu, tylko zasila istniejące obiekty.  ￼  ￼
-
-Po tych poprawkach ten wariant „one-shot bootstrap” będzie już sensowny.
-
-6. Gotowy minimalny patch DBInit
-
-Masz tu wersję zmian do wklejenia.
-
-Dodaj funkcję
-
-def insert_static_swieta(conn: sqlite3.Connection, rows: list[dict] | None) -> None:
-    if not rows:
-        return
-
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM swieta;")
-
-    data_to_insert = [
-        (
-            row.get("nazwa"),
-            row.get("rodzaj"),
-            row.get("data"),
-            row.get("rok"),
-            row.get("mies"),
-            row.get("dzien"),
-            row.get("dzien_tyg"),
-        )
-        for row in rows
-    ]
-
-    cursor.executemany(
-        """
-        INSERT INTO swieta (nazwa, rodzaj, data, rok, mies, dzien, dzien_tyg)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        data_to_insert,
+    parser.add_argument(
+        "--config",
+        default="config.yaml",
+        help="Path to config.yaml"
     )
-    conn.commit()
+    parser.add_argument(
+        "--build-clients",
+        help="Comma-separated list of client IDs to build DBs for (overrides config)"
+    )
 
-Usuń funkcję
+    parser.add_argument(
+        "--db-path",
+        required=True,
+        help="Ścieżka do wspólnej bazy SQLite"
+    )
 
-def create_and_import_swieta(conn, params, file_path):
-    ...
 
-Zastąp w main()
+    args = parser.parse_args()
 
-z:
+    config = load_config(args.config)
+    t0 = datetime.strptime(args.t0, "%Y-%m-%d").date()
 
-create_aggregated_data_temp_schema(cursor, params)
-create_and_import_swieta(conn_new, params, file_path = r'...')
-exec_sql(conn, params.get("query_swieta"), "query_swieta")
+    cli_clients = parse_client_ids(args.build_clients)
 
-na:
+    if cli_clients:
+        # NADPISUJEMY tylko na potrzeby tego wywołania
+        config["first_model_params"]["train_client_id"] = cli_clients
+        print(f"[INFO] Using client list from CLI: {cli_clients}")
+    else:
+        print(
+            "[INFO] Using client list from config.yaml:",
+            config["first_model_params"].get("train_client_id")
+        )
 
-create_aggregated_data_temp_schema(cursor, params)
-exec_sql(conn, params.get("query_swieta"), "query_swieta")
-insert_static_swieta(conn, params.get("swieta_rows"))
+    # CORE: dalej zostaje EXACTLY ten sam mechanizm
+    CreateDatabase.CreateDatabase(
+        config["first_model_params"],
+        t0,
+        create_many_dbs_from_one_excel=True
+    )
 
-Zastąp blok widoków
+if __name__ == "__main__":
+    main()
 
-z raw_ready na bezwarunkowy blok, który wkleiłem wyżej.
 
-7. Gotowy minimalny patch CreateDatabase
-
-Usuń tylko ten fragment:
-
-        #tabela do świąt
-        # Ścieżka do pliku Excel
-        create_and_import_swieta(conn, params, file_path = r'C:\Users\OE00SG\CashPredictor\dev3\co i jak baza\Arkusz w C  Users OQ38TT jupiter dev3 co i jak baza co i jak baza.xls')
-
-I tyle.
-
-Jeżeli chcesz, w następnym kroku mogę Ci od razu rozpisać dokładny finalny diff: „stare linie -> nowe linie” dla DBInit i CreateDatabase, w formie gotowej do ręcznego wklejenia.
+czyli jeszcze cchyba trzeba przekazać bazę, w oógle złapać ten parametr no i jeszcze zastanów się jakie poprawki trzeba zrobić w creatdeatabase dla tej bazy z parametra i braku z template i podaj. czyli podja dla tego pliku powyżej co dodać/ zmienić oraz dla create database
