@@ -1,11 +1,239 @@
-mam takie:
-  swieta_columns: ["nazwa", "rodzaj", "data", "rok", "mies", "dzien", "dzien_tyg"]
-    - ["Nowy Rok", "stałe", "2022-01-01", 2022, 1, 1, "sobota"]
-    - ["Trzech Króli", "stałe", "2022-01-06", 2022, 1, 6, "czwartek"]
+Masz tu błąd w YAML-u: same rekordy świąt muszą być pod osobnym kluczem, nie bezpośrednio pod swieta_columns.
 
-teraz jak to wykorzystać? czyli co mam dla tych świat wstawić do init? konkretny kod.
+Powinno być tak:
 
-co do tego:
-	4.	Ustalić, że DBInit jest obowiązkowy przed CreateDatabase — bo CreateDatabase zakłada już gotowe tabele i widoki. To wynika z samego układu nowego kodu: loader nie tworzy już pełnego schematu, tylko zasila istniejące obiekty.  ￼  ￼
-to jak to zabezpieczyć, jak to robię teraz czy źle czy dobrze, czy zmienić i na co?
+swieta_columns: ["nazwa", "rodzaj", "data", "rok", "mies", "dzien", "dzien_tyg"]
+swieta_rows:
+  - ["Nowy Rok", "stałe", "2022-01-01", 2022, 1, 1, "sobota"]
+  - ["Trzech Króli", "stałe", "2022-01-06", 2022, 1, 6, "czwartek"]
 
+Co wstawić do db_init.py
+
+Dodaj tę funkcję:
+
+def seed_swieta(cursor: sqlite3.Cursor, params: dict) -> None:
+    columns = params.get("swieta_columns")
+    rows = params.get("swieta_rows")
+
+    if not columns or not rows:
+        print("[WARN] Brak definicji świąt w configu, pomijam seed tabeli swieta.")
+        return
+
+    placeholders = ", ".join(["?"] * len(columns))
+    columns_sql = ", ".join(columns)
+
+    # wstawiamy tylko jeśli identyczny rekord jeszcze nie istnieje
+    where_clause = " AND ".join([f"{col} = ?" for col in columns])
+
+    inserted = 0
+    for row in rows:
+        if len(row) != len(columns):
+            raise RuntimeError(
+                f"Nieprawidłowy rekord swieta. Oczekiwano {len(columns)} pól, "
+                f"otrzymano {len(row)}: {row}"
+            )
+
+        cursor.execute(
+            f"SELECT 1 FROM swieta WHERE {where_clause} LIMIT 1",
+            tuple(row),
+        )
+        exists = cursor.fetchone() is not None
+
+        if not exists:
+            cursor.execute(
+                f"INSERT INTO swieta ({columns_sql}) VALUES ({placeholders})",
+                tuple(row),
+            )
+            inserted += 1
+
+    print(f"[OK] Seed swieta zakończony. Dodano {inserted} nowych rekordów.")
+
+Gdzie to wywołać w db_init.py
+
+Masz teraz:
+
+exec_sql(conn, params.get("query_swieta"), "query_swieta")
+
+To zostaje, bo to tworzy tabelę.
+
+Zaraz po tym dodaj:
+
+seed_swieta(cursor, params)
+conn.commit()
+
+Czyli fragment ma wyglądać tak:
+
+create_aggregated_data_temp_schema(cursor, params)
+
+exec_sql(conn, params.get("query_swieta"), "query_swieta")
+seed_swieta(cursor, params)
+conn.commit()
+
+exec_sql(conn, params.get("query_create_group_cust_inv_days"), "query_create_group_cust_inv_days")
+exec_sql(conn, params.get("query_create_summary_client_days_tab2"), "query_create_summary_client_days_tab2")
+exec_sql(conn, params.get("query_create_dataset_tab"), "query_create_dataset_tab")
+exec_sql(conn, params.get("statystyki_faktur"), "statystyki_faktur")
+
+Co usunąć z CreateDatabase
+
+Skoro święta są już stałe i seedowane w init, to z CreateDatabase usuń:
+	•	funkcję create_and_import_swieta(...)
+	•	jej wywołania
+
+Czyli usuń to wywołanie:
+
+create_and_import_swieta(conn, params, file_path = r'C:\Users\OE00SG\CashPredictor\dev3\co i jak baza\Arkusz w C  Users OQ38TT jupiter dev3 co i jak baza co i jak baza.xls')
+
+I możesz też usunąć całą funkcję:
+
+def create_and_import_swieta(conn, params, file_path):
+    ...
+
+oraz analogiczne wywołanie w CreateOneDbForAll(...).
+
+⸻
+
+Jak zabezpieczyć obowiązkowy DBInit przed CreateDatabase
+
+Teraz najlepiej zrobić to jawnie: CreateDatabase ma sprawdzać, czy baza ma wymagany schemat. To jest poprawne i potrzebne.
+
+Co sprawdzać
+
+Minimum:
+	•	czy istnieją główne tabele
+	•	czy istnieją główne widoki
+
+Na przykład:
+	•	invo
+	•	debc
+	•	clhs
+	•	dcmo
+	•	group_cust_inv_days
+	•	grouped_client_days
+	•	summary_client_days_tab
+	•	extended_grouped_client_days_tab
+	•	dataset_tab
+	•	dataset
+	•	INVO_CLHS_JOINED_TAB
+	•	swieta
+
+oraz widoki:
+	•	invo_view
+	•	clhs_view
+	•	DEBC_view
+	•	dcmo_view
+	•	INVO_CLHS_JOINED
+	•	summary_client_days_view
+	•	extended_grouped_client_days
+	•	stats_pivot_view
+	•	dataset_raw_view
+
+Kod do dodania w CreateDatabase
+
+Dodaj helper:
+
+def sqlite_object_exists(cursor, obj_type: str, name: str) -> bool:
+    cursor.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = ? AND name = ?
+        LIMIT 1
+        """,
+        (obj_type, name),
+    )
+    return cursor.fetchone() is not None
+
+Dodaj walidację:
+
+def validate_required_schema_for_create_database(cursor) -> None:
+    required_tables = [
+        "invo",
+        "debc",
+        "clhs",
+        "dcmo",
+        "group_cust_inv_days",
+        "grouped_client_days",
+        "summary_client_days_tab",
+        "extended_grouped_client_days_tab",
+        "dataset_tab",
+        "dataset",
+        "INVO_CLHS_JOINED_TAB",
+        "swieta",
+        "aggregated_data_temp",
+        "statystyki_faktur",
+    ]
+
+    required_views = [
+        "invo_view",
+        "clhs_view",
+        "DEBC_view",
+        "dcmo_view",
+        "INVO_CLHS_JOINED",
+        "summary_client_days_view",
+        "extended_grouped_client_days",
+        "stats_pivot_view",
+        "dataset_raw_view",
+    ]
+
+    missing_tables = [
+        name for name in required_tables
+        if not sqlite_object_exists(cursor, "table", name)
+    ]
+    missing_views = [
+        name for name in required_views
+        if not sqlite_object_exists(cursor, "view", name)
+    ]
+
+    if missing_tables or missing_views:
+        parts = []
+        if missing_tables:
+            parts.append(f"brak tabel: {', '.join(missing_tables)}")
+        if missing_views:
+            parts.append(f"brak widoków: {', '.join(missing_views)}")
+
+        raise RuntimeError(
+            "Baza nie ma pełnego schematu wymaganego przez CreateDatabase; "
+            "najpierw uruchom DBInit. " + " | ".join(parts)
+        )
+
+Gdzie to wywołać
+
+W CreateDatabase, zaraz po:
+
+conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+cursor = conn.cursor()
+
+dodaj:
+
+validate_required_schema_for_create_database(cursor)
+
+Czyli:
+
+db_path = params['database_template'].format(client_id=client_id)
+conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+cursor = conn.cursor()
+
+validate_required_schema_for_create_database(cursor)
+
+Czy to robisz teraz dobrze
+
+Obecnie nie do końca, bo:
+	•	CreateDatabase zakłada, że schemat już istnieje,
+	•	ale nie sprawdza tego wprost,
+	•	więc przy złej bazie wywali się później, w losowym miejscu.
+
+Po dodaniu walidacji będzie dobrze, bo błąd będzie:
+	•	szybki,
+	•	czytelny,
+	•	dokładnie powie, że najpierw trzeba odpalić DBInit.
+
+Wniosek
+
+Docelowo masz mieć taki podział:
+	•	DBInit — tworzy cały schemat i seeduje stałe dane, jak swieta
+	•	CreateDatabase — tylko ładuje dane klienta do istniejących obiektów i przelicza pochodne
+
+To zabezpieczenie przez validate_required_schema_for_create_database(...) jest właśnie poprawnym domknięciem tej logiki.
+
+Jeśli chcesz, w następnym kroku mogę Ci od razu rozpisać gotowy patch: dokładnie które funkcje usunąć z CreateDatabase, które dodać do DBInit i finalny fragment obu plików gotowy do wklejenia.
