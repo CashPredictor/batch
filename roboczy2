@@ -1,35 +1,382 @@
-odnośnie:
-Dawniej
+Da się to zrobić tak, żeby było jednocześnie:
+	•	zgodne z nową architekturą,
+	•	bez runtime odtwarzania schematu,
+	•	i wydajnościowo możliwie tak samo jak wcześniej.
 
-Każdy shard:
-	•	przebudowywał stats_pivot_view,
-	•	przebudowywał dataset_raw_view,
-	•	więc joiny i agregacje liczyły się tylko dla shardu.
+I klucz jest taki:
 
-Teraz
+Nie shardować na końcu INSERT ... FROM dataset_raw_view
 
-stats_pivot_view i dataset_raw_view są globalne,
-a shard działa dopiero na końcu przy insercie do dataset_tab.
+bo wtedy rzeczywiście:
+	•	stats_pivot_view liczy się globalnie,
+	•	dataset_raw_view liczy się globalnie,
+	•	a shard tylko obcina wynik na końcu,
+	•	czyli tracisz dawny zysk wydajnościowy.
 
-Wniosek
-
-To jest poprawne funkcjonalnie, ale może być trochę cięższe wydajnościowo niż dawniej.
+To nie jest wystarczające.
 
 ⸻
 
-7. Czy to problem
+Co naprawdę dawało wydajność wcześniej
 
-Na dziś:
-	•	architektonicznie to jest poprawne
-	•	logicznie to jest poprawne
-	•	zgodne z nową zasadą „schemat w init, zasilanie w CreateDatabase”
+Nie sam fakt istnienia shardów, tylko to, że dla każdego shardu silnik wykonywał:
+	•	mniejszy zakres group_cust_inv_days,
+	•	mniejszy join do stats_pivot_view,
+	•	mniejszy join do summary_client_days_tab,
+	•	mniejszy join do extended_grouped_client_days_tab,
+	•	i dopiero z tego składał dataset_raw_view.
 
-Jeżeli później okaże się, że wydajność siadła, to wtedy nie wracasz do drop/create view, tylko robisz:
-	•	albo materializację pośrednią klientową,
-	•	albo osobne zapytania INSERT ... SELECT ... bez widoku,
-	•	albo tabelę pomocniczą per klient/shard.
+Czyli wydajność dawało wpychanie shard condition do wnętrza planu zapytania, a nie filtrowanie na końcu.
 
-to jednak musimy to zrobić tak aby wydajnościowo było identycznie, bo tylko w ten sposób baza to dźwigała, zastanów się jak to zrobić aby schemat był
-tak jak zaproponowałeś, ale inserty w craete database tylok wydajnościowo było takjak wcześniej? nie chcemy tymczasowych tabel 
-co najwyżej mogą być tabele przejściowe, ale to w takim razie też musimy je zdefiniować i zasilać i usuwać, ale zastanów się czy to
-ma sens, czy może są lepsze opcje?
+⸻
+
+Jak zachować to samo bez psucia architektury
+
+Najlepsza opcja to:
+
+1. W db_init zostawić tylko stały schemat
+
+czyli:
+	•	tabele,
+	•	indeksy,
+	•	widoki stałe, niezależne od shardów.
+
+2. Z CreateDatabase usunąć runtime CREATE VIEW
+
+czyli nadal nie odtwarzasz schematu.
+
+3. Ale zamiast używać globalnego dataset_raw_view, trzymać w configu:
+	•	parametryzowalny SELECT do stats pivot
+	•	parametryzowalny SELECT do dataset raw
+	•	i w CreateDatabase robić:
+	•	INSERT INTO dataset_tab ... SELECT ...
+	•	gdzie ten SELECT ma wstrzyknięty shard condition.
+
+Czyli:
+	•	nie tworzysz widoku,
+	•	ale używasz dokładnie tej samej logiki SQL,
+	•	tylko jako inline SELECT zamiast CREATE VIEW.
+
+To daje praktycznie ten sam plan wykonania co dawniej.
+
+⸻
+
+To jest najlepsza opcja
+
+Bo:
+	•	nie łamie zasady „schemat w init”,
+	•	nie robi runtime DROP VIEW / CREATE VIEW,
+	•	nie wymaga tymczasowych widoków,
+	•	nie wymaga tabel przejściowych,
+	•	pozwala zachować sharding tam, gdzie on realnie działa.
+
+⸻
+
+Czego nie robić
+
+Nie robić globalnego dataset_raw_view + filtrowania shardem na końcu
+
+bo będzie wolniej.
+
+Nie robić tymczasowych widoków
+
+bo to znowu jest pół-krok w stronę runtime schematu.
+
+Nie robić tabel przejściowych, jeśli nie trzeba
+
+bo:
+	•	trzeba je tworzyć,
+	•	czyścić,
+	•	pilnować klienta i shardu,
+	•	to zwiększa złożoność,
+	•	a tu da się osiągnąć cel bez nich.
+
+⸻
+
+Najlepszy model docelowy
+
+db_init
+
+tworzy tylko:
+	•	raw tables,
+	•	derived tables,
+	•	stałe widoki niezależne od shardów:
+	•	invo_view
+	•	clhs_view
+	•	debc_view
+	•	dcmo_view
+	•	INVO_CLHS_JOINED
+	•	summary_client_days_view
+	•	extended_grouped_client_days
+
+Natomiast:
+	•	stats_pivot_view
+	•	dataset_raw_view
+
+nie muszą być już prawdziwymi widokami schematowymi.
+
+Zamiast tego mogą być w configu jako select templates.
+
+To jest najczystsze rozwiązanie.
+
+⸻
+
+Czyli co proponuję konkretnie
+
+W configu rozdzielić:
+
+zamiast:
+	•	query_create_stats_pivot_view
+	•	query_create_dataset_raw_view
+
+zrób:
+	•	query_stats_pivot_select
+	•	query_dataset_raw_select
+
+czyli nie CREATE VIEW ..., tylko samo SELECT ....
+
+⸻
+
+Jak to będzie działać
+
+Dawniej
+
+robiłeś:
+	•	CREATE VIEW stats_pivot_view AS SELECT ... WHERE {shard_condition}
+	•	CREATE VIEW dataset_raw_view AS SELECT ... JOIN stats_pivot_view ... WHERE {shard_condition}
+	•	INSERT INTO dataset_tab SELECT * FROM dataset_raw_view
+
+Teraz
+
+zrobisz:
+	•	z configu bierzesz query_stats_pivot_select
+	•	z configu bierzesz query_dataset_raw_select
+	•	do obu wstrzykujesz ten sam shard_condition
+	•	i wykonujesz:
+
+INSERT INTO dataset_tab
+SELECT * FROM (
+    ... query_dataset_raw_select po replace ...
+)
+
+czyli logicznie prawie to samo, ale bez tworzenia widoku.
+
+⸻
+
+Dlaczego to zachowa wydajność
+
+Bo shard condition dalej siedzi:
+	•	wewnątrz zapytania pivot,
+	•	wewnątrz zapytania dataset raw,
+	•	przed joinami i grupowaniami końcowymi.
+
+Czyli SQLite nadal liczy na ograniczonym fragmencie danych.
+
+To jest właśnie to, co chcesz odzyskać.
+
+⸻
+
+Czy trzeba wtedy zostawić stats_pivot_view i dataset_raw_view w init?
+
+Moja rekomendacja:
+
+nie
+
+Jeżeli mają być shardowane wydajnościowo tak jak dawniej, to lepiej:
+	•	nie tworzyć ich w db_init,
+	•	nie trzymać ich jako obiektów schematu,
+	•	tylko trzymać ich definicje jako szablony SQL w configu.
+
+Bo wtedy nie ma rozdwojenia:
+	•	jeden SQL do stałego widoku,
+	•	drugi SQL do shardowanego inserta.
+
+Masz jedną definicję logiki i używasz jej dokładnie tam, gdzie trzeba.
+
+⸻
+
+Co wtedy zostaje jako schemat, a co jako runtime select
+
+Stały schemat w db_init
+
+zostają:
+	•	wszystkie tabele,
+	•	indeksy,
+	•	raw views,
+	•	helper views bez shardów i bez problemów wydajnościowych.
+
+Runtime select w CreateDatabase
+
+przechodzą:
+	•	stats_pivot
+	•	dataset_raw
+
+ale tylko jako SELECT-y używane do insertów, nie jako obiekty DB.
+
+To jest nadal zgodne z zasadą:
+CreateDatabase zasila, a nie odtwarza schemat.
+
+Bo SELECT użyty do INSERT INTO ... SELECT ... to nie jest tworzenie schematu.
+
+⸻
+
+Czy tabele przejściowe mają sens
+
+Moim zdaniem tutaj nie jako pierwszy wybór.
+
+Miałyby sens, gdyby:
+	•	jeden shardowany wynik był wielokrotnie używany,
+	•	albo jedna ciężka część pipeline była potem wykorzystywana kilka razy.
+
+Ale u Ciebie główny problem jest taki, żeby wydajnie zbudować dataset_tab.
+
+Jeśli wynik jest używany raz, to lepiej:
+	•	zrobić dobry shardowany INSERT ... SELECT ...,
+	•	niż tworzyć dodatkową tabelę pośrednią, zasilać ją, indeksować, czyścić.
+
+Tabele przejściowe zwiększają:
+	•	złożoność,
+	•	I/O,
+	•	liczbę commitów,
+	•	ilość kodu do utrzymania.
+
+Więc na teraz: nie warto.
+
+⸻
+
+Najlepsza architektura
+
+Zostaw w init:
+	•	extended_grouped_client_days_view
+	•	summary_client_days_view
+
+bo one są potrzebne też niezależnie i są częścią logicznego schematu.
+
+Przenieś z widoków do select-template:
+	•	stats_pivot_view
+	•	dataset_raw_view
+
+bo to są elementy stricte pod wydajne zasilanie datasetów.
+
+To będzie najbardziej spójne.
+
+⸻
+
+Jak to wdrożyć praktycznie
+
+1. W configu zamiast CREATE VIEW ... daj SELECT-y
+
+query_stats_pivot_select
+
+czyli bez:
+
+CREATE VIEW stats_pivot_view AS
+
+tylko samo:
+
+SELECT ...
+FROM group_cust_inv_days g
+LEFT JOIN statystyki_faktur stats_pivot ...
+WHERE {shard_condition}
+GROUP BY ...
+
+query_dataset_raw_select
+
+czyli bez:
+
+CREATE VIEW dataset_raw_view AS
+
+tylko samo:
+
+SELECT ...
+FROM group_cust_inv_days g
+LEFT JOIN ...
+LEFT JOIN (
+    {stats_pivot_select}
+) pivot
+ON ...
+WHERE {shard_condition}
+
+albo, jeszcze lepiej, przez CTE.
+
+⸻
+
+Najlepsza forma SQL: CTE
+
+To jest najczystsze.
+
+query_dataset_raw_select
+
+powinno wyglądać mniej więcej tak:
+
+WITH stats_pivot_view AS (
+    {stats_pivot_select}
+)
+SELECT
+    ...
+FROM group_cust_inv_days g
+LEFT JOIN invo i ON ...
+LEFT JOIN ... c ON ...
+LEFT JOIN extended_grouped_client_days_tab e ON ...
+LEFT JOIN summary_client_days_tab s ON ...
+LEFT JOIN stats_pivot_view pivot ON ...
+WHERE {shard_condition}
+
+To daje:
+	•	dawną logikę,
+	•	dawną wydajność,
+	•	brak runtime widoków,
+	•	brak tymczasowych tabel.
+
+To jest moim zdaniem najlepsza wersja.
+
+⸻
+
+Wniosek końcowy
+
+Najlepsza opcja to:
+
+w db_init
+
+tworzyć tylko stały schemat,
+
+w CreateDatabase
+
+dla shardów wykonywać:
+	•	shardowany SELECT stats_pivot
+	•	shardowany SELECT dataset_raw
+	•	ale jako inline SQL / CTE,
+	•	nie jako CREATE VIEW.
+
+⸻
+
+Czyli odpowiedź brzmi
+
+Tak, da się zachować wydajność praktycznie identyczną jak wcześniej, bez tymczasowych widoków i bez tabel przejściowych, jeśli:
+	•	stats_pivot_view i dataset_raw_view przestaną być obiektami schematu,
+	•	a staną się szablonami SELECT w configu,
+	•	uruchamianymi w CreateDatabase z wstrzykniętym shard_condition.
+
+To jest najlepsze rozwiązanie.
+
+⸻
+
+Co bym zrobił teraz
+	1.	Usunął z db_init tworzenie:
+	•	query_create_stats_pivot_view
+	•	query_create_dataset_raw_view
+	2.	W configu dodał:
+	•	query_stats_pivot_select
+	•	query_dataset_raw_select
+	3.	W CreateDatabase przebudował sekcję dataset_tab, żeby używała:
+	•	batch po dacie,
+	•	shard,
+	•	INSERT INTO dataset_tab ... WITH stats_pivot_view AS (...) SELECT ...
+
+To będzie i czyste, i szybkie.
+
+W następnym kroku mogę Ci rozpisać gotowy kod:
+	•	nowe klucze do configa,
+	•	nowy SQL query_stats_pivot_select,
+	•	nowy SQL query_dataset_raw_select,
+	•	gotowy blok Pythona do CreateDatabase 1:1 do wklejenia.
