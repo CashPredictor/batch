@@ -1,69 +1,332 @@
-teraz mam takie:
-import argparse
-from datetime import datetime
-import yaml
-import CreateDatabase
+Masz rację — trzeba to przemyśleć jeszcze raz od strony rzeczywistego flow, a nie tylko punktowych poprawek.
 
-def load_config(path="config.yaml"):
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+W obecnej sytuacji nie chodzi o:
+	•	wiele baz z wielu plików,
+	•	jedną bazę z już gotowych baz datasetowych,
+	•	ani o stare template’y per klient.
 
-def parse_client_ids(raw):
-    if raw is None:
-        return None
-    return [int(x.strip()) for x in raw.split(",") if x.strip()]
+Chodzi o jeden docelowy tryb:
 
-def main():
-    parser = argparse.ArgumentParser(description="Build per-client SQLite DBs from single Excel file")
+jeden Excel wieloklientowy → jedna wspólna baza SQLite → klienci ładowani kolejno do tych samych tabel
 
-    parser.add_argument(
-        "--t0",
-        required=True,
-        help="Current date in YYYY-MM-DD"
-    )
-    parser.add_argument(
-        "--config",
-        default="config.yaml",
-        help="Path to config.yaml"
-    )
-    parser.add_argument(
-        "--build-clients",
-        help="Comma-separated list of client IDs to build DBs for (overrides config)"
-    )
+I pod to trzeba uprościć CreateDatabase.
 
-    parser.add_argument(
-        "--db-path",
-        required=True,
-        help="Ścieżka do wspólnej bazy SQLite"
-    )
+Jak to działa teraz
+
+build_client_dbs.py
+
+Ten plik:
+	•	bierze listę klientów,
+	•	wkłada ich do params["train_client_id"],
+	•	wywołuje CreateDatabase(...).
+
+Ale obecnie CreateDatabase nadal ma w sobie starą logikę wielotrybową:
+	•	create_many_dbs_from_one_excel=True
+	•	tryb osobnych plików per klient
+	•	stare template’y baz
+	•	tryb CreateOneDbForAll
+	•	różne ścieżki historyczne
+
+To znaczy, że dziś masz mieszankę:
+	•	trochę nowej logiki wspólnej bazy,
+	•	trochę starej logiki budowania osobnych baz.
+
+I to właśnie trzeba przeciąć.
+
+⸻
+
+Docelowe założenie
+
+Powinno być tylko to:
+	1.	db_init.py
+	•	tworzy pustą bazę,
+	•	tworzy cały schemat,
+	•	tworzy wszystkie widoki, indeksy, tabele pomocnicze, święta itd.
+	2.	build_client_dbs.py
+	•	bierze listę klientów,
+	•	dla każdego klienta wywołuje CreateDatabase(...),
+	•	zawsze przekazuje tę samą ścieżkę wspólnej bazy.
+	3.	CreateDatabase.py
+	•	nie tworzy schematu
+	•	nie wybiera trybów architektonicznych
+	•	przyjmuje:
+	•	jednego klienta,
+	•	wspólną bazę,
+	•	jeden Excel wieloklientowy,
+	•	ładuje dane tego klienta do już istniejących tabel.
+
+To oznacza, że z CreateDatabase można usunąć większość starych trybów.
+
+⸻
+
+Który kod z obecnego CreateDatabase jest naprawdę potrzebny
+
+Z całej starej funkcji potrzebny jest tylko ten wariant logiczny:
+
+potrzebny rdzeń
+
+ten fragment koncepcyjnie:
+	•	wczytaj jeden Excel
+	•	odfiltruj z niego jednego klienta
+	•	otwórz jedną wspólną bazę
+	•	wykonaj:
+	•	delete klienta z tabel RAW
+	•	insert klienta do RAW
+	•	delete klienta z tabel pochodnych
+	•	refill pochodnych dla tego klienta
+
+Czyli tak naprawdę potrzebujesz z obecnej funkcji tylko logiki z części:
+
+if create_many_dbs_from_one_excel:
+    ...
+
+ale przerobionej tak, żeby:
+	•	nie robiła listy klientów,
+	•	nie sterowała wieloma bazami,
+	•	nie była „many dbs from one excel”,
+	•	tylko po prostu:
+load one client from multi-client excel into one shared db
+
+⸻
+
+Co z tego wynika
+
+CreateDatabase nie powinien już iterować po klientach
+
+Pętla po klientach ma być w build_client_dbs.py.
+
+To właśnie ten plik ma sterować procesem:
+	•	klient 13581
+	•	klient 10095
+	•	klient 6089
+	•	itd.
+
+A CreateDatabase ma robić tylko:
+	•	„weź tego jednego klienta i załaduj go do tej jednej bazy”.
+
+To jest dużo czystsze.
+
+⸻
+
+Co można usunąć z CreateDatabase
+
+1. Tryb wielu osobnych plików Excel
+
+Ten blok:
+
+else:
+    # --- wiele plików: po jednym Excelu na klienta ---
+
+jeśli już przechodzicie całkowicie na:
+jeden Excel wieloklientowy,
+to ten tryb można wyrzucić.
+
+2. Całą logikę budowania client_ids w CreateDatabase
+
+Niepotrzebne będzie:
+	•	all_client_ids
+	•	_counts
+	•	_counts_sorted
+	•	filtrowanie exclude_ids
+	•	budowanie listy klientów w środku tej funkcji
+
+Bo klient ma już przyjść gotowy z build_client_dbs.py.
+
+3. create_many_dbs_from_one_excel jako przełącznik
+
+Jeżeli zostaje tylko jeden prawdziwy tryb, to parametr:
+
+create_many_dbs_from_one_excel
+
+staje się zbędny.
+
+Możesz go usunąć całkowicie.
+
+4. CreateOneDbForAll
+
+Ta funkcja jest z innej epoki architektury:
+	•	bierze gotowe bazy klientów,
+	•	scala tylko dataset.
+
+To nie jest już ten pipeline.
+Można ją zostawić chwilowo jako legacy, ale nie należy do nowego flow.
+
+⸻
+
+Jak powinien wyglądać nowy uproszczony flow
+
+build_client_dbs.py
+
+on robi:
+
+for client_id in client_ids:
+    run_params = dict(params)
+    run_params["client_id"] = client_id
+    run_params["database"] = args.db_path
+
+    CreateDatabase.CreateDatabase(run_params, t0)
+
+czyli:
+	•	lista klientów zostaje tutaj,
+	•	baza wspólna jest tutaj,
+	•	jeden klient na jedno wywołanie.
+
+⸻
+
+CreateDatabase(params, t0)
+
+i ta funkcja już nie myśli o wielu trybach.
+Ona robi tylko:
+	1.	pobierz:
+	•	client_id = params["client_id"]
+	•	db_path = params["database"]
+	•	file_path = params["multi_client_excel_path"]
+	2.	wczytaj Excel:
+	•	df_invo_all, df_debc_all, df_clhs_all, df_dcmo_all
+	3.	odfiltruj jednego klienta:
+	•	df_invo = ... == client_id
+	•	itd.
+	4.	otwórz wspólną bazę db_path
+	5.	wyczyść klienta z:
+	•	invo
+	•	debc
+	•	clhs
+	•	dcmo
+	6.	załaduj RAW
+	7.	wyczyść i przelicz pochodne dla klienta:
+	•	INVO_CLHS_JOINED_TAB
+	•	group_cust_inv_days
+	•	grouped_client_days
+	•	extended_grouped_client_days_tab
+	•	summary_client_days_tab
+	•	statystyki_faktur
+	•	dataset_tab
+	•	dataset
+	8.	zamknij połączenie
+
+To wszystko.
+
+⸻
+
+Czyli co konkretnie zmienić
+
+1. W build_client_dbs.py
+
+zamiast ustawiać:
+
+config["first_model_params"]["train_client_id"] = cli_clients
+
+lepiej zrobić pętlę i przekazywać pojedynczego klienta jako nowy parametr, na przykład:
+
+run_params["client_id"] = client_id
+run_params["database"] = args.db_path
+
+Nie używałbym już do tego train_client_id wewnątrz CreateDatabase, bo to myli znaczenie.
+train_client_id może zostać jako lista wejściowa w configu, ale do pojedynczego wywołania lepiej wprowadzić jawne:
+
+client_id
 
 
-    args = parser.parse_args()
+⸻
 
-    config = load_config(args.config)
-    t0 = datetime.strptime(args.t0, "%Y-%m-%d").date()
+2. W CreateDatabase
 
-    cli_clients = parse_client_ids(args.build_clients)
+zamiast:
 
-    if cli_clients:
-        # NADPISUJEMY tylko na potrzeby tego wywołania
-        config["first_model_params"]["train_client_id"] = cli_clients
-        print(f"[INFO] Using client list from CLI: {cli_clients}")
-    else:
-        print(
-            "[INFO] Using client list from config.yaml:",
-            config["first_model_params"].get("train_client_id")
-        )
+suffix = params["train_client_id"]
+...
+client_ids = ...
+...
+for client_id in client_ids:
 
-    # CORE: dalej zostaje EXACTLY ten sam mechanizm
-    CreateDatabase.CreateDatabase(
-        config["first_model_params"],
-        t0,
-        create_many_dbs_from_one_excel=True
-    )
+powinno być po prostu:
 
-if __name__ == "__main__":
-    main()
+client_id = params["client_id"]
+db_path = params["database"]
+file_path = params["multi_client_excel_path"]
 
+i bez żadnej pętli po klientach.
 
-czyli jeszcze cchyba trzeba przekazać bazę, w oógle złapać ten parametr no i jeszcze zastanów się jakie poprawki trzeba zrobić w creatdeatabase dla tej bazy z parametra i braku z template i podaj. czyli podja dla tego pliku powyżej co dodać/ zmienić oraz dla create database
+⸻
+
+Co z nazwą funkcji
+
+Też bym to uprościł.
+
+Obecna nazwa:
+
+CreateDatabase
+
+jest historyczna i myląca, bo ona już nie tworzy bazy w sensie schematu.
+
+Docelowo lepsza byłaby nazwa typu:
+	•	LoadClientData
+	•	PopulateClientData
+	•	RefillClientData
+
+Ale jeśli na razie nie chcesz ruszać interfejsu i importów, to można zostawić nazwę CreateDatabase, tylko wewnętrznie uprościć funkcję.
+
+⸻
+
+Najważniejszy wniosek
+
+Masz rację, że nie trzeba teraz „naprawiać wszystkich trybów”.
+Trzeba zrobić coś odwrotnego:
+
+trzeba świadomie wyrzucić stare tryby
+
+i zostawić tylko jeden docelowy:
+
+jeden Excel → jedna wspólna baza → jeden klient na jedno wywołanie → pętla po klientach w build_client_dbs.py
+
+To jest najczystsze i najbardziej zgodne z tym, co już zrobiliście:
+	•	dodaliście CLNTNO do tabel,
+	•	zrobiliście delete/append zamiast drop/create,
+	•	przenieśliście schemat do db_init.
+
+⸻
+
+Co bym usunął teraz
+
+Z CreateDatabase.py:
+	•	gałąź z osobnymi plikami Excel per klient
+	•	logikę wyboru wielu klientów w środku funkcji
+	•	database_template
+	•	zależność od tworzenia osobnych baz per klient
+	•	parametr create_many_dbs_from_one_excel
+	•	wszystko, co służyło staremu rozdzieleniu trybów
+
+Zostawiłbym:
+	•	helpers do wczytania Excela
+	•	helpers do refilli
+	•	sam pipeline ładowania jednego klienta
+
+⸻
+
+Krótka odpowiedź na Twoje pytanie
+
+Tak:
+	•	właściwym kodem bazowym jest obecna gałąź „from one excel”
+	•	ale trzeba ją przerobić z:
+	•	„wiele klientów i wiele baz”
+na:
+	•	„jeden klient i jedna wspólna baza”
+
+Nie trzeba ratować wszystkich innych scenariuszy.
+Można je wyciąć.
+
+⸻
+
+Najlepsza następna rzecz
+
+Teraz najlepiej zrobić:
+	1.	uproszczony podpis CreateDatabase(params, t0)
+	2.	w params używać:
+	•	client_id
+	•	database
+	•	multi_client_excel_path
+	3.	wyrzucić z tej funkcji wszystkie stare tryby
+
+Mogę Ci teraz rozpisać dokładnie:
+	•	co usunąć z CreateDatabase blok po bloku
+	•	oraz dać Ci docelowy szkielet nowej, uproszczonej funkcji CreateDatabase gotowy do wklejenia.
