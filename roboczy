@@ -1,445 +1,139 @@
-Nie, jeszcze nie jest dobrze. Poprawiłeś kilka ważnych rzeczy, ale nadal są błędy logiczne i teraz najlepiej dokończyć przejście na nowy model, zamiast dalej łatać starą funkcję.
-
-Najważniejszy wniosek:
-
-CreateDatabase ma już tylko zasilać istniejące obiekty.
-To oznacza:
-	•	żadnego tworzenia schematu,
-	•	żadnego tworzenia indeksów,
-	•	żadnego replace,
-	•	żadnego „resume po ostatnim miesiącu”,
-	•	żadnych funkcji, które implicitnie zakładają DROP/CREATE,
-	•	tylko:
-	1.	wyczyść dane klienta z tabel docelowych,
-	2.	wstaw dane klienta,
-	3.	commit.
-
-Co nadal jest źle
-
-1. swieta nadal będzie się duplikować
-
-Masz:
-
-data.to_sql('swieta', conn, if_exists='append', index=False)
-
-To nie tworzy już tabeli, ale nadal przy każdym uruchomieniu dopisze te same święta.
-
-Powinno być albo:
-	•	swieta ładowane raz poza CreateDatabase,
-albo
-	•	przed insertem pełne DELETE FROM swieta.
-
-Ponieważ to tabela globalna, najczyściej:
-	•	usunąć ładowanie swieta z CreateDatabase
-	•	zostawić to jako etap bootstrap albo osobny krok.
-
-Jeżeli chcesz zostawić tymczasowo w CreateDatabase, to:
-
-def create_and_import_swieta(conn, params, file_path):
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM swieta")
-
-    data = pd.read_excel(file_path)
-    data['data'] = pd.to_datetime(data['data'], format='%d.%m.%Y')
-    data.to_sql('swieta', conn, if_exists='append', index=False)
-
-2. aggregated_data_temp nadal będzie się duplikować
-
-Masz na końcu:
-
-create_aggregated_data_temp(conn, data_end_str)
-
-To też jest tabela globalna, nie klientowa. Przy każdym runie dopiszesz te same dni drugi raz.
-
-To też trzeba wywalić z CreateDatabase.
-
-3. summary_client_days_tab nadal ma starą logikę incremental
-
-To jest już niezgodne z nowym modelem.
-
-Masz:
-	•	szukanie ostatniego miesiąca,
-	•	kontynuowanie od ostatniego miesiąca,
-	•	brak czyszczenia klienta przed całością.
-
-To trzeba uprościć. Dla nowego modelu:
-	•	DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?
-	•	potem zwykły insert dla wszystkich miesięcy tego klienta
-
-bez last_inserted_year, bez resume.
-
-4. statystyki_faktur czyścisz w złym miejscu
-
-Masz:
-
-cursor.execute("DELETE FROM statystyki_faktur WHERE INVO_CLNTNO = ?", (client_id,))
-
-wewnątrz pętli scenariuszy. To jest błąd. W praktyce będziesz kasował poprzednio policzone rekordy klienta przy każdym kolejnym scenariuszu.
-
-To DELETE ma być raz, przed całym blokiem liczenia statystyk.
-
-5. dataset_tab sharding jest niepełny
-
-Masz dwa problemy:
-	•	wyliczasz shard_condition, ale go nie używasz,
-	•	więc każdy shard ładuje to samo.
-
-Ten fragment:
-
-INSERT INTO dataset_tab 
-SELECT * FROM dataset_raw_view
-WHERE INVO_CLNTNO  = {client_id}
-AND dzien >= ...
-
-w ogóle nie filtruje po shardzie. Czyli pętla po shardach nie ma sensu i dubluje dane.
-
-Albo:
-	•	usuwasz cały sharding z tego etapu,
-albo
-	•	dodajesz AND {shard_condition}.
-
-Na ten moment najprościej: usuń shard loop, jeśli nie jest potrzebny.
-
-6. query_invo ma ryzykowne SQL
-
-Masz:
-
-and date(INVO_INVDATE) >= {params['od_dnia']} ;
-
-Bez cudzysłowów. To powinno być parametryzowane albo przynajmniej:
-
-and date(INVO_INVDATE) >= date('{params['od_dnia']}')
-
-7. Nadal tworzysz indeksy w CreateDatabase
-
-Masz nadal:
-
-cursor.execute(params['idx_invo_debcno_invdate_etc'])
-cursor.execute(params['idx_invo_debcno_invdate'])
-cursor.execute(params['idx_summary_days_ids_dzien'])
-cursor.execute(params['idx_ext_days_ids_dzien'])
-cursor.execute(params['idx_clhs_joined_keys_datetime'])
-
-To trzeba usunąć z CreateDatabase. To należy do db_init.
-
-⸻
-
-Najważniejsza odpowiedź na Twoje pytanie o dataset
-
-Tak, dokładnie: obecna funkcja create_and_insert_processed_table_chunked(...) jest reliktem starego modelu.
-
-Była długa i skomplikowana, bo wcześniej:
-	•	tabela docelowa mogła być tworzona „przy okazji”,
-	•	funkcja miała obsługiwać pierwszy batch inaczej,
-	•	było myślenie w stylu „buduję tabelę dataset etapami, może od zera”.
-
-W nowym modelu to już nie ma sensu.
-
-Co ma zostać z tej funkcji
-
-Ma zostać tylko:
-	•	czytanie z dataset_tab partiami,
-	•	przetworzenie DataFrame przez process_dataset_tab,
-	•	insert do już istniejącej tabeli dataset.
-
-Czego ma nie być
-
-Nie ma być:
-	•	żadnego myślenia o tworzeniu tabeli,
-	•	żadnego specjalnego traktowania pierwszego batcha,
-	•	żadnego „utworzono tabelę” w logach,
-	•	żadnych implicit założeń o schemacie.
-
-⸻
-
-Jak to najlepiej zrobić teraz
-
-Docelowa logika dla dataset
-
-W CreateDatabase:
-	1.	wyczyść klienta z dataset
-	2.	czytaj dataset_tab tego klienta partiami
-	3.	każdą partię przetwórz
-	4.	append do dataset
-
-Czyli zamiast starej funkcji z chunkowaniem po (ROK, MIESIAC) i specjalną pierwszą partią, zrób prostą funkcję typu:
-
-def refill_dataset_for_client(conn, client_id, source_table="dataset_tab", target_table="dataset", chunksize=200000):
-    ...
-
-To jest dużo czystsze.
-
-⸻
-
-Kod, który proponuję
-
-1. Nowa funkcja zamiast create_and_insert_processed_table_chunked
-
-def refill_dataset_for_client(
-    conn,
-    client_id,
-    source_table: str = "dataset_tab",
-    target_table: str = "dataset",
-    chunksize: int = 200000
-):
-    cursor = conn.cursor()
-
-    # Czyścimy tylko dane tego klienta w tabeli docelowej
-    cursor.execute(f"DELETE FROM {target_table} WHERE INVO_CLNTNO = ?", (client_id,))
-    conn.commit()
-
-    # Mapowanie typów kolumn z tabeli źródłowej
-    cursor.execute(f"PRAGMA table_info({source_table});")
-    columns_info_raw = cursor.fetchall()
-    columns_info = [(col[1], col[2] if col[2] else "TEXT") for col in columns_info_raw]
-
-    query = f"""
-        SELECT *
-        FROM {source_table}
-        WHERE INVO_CLNTNO = ?
-        ORDER BY ROK, MIESIAC, DZIEN, INVO_NO
-    """
-
-    total_inserted = 0
-    offset = 0
-
-    while True:
-        chunk_query = query + f" LIMIT {chunksize} OFFSET {offset}"
-        chunk_df = pd.read_sql_query(chunk_query, conn, params=(client_id,))
-
-        if chunk_df.empty:
-            break
-
-        processed_df = process_dataset_tab(chunk_df, columns_info)
-        processed_df = remove_case_insensitive_duplicate_columns(processed_df)
-        processed_df = sanitize_column_names(processed_df)
-
-        float_cols = processed_df.select_dtypes(include=[np.float64, np.float32]).columns
-        if len(float_cols) > 0:
-            processed_df[float_cols] = processed_df[float_cols].round(4)
-            for c in float_cols:
-                processed_df[c] = processed_df[c].astype("float32")
-
-        processed_df = processed_df.where(pd.notna(processed_df), None)
-
-        placeholders = ", ".join(["?" for _ in processed_df.columns])
-        insert_sql = f"INSERT INTO {target_table} VALUES ({placeholders})"
-
-        def _to_sqlite_safe(v):
-            if pd.isna(v):
-                return None
-            if isinstance(v, np.datetime64):
-                v = pd.to_datetime(v)
-            if isinstance(v, pd.Timestamp):
-                return v.to_pydatetime()
-            return v
-
-        rows = [
-            tuple(_to_sqlite_safe(v) for v in row)
-            for row in processed_df.itertuples(index=False, name=None)
-        ]
-
-        cursor.executemany(insert_sql, rows)
-        conn.commit()
-
-        inserted_now = len(rows)
-        total_inserted += inserted_now
-        print(f"[INFO] dataset: client={client_id}, offset={offset}, inserted={inserted_now}, total={total_inserted}")
-
-        offset += chunksize
-
-    print(f"[OK] dataset rebuilt for client {client_id}, total rows inserted: {total_inserted}")
-
-
-⸻
-
-2. W CreateDatabase zamień:
-
-obecne:
-
-create_and_insert_processed_table_chunked(
-    conn,
-    original_table_name="dataset_tab",
-    target_table_name="dataset",
-    limit_first_batch=params['data_limit']
-)
-
-na:
-
-refill_dataset_for_client(
-    conn,
-    client_id=client_id,
-    source_table="dataset_tab",
-    target_table="dataset",
-    chunksize=params['data_limit']
-)
-
-
-⸻
-
-Co jeszcze poprawić w CreateDatabase
-
-A. statystyki_faktur
-
-Usuń DELETE z wnętrza pętli i daj raz przed liczeniem:
-
-cursor.execute("DELETE FROM statystyki_faktur WHERE INVO_CLNTNO = ?", (client_id,))
-conn.commit()
-
-Tuż przed:
-
-for z_ilu_dni in z_ilu_dni_values:
-
-
-⸻
-
-B. summary_client_days_tab
-
-Uprość cały blok.
-
-Na początku:
-
-cursor.execute("DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
-conn.commit()
-
-A potem po prostu:
-
-cursor.execute("""
-    SELECT DISTINCT ROK, MIESIAC
-    FROM extended_grouped_client_days
-    WHERE INVO_CLNTNO = ?
-    ORDER BY ROK, MIESIAC
-""", (client_id,))
-all_rows = cursor.fetchall()
-
-for (year, month) in all_rows:
-    cursor.execute("""
-        INSERT INTO summary_client_days_tab
-        SELECT *
-        FROM summary_client_days_view
-        WHERE ROK = ?
-          AND MIESIAC = ?
-          AND INVO_CLNTNO = ?
-    """, (year, month, client_id))
-    conn.commit()
-
-Usuń:
-	•	last_inserted_year
-	•	last_inserted_month
-	•	całe resume logic
-
-⸻
-
-C. dataset_tab
-
-Jeśli zostawiasz sharding, to musisz użyć shard_condition. Obecnie nie działa.
-
-Najprościej byłoby na razie zrobić bez shardów:
-
-cursor.execute("DELETE FROM dataset_tab WHERE INVO_CLNTNO = ?", (client_id,))
-conn.commit()
-
-batch_size = 1000
-current_date = pd.to_datetime(min_date)
-
-while current_date <= pd.to_datetime(data_end_str):
-    next_date = current_date + pd.Timedelta(days=batch_size - 1)
-
-    cursor.execute("""
-        INSERT INTO dataset_tab
-        SELECT *
-        FROM dataset_raw_view
-        WHERE INVO_CLNTNO = ?
-          AND DATE(DZIEN) >= DATE(?)
-          AND DATE(DZIEN) <= DATE(?)
-    """, (client_id, current_date.strftime('%Y-%m-%d'), next_date.strftime('%Y-%m-%d')))
-    conn.commit()
-
-    current_date = next_date + pd.Timedelta(days=1)
-
-To będzie poprawniejsze niż obecna pseudo-pętla shardów.
-
-⸻
-
-D. query_invo
-
-Zmień na:
-
-query_invo = """
-SELECT 
-    INVO_NO,
-    INVO_ADMNO,
-    INVO_CLNTNO,
-    INVO_DEBH_NO,
-    INVO_DEBC_NO,
-    INVO_INVDATE,
-    INVO_FINALPAYMENTDATE
-FROM invo_view
-WHERE INVO_INVDATE IS NOT NULL
-  AND DATE(INVO_INVDATE) >= DATE(?)
-  AND INVO_CLNTNO = ?
-"""
-cursor.execute(query_invo, (params['od_dnia'], client_id))
-rows = cursor.fetchall()
-
-
-⸻
-
-E. grouped_query
-
-Upewnij się, że params['grouped_query'] ma filtr klienta.
-Jeśli nie ma, to i tak wczytasz dane nie tylko dla bieżącego klienta.
-
-Czyli albo query z configa musi mieć placeholder na klienta, albo tutaj dodaj warunek.
-
-⸻
-
-Co zostawić w CreateDatabase, a co usunąć całkiem
-
-Zostawić
-	•	import RAW do invo/debc/clhs/dcmo
-	•	zasilenie INVO_CLHS_JOINED_TAB
-	•	zasilenie group_cust_inv_days
-	•	zasilenie grouped_client_days
-	•	zasilenie extended_grouped_client_days_tab
-	•	zasilenie summary_client_days_tab
-	•	wyliczenie statystyki_faktur
-	•	zasilenie dataset_tab
-	•	zasilenie dataset
-
-Usunąć z CreateDatabase
-	•	tworzenie indeksów
-	•	tworzenie schematu
-	•	swieta jeśli możesz zrobić to osobno
-	•	aggregated_data_temp jeśli możesz zrobić to osobno
-	•	logikę incremental / resume w summary_client_days_tab
-	•	starą skomplikowaną funkcję chunkującą do dataset
-
-⸻
-
-Odpowiedź wprost: czy dobrze?
-
-Jeszcze nie.
-
-Dobrze poprawiłeś
-	•	delete przed RAW,
-	•	delete przed INVO_CLHS_JOINED_TAB,
-	•	delete przed group_cust_inv_days,
-	•	delete przed grouped_client_days,
-	•	delete przed extended_grouped_client_days_tab,
-	•	delete przed dataset_tab.
-
-Nadal do poprawy
-	•	statystyki_faktur delete jest w złym miejscu,
-	•	summary_client_days_tab nadal ma starą logikę,
-	•	dataset_tab sharding jest logicznie popsuty,
-	•	dataset nadal wymaga nowej prostszej funkcji,
-	•	swieta i aggregated_data_temp nadal są problematyczne,
-	•	indeksy nadal niepotrzebnie siedzą w CreateDatabase,
-	•	część query dalej nie jest parametryzowana.
-
-Najbardziej opłaca się teraz zrobić dwa ruchy:
-	1.	uprościć summary_client_days_tab,
-	2.	wyrzucić starą funkcję create_and_insert_processed_table_chunked i zastąpić ją prostym refill_dataset_for_client.
-
-W następnym kroku mogę Ci rozpisać gotowy, zwarty patch do CreateDatabase: dokładnie które bloki usunąć i czym je zastąpić.
+nie róbmy widoków tymczasowych, zamiast tego skorzystajmy z widoków zdefiniowanych bez shared w config( poniżej cześci tych widoków
+w config gdzie są te sharedy) zastąpmy je tak aby nie byo sharedów, ale dynamicznie dodajmy where w create database z sharedem do zapytań dla tych widoków
+w configu mamy:
+  shard_condition: ""
+  
+  query_create_stats_pivot_view: |
+    CREATE VIEW stats_pivot_view AS  
+    SELECT 
+        g.INVO_ADMNO,
+        g.INVO_CLNTNO,
+        g.INVO_DEBH_NO,
+        g.INVO_DEBC_NO,
+        g.DZIEN,        
+        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_DNI_DO_ZAPLATY     END) AS F7_11_AVG_DNI_DO_ZAPLATY,
+        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 
+...
+    FROM 
+        group_cust_inv_days g
+    -- Dołączenie danych z statystyki_faktur
+    LEFT JOIN statystyki_faktur stats_pivot
+    ON g.INVO_ADMNO = stats_pivot.INVO_ADMNO
+       AND g.INVO_CLNTNO = stats_pivot.INVO_CLNTNO
+       AND g.INVO_DEBH_NO = stats_pivot.INVO_DEBH_NO
+       AND (g.INVO_DEBH_NO = stats_pivot.INVO_DEBH_NO AND g.INVO_DEBC_NO = stats_pivot.INVO_DEBC_NO)
+       AND DATE(g.DZIEN) = DATE(stats_pivot.DZIEN)
+    WHERE {shard_condition}
+    GROUP BY
+        g.INVO_ADMNO,
+        g.INVO_CLNTNO,
+        g.INVO_DEBH_NO,
+        g.INVO_DEBC_NO,
+        g.DZIEN;
+
+
+  query_create_dataset_raw_view: |
+    CREATE VIEW dataset_raw_view AS
+    SELECT 
+        g.INVO_NO,
+        g.INVO_ADMNO,
+...
+    -- Dołączenie danych z summary_client_days_tab
+    LEFT JOIN summary_client_days_tab s
+    ON 
+        g.INVO_CLNTNO = s.INVO_CLNTNO
+        AND g.INVO_DEBH_NO = s.INVO_DEBH_NO
+        AND (s.INVO_DEBH_NO = g.INVO_DEBH_NO AND s.INVO_DEBC_NO = g.INVO_DEBC_NO)
+        AND DATE(g.DZIEN) = DATE(s.DZIEN)
+    
+    -- Dołączenie danych z statystyki_faktur
+    LEFT JOIN stats_pivot_view pivot
+    ON g.INVO_ADMNO = pivot.INVO_ADMNO
+       AND g.INVO_CLNTNO = pivot.INVO_CLNTNO
+       AND g.INVO_DEBH_NO = pivot.INVO_DEBH_NO
+       AND (g.INVO_DEBH_NO = pivot.INVO_DEBH_NO AND g.INVO_DEBC_NO = pivot.INVO_DEBC_NO)
+       AND DATE(g.DZIEN) = DATE(pivot.DZIEN)
+    WHERE {shard_condition};
+
+obecnie w init mamy tak:
+            exec_sql(conn, params.get("query_create_dataset_raw_view"), "query_create_dataset_raw_view")          
+            exec_sql(conn, params.get("query_create_stats_pivot_view"), "query_create_stats_pivot_view")
+
+a w create database:
+
+        NUM_SHARDS = params['NUM_SHARDS']
+        
+        for shard in range(NUM_SHARDS + 1):  # dodatkowy shard 10 = nie-numeryczne
+            if shard < NUM_SHARDS:
+                shard_condition = f"""
+                    (
+                        CAST(g.INVO_DEBC_NO AS INTEGER) IS NOT NULL
+                        AND (CAST(g.INVO_DEBC_NO AS INTEGER) % {NUM_SHARDS}) = {shard}
+                    )
+                """
+            else:
+                shard_condition = "CAST(g.INVO_DEBC_NO AS INTEGER) IS NULL"
+        
+        cursor.execute("DELETE FROM dataset_tab WHERE INVO_CLNTNO = ?", (client_id,))
+        
+        for shard in range(NUM_SHARDS + 1):
+        
+            if shard < NUM_SHARDS:
+                shard_condition = f"""
+                    (
+                        g.INVO_DEBC_NO IS NOT NULL
+                        AND g.INVO_DEBC_NO NOT GLOB '*[^0-9]*'
+                        AND (CAST(g.INVO_DEBC_NO AS INTEGER) % {NUM_SHARDS}) = {shard}
+                    )
+                """
+            else:
+                shard_condition = """
+                    (
+                        g.INVO_DEBC_NO IS NULL
+                        OR g.INVO_DEBC_NO GLOB '*[^0-9]*'
+                    )
+                """            
+
+a mieliśmy:
+
+        NUM_SHARDS = params['NUM_SHARDS']
+        
+        for shard in range(NUM_SHARDS + 1):  # dodatkowy shard 10 = nie-numeryczne
+            if shard < NUM_SHARDS:
+                shard_condition = f"""
+                    (
+                        CAST(g.INVO_DEBC_NO AS INTEGER) IS NOT NULL
+                        AND (CAST(g.INVO_DEBC_NO AS INTEGER) % {NUM_SHARDS}) = {shard}
+                    )
+                """
+            else:
+                shard_condition = "CAST(g.INVO_DEBC_NO AS INTEGER) IS NULL"
+        
+        for shard in range(NUM_SHARDS + 1):
+        
+            if shard < NUM_SHARDS:
+                shard_condition = f"""
+                    (
+                        g.INVO_DEBC_NO IS NOT NULL
+                        AND g.INVO_DEBC_NO NOT GLOB '*[^0-9]*'
+                        AND (CAST(g.INVO_DEBC_NO AS INTEGER) % {NUM_SHARDS}) = {shard}
+                    )
+                """
+            else:
+                shard_condition = """
+                    (
+                        g.INVO_DEBC_NO IS NULL
+                        OR g.INVO_DEBC_NO GLOB '*[^0-9]*'
+                    )
+                """            
+            # Wstrzyknięcie warunku do SQL
+            pivot_sql = params['query_create_stats_pivot_view'].replace("{shard_condition}", shard_condition)
+            raw_sql   = params['query_create_dataset_raw_view'].replace("{shard_condition}", shard_condition)
+                
+            cursor.execute("DROP VIEW IF EXISTS stats_pivot_view;")
+            cursor.execute(pivot_sql)
+            
+            cursor.execute("DROP VIEW IF EXISTS dataset_raw_view;")
+            cursor.execute(raw_sql)
+
+jak to poprawnie zaimplementowaać zgodnie z nową logiką?
