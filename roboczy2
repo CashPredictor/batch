@@ -1,485 +1,63 @@
-Nie, to jeszcze nie jest domknięte. Kierunek jest dobry, ale w obu plikach dalej są błędy logiczne i kilka miejsc, gdzie albo usunąłeś za dużo, albo nie usunąłeś tego, co jeszcze powinno zniknąć.
+def create_aggregated_data_temp(conn, data_end, data_start="2023-03-12"):
+    cursor = conn.cursor()
+    
+    # Generowanie danych od 2023-03-12 do 2030-04-27
+    rows_to_insert = generate_dates(data_start, data_end)
+    
+    # Wstawianie danych do tabeli
+    insert_query = "INSERT INTO aggregated_data_temp (DZIEN, DZIS_DZIEN_TYG, DZIS_SOBOTA, DZIS_NIEDZIELA) VALUES (?, ?, ?, ?)"
+    cursor.executemany(insert_query, rows_to_insert)
+    conn.commit()
+    
+    print(f"Wstawiono {len(rows_to_insert)} wierszy do tabeli 'aggregated_data_temp'.")
+
+powinno dopisywać ale tylko jeżeli jeszcze taki wiersz nie istnieje po wszyzstkich wartościach z tabeli, jeżeli istnieje to nie dopisuje wiersza
+
+
+przeanalizuj to jeszcze raz:
+5. dataset_tab sharding jest niepełny
+bo wcześniej nie było w tym tego condition i działało, może to trzeba przenieść do inita, albo jakoś inaczej zastąpić, a może już jest obsłużone?
+
+
+dla:
+refill_dataset_for_client(
+    conn,
+    client_id=client_id,
+    source_table="dataset_tab",
+    target_table="dataset",
+    chunksize=params['data_limit']
+)
+
+musimy zostać z chunkowaniem i iterowaniem po dacie, bo długo schodzi z tym procesem i ma to robić partiami tak jak to zdefiniowano
+wcześcniej, ale faktycznie działamy na kliencie, mamy już schemat, nie ma już pierwszej partii która robi schemat, append do dataset
+
+pętla shard_condition służyła do:
+            # Wstrzyknięcie warunku do SQL
+            pivot_sql = params['query_create_stats_pivot_view'].replace("{shard_condition}", shard_condition)
+            raw_sql   = params['query_create_dataset_raw_view'].replace("{shard_condition}", shard_condition)
+
+teraz przeniosłem to do init, ale tam nie ma tej shard_condition, czy mam to jakoś poprawić, obsłużyc?
+
+jheżeli chodzi o batche i sharedy to we wcześniejszym kodzie to było zoptymalizowane pod kątem wydajności i te mechanizmy powinniśmy odtworzyć w nowym.
+
+  grouped_query: |
+    SELECT 
+        g.INVO_ADMNO,
+        g.INVO_CLNTNO,
+        g.INVO_DEBH_NO,
+        g.INVO_DEBC_NO,
+        g.DZIEN,
+        g.MIESIAC,
+        g.ROK
+    FROM 
+        group_cust_inv_days g
+    GROUP BY 
+        g.INVO_ADMNO,
+        g.INVO_CLNTNO,
+        g.INVO_DEBH_NO,
+        g.INVO_DEBC_NO,
+        g.DZIEN,
+        g.MIESIAC,
+        g.ROK;  
+czy coś trzeba z tym zrobić? dodać parametr do client_id? jak?
 
-Najkrótszy werdykt:
-	•	db_init.py — prawie OK, ale jeszcze z ryzykami
-	•	CreateDatabase — jeszcze nie OK
-	•	główny brak: brakuje konsekwentnego modelu “1 clientno only”
-	•	główny problem: dalej są miejsca bez DELETE ... WHERE INVO_CLNTNO = ... przed append
-	•	dodatkowo są 2 ewidentne błędy wykonania
-
-⸻
-
-1. Co jest już dobrze
-
-db_init.py
-
-To już w dużej mierze robi właściwą rzecz:
-	•	tworzy pustą bazę,
-	•	failuje, jeśli plik już istnieje,
-	•	tworzy tabele,
-	•	tworzy widoki,
-	•	tworzy indeksy.
-
-To jest zgodne z docelową odpowiedzialnością.
-
-CreateDatabase
-
-Usunąłeś sporo DDL:
-	•	nie ma już DROP TABLE,
-	•	nie ma już CREATE TABLE,
-	•	nie ma już generowania widoku extended_grouped_client_days w Pythonie,
-	•	nie ma już DROP VIEW / CREATE VIEW dla stats_pivot_view i dataset_raw_view.
-
-To jest dobry kierunek.
-
-⸻
-
-2. Najważniejsze błędy, które jeszcze są
-
-❌ Błąd 1: CLNTNO nie istnieje
-
-Masz:
-
-cursor.execute(f"""DELETE FROM grouped_client_days where INVO_CLNTNO = {CLNTNO}""")
-
-To się wywali, bo CLNTNO nie jest zdefiniowane.
-
-Tu powinno być client_id, albo lepiej parametr SQL:
-
-cursor.execute("DELETE FROM grouped_client_days WHERE INVO_CLNTNO = ?", (client_id,))
-
-To jest obecnie twardy błąd runtime.
-
-⸻
-
-❌ Błąd 2: swieta nadal robi replace
-
-Masz:
-
-data.to_sql('swieta', conn, if_exists='replace', index=False)
-
-To nadal odtwarza tabelę swieta, czyli:
-	•	drop,
-	•	create,
-	•	insert.
-
-A przecież chcesz, żeby schemat był tylko w db_init.
-
-Powinno być:
-
-cursor = conn.cursor()
-cursor.execute("DELETE FROM swieta")
-data.to_sql("swieta", conn, if_exists="append", index=False)
-
-Czyli teraz create_and_import_swieta() jest nadal częściowo schematowe.
-
-⸻
-
-3. CreateDatabase nadal nie jest jeszcze „single-client safe”
-
-Napisałeś bardzo ważną rzecz:
-
-musimy przekazać clientno i wszystko ma to przekazywać, bo zawsze chcemy operować tylko na jednym clientno
-
-I to oznacza jedną twardą zasadę:
-
-każda tabela, do której dopisujesz dane przez append, musi mieć wcześniej:
-	•	DELETE ... WHERE INVO_CLNTNO = ?
-albo odpowiedni warunek klienta,
-	•	albo być budowana od zera na pustej bazie klienta.
-
-W obecnym kodzie tego nie ma konsekwentnie.
-
-⸻
-
-4. Gdzie brakuje DELETE ... WHERE client_id
-
-4.1 RAW tables
-
-Masz tylko:
-
-df_invo.to_sql('invo', conn, if_exists='append', index=False)
-df_debc.to_sql('debc', conn, if_exists='append', index=False)
-df_clhs.to_sql('clhs', conn, if_exists='append', index=False)
-df_dcmo.to_sql('dcmo', conn, if_exists='append', index=False)
-
-Jeżeli uruchomisz drugi raz dla tego samego klienta, dostaniesz duplikaty.
-
-Tu musi być wcześniej:
-
-cursor.execute("DELETE FROM invo WHERE INVO_CLNTNO = ?", (client_id,))
-cursor.execute("DELETE FROM debc WHERE DEBC_CLNTNO = ?", (client_id,))
-cursor.execute("DELETE FROM clhs WHERE CLHS_CLNTNO = ?", (client_id,))
-cursor.execute("DELETE FROM dcmo WHERE DEBC_CLNTNO = ?", (client_id,))
-
-
-⸻
-
-4.2 INVO_CLHS_JOINED_TAB
-
-Masz:
-
-INSERT INTO INVO_CLHS_JOINED_TAB
-SELECT * FROM INVO_CLHS_JOINED;
-
-To ładuje wszystko dla wszystkich danych obecnych w RAW, bez czyszczenia klienta.
-
-Powinno być najpierw delete po kliencie, np.:
-
-cursor.execute("DELETE FROM INVO_CLHS_JOINED_TAB WHERE INVO_CLNTNO = ?", (client_id,))
-cursor.execute("""
-    INSERT INTO INVO_CLHS_JOINED_TAB
-    SELECT * FROM INVO_CLHS_JOINED
-    WHERE INVO_CLNTNO = ?
-""", (client_id,))
-
-
-⸻
-
-4.3 group_cust_inv_days
-
-Masz insert, ale brak delete po kliencie.
-
-Powinno być:
-
-cursor.execute("DELETE FROM group_cust_inv_days WHERE INVO_CLNTNO = ?", (client_id,))
-
-przed executemany.
-
-⸻
-
-4.4 grouped_client_days
-
-Tu próbowałeś zrobić delete, ale błędnie przez CLNTNO.
-
-Ma być:
-
-cursor.execute("DELETE FROM grouped_client_days WHERE INVO_CLNTNO = ?", (client_id,))
-df.to_sql("grouped_client_days", conn, if_exists="append", index=False)
-
-
-⸻
-
-4.5 extended_grouped_client_days_tab
-
-Masz same inserty per miesiąc.
-
-Brakuje:
-
-cursor.execute("DELETE FROM extended_grouped_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
-
-przed pętlą.
-
-⸻
-
-4.6 summary_client_days_tab
-
-Tutaj też nie może być logika „kontynuuj od ostatniego miesiąca”, jeśli chcesz przeliczać pojedynczego klienta w sposób deterministyczny.
-
-Dla klientowego rebuilda powinno być:
-
-cursor.execute("DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
-
-a potem prosty insert dla tego klienta.
-
-Obecna logika z:
-
-SELECT ROK, MIESIAC FROM summary_client_days_tab ORDER BY ...
-
-jest bardziej pod incremental global load, a nie pod single-client refresh.
-
-To jest bardzo ważne: ten blok jest koncepcyjnie niezgodny z nowym modelem.
-
-⸻
-
-4.7 statystyki_faktur
-
-Masz same inserty, brak delete po kliencie.
-
-Powinno być:
-
-cursor.execute("DELETE FROM statystyki_faktur WHERE INVO_CLNTNO = ?", (client_id,))
-
-przed liczeniem.
-
-⸻
-
-4.8 dataset_tab
-
-Masz inserty do dataset_tab, brak delete po kliencie.
-
-Musi być:
-
-cursor.execute("DELETE FROM dataset_tab WHERE INVO_CLNTNO = ?", (client_id,))
-
-przed pętlą shardów.
-
-⸻
-
-4.9 dataset
-
-Masz inserty przez create_and_insert_processed_table_chunked(...), ale nie czyścisz wcześniej klienta w tabeli dataset.
-
-Czyli przed wywołaniem tej funkcji:
-
-cursor.execute("DELETE FROM dataset WHERE INVO_CLNTNO = ?", (client_id,))
-conn.commit()
-
-Inaczej będziesz duplikował rekordy klienta.
-
-⸻
-
-4.10 aggregated_data_temp
-
-Tu zależy od modelu.
-
-Ta tabela wygląda na globalną kalendarzową, nie klientową. Ale wtedy:
-	•	nie powinna być ładowana na końcu każdego CreateDatabase,
-	•	bo za każdym runem dopisujesz te same dni ponownie.
-
-Masz:
-
-create_aggregated_data_temp(conn, data_end_str)
-
-i to zarówno w CreateOneDbForAll, jak i na końcu CreateDatabase.
-
-To jest błąd logiczny.
-Ta tabela powinna być:
-	•	albo zasilana tylko raz w db_init,
-	•	albo przed zasileniem czyszczona całkowicie.
-
-Najczystsza opcja: przenieść jej zasilenie do db_init albo osobnego bootstrap data step.
-W CreateDatabase bym to usunął.
-
-⸻
-
-5. Co usunąłeś dobrze, a czego nie wolno było zostawiać
-
-Dobrze usunięte
-	•	generowanie extended_grouped_client_days przez generate_view_query_complete
-	•	DROP VIEW ...
-	•	dynamiczne pivot_sql, raw_sql
-
-To było schematowe i dobrze, że zniknęło.
-
-Jeszcze nie do końca usunięte
-
-W CreateDatabase nadal masz schematopodobne rzeczy pośrednie:
-	•	create_and_import_swieta(... if_exists='replace')
-	•	indeksy tworzone w runtime:
-
-cursor.execute(params['idx_invo_debcno_invdate_etc'])
-cursor.execute(params['idx_invo_debcno_invdate'])
-cursor.execute(params['idx_summary_days_ids_dzien'])
-cursor.execute(params['idx_ext_days_ids_dzien'])
-cursor.execute(params['idx_clhs_joined_keys_datetime'])
-
-
-
-To też powinno wyjść z CreateDatabase, skoro indeksy są częścią schematu i tworzy je db_init.
-
-Czyli ten blok też usuń z CreateDatabase.
-
-⸻
-
-6. db_init.py — co jeszcze poprawić
-
-⚠️ Widoki tworzone warunkowo if raw_ready
-
-To działa, ale w praktyce na świeżej bazie raw_ready i tak będzie True, bo przed chwilą utworzyłeś puste tabele:
-	•	invo
-	•	debc
-	•	clhs
-	•	dcmo
-
-Czyli ten warunek jest zbędny.
-
-Możesz po prostu zawsze robić:
-
-exec_sql(conn, params.get("query_create_invo_view"), ...)
-...
-
-To uprości kod.
-
-⸻
-
-⚠️ query_swieta i statystyki_faktur
-
-Zakładam, że to są CREATE TABLE IF NOT EXISTS ....
-Jeśli nie, to trzeba to upewnić.
-
-Bo db_init ma być idempotentny na poziomie SQL definicji, choć i tak failuje wcześniej, gdy plik istnieje.
-
-⸻
-
-⚠️ Brak walidacji kompletności
-
-Ja bym dodał po init listę wymaganych tabel i widoków i sprawdzenie, czy wszystko powstało.
-
-To od razu wyłapie:
-	•	brakujący config key,
-	•	zły SQL,
-	•	złą kolejność widoków.
-
-⸻
-
-7. Czy kolejność widoków jest poprawna?
-
-Z tego, co pokazujesz, kolejność wygląda sensownie:
-	1.	invo_view
-	2.	clhs_view
-	3.	DEBC_view
-	4.	dcmo_view
-	5.	INVO_CLHS_JOINED
-	6.	summary_client_days_view
-	7.	extended_grouped_client_days_view
-	8.	stats_pivot_view
-	9.	dataset_raw_view
-
-To jest sensowne, pod warunkiem że:
-	•	extended_grouped_client_days_view zależy tylko od wcześniej istniejących obiektów,
-	•	dataset_raw_view zależy od stats_pivot_view,
-	•	summary_client_days_view zależy od group_cust_inv_days.
-
-Na podstawie tego, co wkleiłeś wcześniej, ta kolejność wygląda dobrze.
-
-⸻
-
-8. Największy problem koncepcyjny, który został
-
-Masz nadal miks dwóch modeli:
-
-model A
-
-„baza klientowa, zawsze pracuję tylko na jednym clientno”
-
-model B
-
-„baza narastająca / wieloklientowa / incremental po miesiącach”
-
-W CreateDatabase nadal są ślady modelu B:
-	•	summary_client_days_tab z kontynuacją po ostatnim miesiącu,
-	•	batchowe dopisywanie bez czyszczenia klienta,
-	•	indeksy tworzone runtime,
-	•	aggregated_data_temp dopisywane za każdym razem.
-
-Jeśli naprawdę chcesz model A, to trzeba go dokończyć konsekwentnie:
-
-zasada:
-
-dla każdej tabeli klientowej:
-	1.	DELETE ... WHERE client_id
-	2.	INSERT/APPEND tylko danych tego klienta
-
-bez „resume od ostatniego miesiąca”.
-
-⸻
-
-9. Co bym zmienił teraz, konkretnie
-
-W CreateDatabase popraw od razu:
-
-A. RAW
-
-dodaj:
-
-cursor.execute("DELETE FROM invo WHERE INVO_CLNTNO = ?", (client_id,))
-cursor.execute("DELETE FROM debc WHERE DEBC_CLNTNO = ?", (client_id,))
-cursor.execute("DELETE FROM clhs WHERE CLHS_CLNTNO = ?", (client_id,))
-cursor.execute("DELETE FROM dcmo WHERE DEBC_CLNTNO = ?", (client_id,))
-conn.commit()
-
-B. swieta
-
-zmień replace na:
-
-cursor.execute("DELETE FROM swieta")
-data.to_sql("swieta", conn, if_exists="append", index=False)
-
-C. grouped_client_days
-
-zamień błędne:
-
-cursor.execute(f"""DELETE FROM grouped_client_days where INVO_CLNTNO = {CLNTNO}""")
-
-na:
-
-cursor.execute("DELETE FROM grouped_client_days WHERE INVO_CLNTNO = ?", (client_id,))
-
-D. przed insertami do tabel pochodnych
-
-dodaj delete po kliencie dla:
-	•	INVO_CLHS_JOINED_TAB
-	•	group_cust_inv_days
-	•	grouped_client_days
-	•	extended_grouped_client_days_tab
-	•	summary_client_days_tab
-	•	statystyki_faktur
-	•	dataset_tab
-	•	dataset
-
-E. usuń z CreateDatabase
-
-ten blok:
-
-cursor.execute(params['idx_invo_debcno_invdate_etc'])
-cursor.execute(params['idx_invo_debcno_invdate'])
-cursor.execute(params['idx_summary_days_ids_dzien'])
-cursor.execute(params['idx_ext_days_ids_dzien'])
-cursor.execute(params['idx_clhs_joined_keys_datetime'])
-
-F. usuń z CreateDatabase
-
-to:
-
-create_aggregated_data_temp(conn, data_end_str)
-
-albo przynajmniej niech będzie tylko raz globalnie, nie przy każdym kliencie.
-
-G. uprość summary_client_days_tab
-
-wywal logikę:
-	•	last_inserted_year
-	•	continue from last month
-
-Jeśli działasz klientowo, rób po prostu:
-	•	delete klienta,
-	•	insert klienta.
-
-⸻
-
-10. Ostateczny werdykt
-
-db_init.py
-
-✅ Prawie OK
-
-Ale warto jeszcze:
-	•	uprościć raw_ready,
-	•	dodać walidację kompletności,
-	•	upewnić się, że wszystkie SQL-e w configu są pełne i poprawne.
-
-CreateDatabase
-
-⚠️ Jeszcze nie OK
-
-Bo:
-	•	ma twardy błąd CLNTNO,
-	•	nadal odtwarza swieta przez replace,
-	•	nie czyści danych klienta konsekwentnie przed append,
-	•	nadal ma ślady starego modelu incremental/global,
-	•	nadal tworzy indeksy runtime, choć nie powinien.
-
-Czy usunąłeś za dużo?
-
-Nie.
-Bardziej problem jest odwrotny:
-nie usunąłeś jeszcze wszystkiego, co trzeba było usunąć z warstwy schematu, i nie dodałeś jeszcze pełnej logiki czyszczenia klienta.
-
-⸻
-
-Najbliższy sensowny krok to zrobić jedną, spójną przeróbkę CreateDatabase pod model:
-
-„single client refresh = delete client rows from every target table, potem append tylko tego klienta”.
-
-Mogę Ci teraz rozpisać dokładnie, blok po bloku, jakie DELETE ... WHERE client_id dodać w którym miejscu i co usunąć z obecnego CreateDatabase.
