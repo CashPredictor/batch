@@ -1,201 +1,69 @@
-Podsumowanie założeń, które przyjmuję
-	1.	DBInit ma robić tylko bootstrap schematu: tabele, widoki, indeksy.
-	2.	CreateDatabase ma tylko zasilać istniejące obiekty: DELETE/INSERT per client, bez budowania schematu.
-	3.	Stara logika ma być zachowana funkcjonalnie, ale:
-	•	dynamiczne tworzenie schematu ma zniknąć z runtime,
-	•	wydajnościowe mechanizmy batch/shard mają zostać odtworzone,
-	•	obróbka ma działać per client_id.
-	4.	Config jest źródłem definicji SQL i służy do weryfikacji, czy potrzebne definicje istnieją.
+Najbardziej zwarty format do configa to nie lista słowników YAML, tylko lista list. Dzięki temu nie powtarzasz nazw pól 144 razy.
 
-Mój werdykt na dziś:
+Najlepiej zrobić to tak:
 
-Kierunek refaktoru jest dobry, ale całość nie jest jeszcze domknięta.
-To nie jest stan „już wszystko OK”, tylko raczej: duża część została dobrze przeniesiona, ale nadal są 2–3 krytyczne naruszenia granicy odpowiedzialności i kilka luk logicznych.
+swieta_columns: ["nazwa", "rodzaj", "data", "rok", "mies", "dzien", "dzien_tyg"]
 
-1. Co zostało przeniesione poprawnie
+swieta_rows:
+  - ["Nowy Rok", "stałe", "2022-01-01", 2022, 1, 1, "sobota"]
+  - ["Trzech Króli", "stałe", "2022-01-06", 2022, 1, 6, "czwartek"]
+  - ...
 
-✅ Dobrze przeniesione z CreateDatabase do DBInit
+To jest dużo krótsze niż:
 
-Ze starego CreateDatabase wynika, że wcześniej w runtime były tworzone:
-	•	raw tabele invo/debc/clhs/dcmo,
-	•	widoki bazowe invo_view, clhs_view, DEBC_view, dcmo_view,
-	•	INVO_CLHS_JOINED,
-	•	tabele pochodne jak INVO_CLHS_JOINED_TAB, group_cust_inv_days, grouped_client_days, summary_client_days_tab, extended_grouped_client_days_tab, dataset_tab, dataset,
-	•	oraz indeksy.  ￼  ￼
+- nazwa: ...
+  rodzaj: ...
+  data: ...
 
-W nowym DBInit widać, że tworzysz już tabelaryczny szkielet i część widoków z configa: query_create_group_cust_inv_days, query_create_summary_client_days_tab2, query_create_dataset_tab, statystyki_faktur, query_create_invo_table, query_create_debc_table, query_create_clhs_table, query_create_dcmo_table, query_create_grouped_client_days_table, query_create_dataset, query_create_invo_clhs_joined_tab_table, query_create_extended_grouped_client_days_tab_table, a potem także widoki bazowe.  ￼
+Jak to zrobić w Excelu
 
-To jest zgodne z docelową zasadą: schemat ma być gotowy przed loaderem.
+Zakładam:
+	•	A = nazwa
+	•	B = rodzaj
+	•	C = data
+	•	D = rok
+	•	E = mies
+	•	F = dzien
+	•	G = dzien_tyg
+	•	H = wynik do wklejenia
 
-✅ Dobrze uproszczone w nowym CreateDatabase
+1. Nagłówek do configa
 
-Najważniejsza poprawa to przejście z DROP TABLE na DELETE ... WHERE client_id + append, więc CreateDatabase przestał niszczyć cały raw layer i działa per klient. Widać to dla invo, debc, clhs, dcmo oraz później dla tabel pochodnych jak INVO_CLHS_JOINED_TAB.  ￼  ￼
+W dowolnej komórce, na przykład H1, wpisz ręcznie:
 
-To jest dokładnie to, czego chcieliście.
+swieta_columns: ["nazwa", "rodzaj", "data", "rok", "mies", "dzien", "dzien_tyg"]
 
-2. Co nadal jest niepoprawne
+swieta_rows:
 
-❌ DBInit nadal zawiera logikę danych
+2. Formuła dla każdego rekordu
 
-W załączonym db_init (1).py nadal jest funkcja create_and_import_swieta(...), która czyta Excela i robi to_sql, czyli ładuje dane, a nie tylko tworzy schemat. Co gorsza, w main() jest wywołanie create_and_import_swieta(conn_new, ...), mimo że w tym pliku nie ma conn_new, tylko conn. To jest jednocześnie:
-	•	naruszenie granicy odpowiedzialności,
-	•	oraz najpewniej błąd wykonania.  ￼
+W H2 wstaw:
 
-To jest obecnie największy twardy błąd w DBInit.
+="  - ["""&A2&""", """&B2&""", """&TEKST(C2;"rrrr-mm-dd")&""", "&D2&", "&E2&", "&F2&", """&G2&"""]"
 
-❌ CreateDatabase nadal ładuje swieta
+I przeciągnij w dół.
 
-Nowy CreateDatabase wciąż wywołuje create_and_import_swieta(...) przy buildzie klienta.  ￼
+To da Ci wiersze w stylu:
 
-To znaczy, że:
-	•	swieta nadal jest częścią runtime-load,
-	•	a nie w pełni ustabilizowanym bootstrapem.
+  - ["Nowy Rok", "stałe", "2022-01-01", 2022, 1, 1, "sobota"]
 
-Macie więc teraz zły stan pośredni:
-	•	DBInit próbuje ładować swieta,
-	•	CreateDatabase też próbuje ładować swieta.
+Jak wkleić do configa
 
-Czyli ta odpowiedzialność jest zdublowana i nieustalona.
+Potem:
+	1.	kopiujesz H1,
+	2.	pod nim kopiujesz wszystkie wartości z H2:H145,
+	3.	wklejasz do YAML.
 
-⚠️ DBInit nie jest jeszcze „czystym init”
+Jeszcze krótsza wersja
 
-Nawet pomijając swieta, sam komentarz i logika „Widoki bazowe – tylko jeśli ich tabele źródłowe już istnieją” są już nieaktualne względem nowego modelu, bo DBInit chwilę wcześniej tworzy raw tables, więc raw_ready będzie prawie zawsze prawdziwe.  ￼
+Da się zrobić jeszcze ciaśniej, jako jeden JSON-owy blok w jednej linii, ale w configu byłoby to mniej czytelne i trudniejsze do edycji. Do YAML najlepszy kompromis to właśnie:
+	•	jeden nagłówek swieta_columns
+	•	potem swieta_rows jako lista list.
 
-To nie rozwala działania, ale pokazuje, że kod nie został jeszcze domknięty po zmianie koncepcji.
+Jeśli chcesz mieć wszystko od razu w jednej komórce
 
-3. Porównanie PRZED vs PO — co zachowaliście, a co zmieniliście
+Możesz też zbudować cały blok jednym zlepieniem, ale przy 144 wierszach to bywa niewygodne. Lepsze jest:
+	•	H1 nagłówek,
+	•	H2:H145 rekordy.
 
-✅ Zachowana logika biznesowa
-
-Nowy CreateDatabase nadal robi:
-	•	import raw,
-	•	materializację INVO_CLHS_JOINED_TAB,
-	•	deduplikację po INVO_NO, INVO_CLNTNO, INVO_ADMNO, INVO_DEBH_NO, INVO_DEBC_NO, CLHS_CHANGED_DATETIME,
-	•	generowanie group_cust_inv_days,
-	•	budowę grouped_client_days,
-	•	ładowanie extended_grouped_client_days_tab,
-	•	liczenie statystyki_faktur,
-	•	ładowanie dataset_tab,
-	•	przebudowę dataset.  ￼  ￼
-
-Czyli ogólny pipeline działania nie został zgubiony.
-
-✅ Dobrze zastąpiona dynamiczna budowa dataset
-
-W starym kodzie dataset był tworzony funkcją create_and_insert_processed_table_chunked, która w pierwszej partii robiła DROP TABLE + CREATE TABLE, a potem append.  ￼
-
-W nowym kodzie jest refill_dataset_for_client(...), które:
-	•	najpierw czyści klienta z dataset,
-	•	potem idzie batchami po datach,
-	•	przetwarza chunk,
-	•	i tylko insertem uzupełnia istniejącą tabelę dataset.  ￼  ￼
-
-To jest bardzo dobra zmiana i zgodna z nową architekturą.
-
-✅ Dobrze zastąpiona dynamiczna budowa extended_grouped_client_days
-
-W starym kodzie generowaliście widok przez generate_view_query_complete(...) i potem tabelę CREATE TABLE FROM VIEW.  ￼
-
-W nowym układzie ta definicja jest już przeniesiona do configa jako query_create_extended_grouped_client_days_view, a CreateDatabase tylko zasila tabelę wynikową. To jest kierunkowo poprawne.  ￼
-
-4. Shardy i wydajność — tutaj zmiana jest sensowna
-
-✅ To wygląda już dobrze
-
-Najważniejszy punkt wydajnościowy: stary kod przebudowywał stats_pivot_view i dataset_raw_view per shard, co było wydajne, ale mieszało schemat i runtime.  ￼
-
-W nowym CreateDatabase widać, że przeszliście na:
-	•	query_stats_pivot_select
-	•	query_dataset_raw_select
-	•	wstrzykiwanie shard_condition i client_filter
-	•	oraz batchowe INSERT INTO dataset_tab ... {dataset_raw_sql}.  ￼
-
-To jest dobra odpowiedź na wcześniejszy problem:
-	•	schemat pozostaje statyczny,
-	•	a wydajnościowe zawężanie nadal dzieje się per shard i per klient.
-
-To uważam za jedną z najlepiej zrobionych części refaktoru.
-
-5. Indeksy
-
-✅ Duża część została przeniesiona sensownie
-
-W starym przepływie indeksy były robione częściowo w CreateDatabase, częściowo w init.  ￼
-
-W nowym DBInit widać:
-	•	indeksy bazowe na raw tabelach,
-	•	indeksy na group_cust_inv_days, grouped_client_days, INVO_CLHS_JOINED_TAB,
-	•	indeksy jawnie z configa, np. idx_invo_debcno_invdate, idx_invo_debcno_invdate_etc, idx_summary_days_ids_dzien, idx_ext_days_ids_dzien, idx_clhs_joined_keys_datetime.  ￼
-
-To jest dobry kierunek.
-
-⚠️ Ale nadal macie niespójność organizacyjną
-
-Skoro celem jest „całe tworzenie schematu zostało usunięte z CreateDatabase”, to:
-	•	wszystkie indeksy powinny być ostatecznie tworzone tylko w DBInit,
-	•	a nie częściowo jeszcze rozproszone lub zależne od loadera.
-
-W obecnym stanie jest już blisko, ale nie nazwałbym tego jeszcze w 100% domkniętym.
-
-6. Kompletność schematu
-
-⚠️ Koncepcyjnie prawie kompletne, ale praktycznie zależy od configa
-
-Z runtime nowego CreateDatabase wynika, że potrzebne są co najmniej:
-	•	raw tables: invo, debc, clhs, dcmo,
-	•	widoki: invo_view, clhs_view, DEBC_view, dcmo_view, INVO_CLHS_JOINED, summary_client_days_view, extended_grouped_client_days_view,
-	•	tabele materializowane: INVO_CLHS_JOINED_TAB, group_cust_inv_days, grouped_client_days, extended_grouped_client_days_tab, summary_client_days_tab, statystyki_faktur, dataset_tab, dataset, aggregated_data_temp, swieta.  ￼  ￼
-
-DBInit tworzy prawie cały ten zestaw.  ￼
-
-Natomiast bezpośrednio z przesłanych fragmentów nie jestem w stanie potwierdzić liniowo każdej jednej definicji w configu dla wszystkich query_create_*_table, bo część configa jest ucięta. Na poziomie koncepcyjnym wygląda to dobrze, ale ten punkt oznaczam jako prawie kompletne, nie stuprocentowo zweryfikowane liniowo.
-
-7. Gotowość produkcyjna / bootstrap
-
-❌ DBInit nie jest jeszcze gotowy jako czysty bootstrap
-
-Powody są trzy:
-	•	wywołuje logikę danych (swieta),
-	•	ma błędne conn_new zamiast conn,
-	•	nie jest czysto idempotentny w sensie praktycznego „odpal jeszcze raz i przejdzie”, bo z góry failuje, jeśli plik DB już istnieje.  ￼
-
-Ten ostatni punkt może być świadomą decyzją dla „one-shot bootstrap”, ale wtedy:
-	•	to jest OK dla pierwszego utworzenia,
-	•	ale nie jest OK jako „odbudowa / naprawa / CI rerun”.
-
-Czyli:
-	•	jednorazowy bootstrap — prawie,
-	•	odbudowa po awarii / CI rerun — jeszcze nie.
-
-8. Rekomendacja końcowa
-
-Co jest już OK
-
-✅ Podział architektoniczny jest właściwy.
-✅ Per-client DELETE + INSERT w CreateDatabase to dobra zmiana.
-✅ dataset został przebudowany zgodnie z nową logiką.
-✅ Shardy zostały odtworzone w sposób wydajny bez dynamicznego DROP/CREATE VIEW.
-✅ Większość schematu rzeczywiście została przeniesiona do init.
-
-Co jeszcze trzeba poprawić przed uznaniem refaktoru za domknięty
-
-❌ Usunąć z DBInit całe create_and_import_swieta(...) oraz jego wywołanie.
-❌ Naprawić błąd conn_new w DBInit.
-❌ Ustalić jedno miejsce odpowiedzialne za swieta:
-	•	albo osobny loader referencyjny,
-	•	albo jednorazowe zasilenie po init,
-	•	ale nie jednocześnie DBInit i CreateDatabase.
-⚠️ Doprecyzować, czy DBInit ma być tylko „create if missing”, czy też ma wspierać rerun/recovery.
-⚠️ Posprzątać komentarze i warunki typu raw_ready, bo są jeszcze z poprzedniej koncepcji.
-
-Mój końcowy werdykt
-
-Nie: jeszcze nie jest „wszystko OK”.
-Tak: najważniejszy kierunek i większość przeniesienia są zrobione dobrze.
-
-Najkrócej:
-	•	DBInit: ⚠️ dobry kierunek, ale jeszcze nieczysty i z błędem wykonania.
-	•	CreateDatabase: ✅ dużo lepszy niż stary, ale wciąż ma resztki odpowiedzialności za dane referencyjne (swieta).
-	•	Całość refaktoru: ⚠️ około 80–90% dobrze domknięte, ale nie gotowe do uznania za finalne bez jeszcze jednej rundy czyszczenia.
-
-Najbardziej krytyczny punkt na teraz: wyczyścić DBInit z ładowania danych i naprawić jego uruchamialność.
+Jeżeli chcesz, mogę od razu podać też funkcję Pythona do DBInit, która odczyta taki układ swieta_columns + swieta_rows z configa i zrobi INSERT.
