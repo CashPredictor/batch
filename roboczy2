@@ -1,382 +1,148 @@
-Da się to zrobić tak, żeby było jednocześnie:
-	•	zgodne z nową architekturą,
-	•	bez runtime odtwarzania schematu,
-	•	i wydajnościowo możliwie tak samo jak wcześniej.
-
-I klucz jest taki:
-
-Nie shardować na końcu INSERT ... FROM dataset_raw_view
-
-bo wtedy rzeczywiście:
-	•	stats_pivot_view liczy się globalnie,
-	•	dataset_raw_view liczy się globalnie,
-	•	a shard tylko obcina wynik na końcu,
-	•	czyli tracisz dawny zysk wydajnościowy.
-
-To nie jest wystarczające.
-
-⸻
-
-Co naprawdę dawało wydajność wcześniej
-
-Nie sam fakt istnienia shardów, tylko to, że dla każdego shardu silnik wykonywał:
-	•	mniejszy zakres group_cust_inv_days,
-	•	mniejszy join do stats_pivot_view,
-	•	mniejszy join do summary_client_days_tab,
-	•	mniejszy join do extended_grouped_client_days_tab,
-	•	i dopiero z tego składał dataset_raw_view.
-
-Czyli wydajność dawało wpychanie shard condition do wnętrza planu zapytania, a nie filtrowanie na końcu.
-
-⸻
-
-Jak zachować to samo bez psucia architektury
-
-Najlepsza opcja to:
-
-1. W db_init zostawić tylko stały schemat
-
-czyli:
-	•	tabele,
-	•	indeksy,
-	•	widoki stałe, niezależne od shardów.
-
-2. Z CreateDatabase usunąć runtime CREATE VIEW
-
-czyli nadal nie odtwarzasz schematu.
-
-3. Ale zamiast używać globalnego dataset_raw_view, trzymać w configu:
-	•	parametryzowalny SELECT do stats pivot
-	•	parametryzowalny SELECT do dataset raw
-	•	i w CreateDatabase robić:
-	•	INSERT INTO dataset_tab ... SELECT ...
-	•	gdzie ten SELECT ma wstrzyknięty shard condition.
-
-Czyli:
-	•	nie tworzysz widoku,
-	•	ale używasz dokładnie tej samej logiki SQL,
-	•	tylko jako inline SELECT zamiast CREATE VIEW.
-
-To daje praktycznie ten sam plan wykonania co dawniej.
-
-⸻
-
-To jest najlepsza opcja
-
-Bo:
-	•	nie łamie zasady „schemat w init”,
-	•	nie robi runtime DROP VIEW / CREATE VIEW,
-	•	nie wymaga tymczasowych widoków,
-	•	nie wymaga tabel przejściowych,
-	•	pozwala zachować sharding tam, gdzie on realnie działa.
-
-⸻
-
-Czego nie robić
-
-Nie robić globalnego dataset_raw_view + filtrowania shardem na końcu
-
-bo będzie wolniej.
-
-Nie robić tymczasowych widoków
-
-bo to znowu jest pół-krok w stronę runtime schematu.
-
-Nie robić tabel przejściowych, jeśli nie trzeba
-
-bo:
-	•	trzeba je tworzyć,
-	•	czyścić,
-	•	pilnować klienta i shardu,
-	•	to zwiększa złożoność,
-	•	a tu da się osiągnąć cel bez nich.
-
-⸻
-
-Najlepszy model docelowy
-
-db_init
-
-tworzy tylko:
-	•	raw tables,
-	•	derived tables,
-	•	stałe widoki niezależne od shardów:
-	•	invo_view
-	•	clhs_view
-	•	debc_view
-	•	dcmo_view
-	•	INVO_CLHS_JOINED
-	•	summary_client_days_view
-	•	extended_grouped_client_days
-
-Natomiast:
-	•	stats_pivot_view
-	•	dataset_raw_view
-
-nie muszą być już prawdziwymi widokami schematowymi.
-
-Zamiast tego mogą być w configu jako select templates.
-
-To jest najczystsze rozwiązanie.
-
-⸻
-
-Czyli co proponuję konkretnie
-
-W configu rozdzielić:
-
-zamiast:
-	•	query_create_stats_pivot_view
-	•	query_create_dataset_raw_view
-
-zrób:
-	•	query_stats_pivot_select
-	•	query_dataset_raw_select
-
-czyli nie CREATE VIEW ..., tylko samo SELECT ....
-
-⸻
-
-Jak to będzie działać
-
-Dawniej
-
-robiłeś:
-	•	CREATE VIEW stats_pivot_view AS SELECT ... WHERE {shard_condition}
-	•	CREATE VIEW dataset_raw_view AS SELECT ... JOIN stats_pivot_view ... WHERE {shard_condition}
-	•	INSERT INTO dataset_tab SELECT * FROM dataset_raw_view
-
-Teraz
-
-zrobisz:
-	•	z configu bierzesz query_stats_pivot_select
-	•	z configu bierzesz query_dataset_raw_select
-	•	do obu wstrzykujesz ten sam shard_condition
-	•	i wykonujesz:
-
-INSERT INTO dataset_tab
-SELECT * FROM (
-    ... query_dataset_raw_select po replace ...
-)
-
-czyli logicznie prawie to samo, ale bez tworzenia widoku.
-
-⸻
-
-Dlaczego to zachowa wydajność
-
-Bo shard condition dalej siedzi:
-	•	wewnątrz zapytania pivot,
-	•	wewnątrz zapytania dataset raw,
-	•	przed joinami i grupowaniami końcowymi.
-
-Czyli SQLite nadal liczy na ograniczonym fragmencie danych.
-
-To jest właśnie to, co chcesz odzyskać.
-
-⸻
-
-Czy trzeba wtedy zostawić stats_pivot_view i dataset_raw_view w init?
-
-Moja rekomendacja:
-
-nie
-
-Jeżeli mają być shardowane wydajnościowo tak jak dawniej, to lepiej:
-	•	nie tworzyć ich w db_init,
-	•	nie trzymać ich jako obiektów schematu,
-	•	tylko trzymać ich definicje jako szablony SQL w configu.
-
-Bo wtedy nie ma rozdwojenia:
-	•	jeden SQL do stałego widoku,
-	•	drugi SQL do shardowanego inserta.
-
-Masz jedną definicję logiki i używasz jej dokładnie tam, gdzie trzeba.
-
-⸻
-
-Co wtedy zostaje jako schemat, a co jako runtime select
-
-Stały schemat w db_init
-
-zostają:
-	•	wszystkie tabele,
-	•	indeksy,
-	•	raw views,
-	•	helper views bez shardów i bez problemów wydajnościowych.
-
-Runtime select w CreateDatabase
-
-przechodzą:
-	•	stats_pivot
-	•	dataset_raw
-
-ale tylko jako SELECT-y używane do insertów, nie jako obiekty DB.
-
-To jest nadal zgodne z zasadą:
-CreateDatabase zasila, a nie odtwarza schemat.
-
-Bo SELECT użyty do INSERT INTO ... SELECT ... to nie jest tworzenie schematu.
-
-⸻
-
-Czy tabele przejściowe mają sens
-
-Moim zdaniem tutaj nie jako pierwszy wybór.
-
-Miałyby sens, gdyby:
-	•	jeden shardowany wynik był wielokrotnie używany,
-	•	albo jedna ciężka część pipeline była potem wykorzystywana kilka razy.
-
-Ale u Ciebie główny problem jest taki, żeby wydajnie zbudować dataset_tab.
-
-Jeśli wynik jest używany raz, to lepiej:
-	•	zrobić dobry shardowany INSERT ... SELECT ...,
-	•	niż tworzyć dodatkową tabelę pośrednią, zasilać ją, indeksować, czyścić.
-
-Tabele przejściowe zwiększają:
-	•	złożoność,
-	•	I/O,
-	•	liczbę commitów,
-	•	ilość kodu do utrzymania.
-
-Więc na teraz: nie warto.
-
-⸻
-
-Najlepsza architektura
-
-Zostaw w init:
-	•	extended_grouped_client_days_view
-	•	summary_client_days_view
-
-bo one są potrzebne też niezależnie i są częścią logicznego schematu.
-
-Przenieś z widoków do select-template:
-	•	stats_pivot_view
-	•	dataset_raw_view
-
-bo to są elementy stricte pod wydajne zasilanie datasetów.
-
-To będzie najbardziej spójne.
-
-⸻
-
-Jak to wdrożyć praktycznie
-
-1. W configu zamiast CREATE VIEW ... daj SELECT-y
-
-query_stats_pivot_select
-
-czyli bez:
-
-CREATE VIEW stats_pivot_view AS
-
-tylko samo:
-
-SELECT ...
-FROM group_cust_inv_days g
-LEFT JOIN statystyki_faktur stats_pivot ...
-WHERE {shard_condition}
-GROUP BY ...
-
-query_dataset_raw_select
-
-czyli bez:
-
-CREATE VIEW dataset_raw_view AS
-
-tylko samo:
-
-SELECT ...
-FROM group_cust_inv_days g
-LEFT JOIN ...
-LEFT JOIN (
-    {stats_pivot_select}
-) pivot
-ON ...
-WHERE {shard_condition}
-
-albo, jeszcze lepiej, przez CTE.
-
-⸻
-
-Najlepsza forma SQL: CTE
-
-To jest najczystsze.
-
-query_dataset_raw_select
-
-powinno wyglądać mniej więcej tak:
-
-WITH stats_pivot_view AS (
-    {stats_pivot_select}
-)
-SELECT
-    ...
-FROM group_cust_inv_days g
-LEFT JOIN invo i ON ...
-LEFT JOIN ... c ON ...
-LEFT JOIN extended_grouped_client_days_tab e ON ...
-LEFT JOIN summary_client_days_tab s ON ...
-LEFT JOIN stats_pivot_view pivot ON ...
-WHERE {shard_condition}
-
-To daje:
-	•	dawną logikę,
-	•	dawną wydajność,
-	•	brak runtime widoków,
-	•	brak tymczasowych tabel.
-
-To jest moim zdaniem najlepsza wersja.
-
-⸻
-
-Wniosek końcowy
-
-Najlepsza opcja to:
-
-w db_init
-
-tworzyć tylko stały schemat,
-
-w CreateDatabase
-
-dla shardów wykonywać:
-	•	shardowany SELECT stats_pivot
-	•	shardowany SELECT dataset_raw
-	•	ale jako inline SQL / CTE,
-	•	nie jako CREATE VIEW.
-
-⸻
-
-Czyli odpowiedź brzmi
-
-Tak, da się zachować wydajność praktycznie identyczną jak wcześniej, bez tymczasowych widoków i bez tabel przejściowych, jeśli:
-	•	stats_pivot_view i dataset_raw_view przestaną być obiektami schematu,
-	•	a staną się szablonami SELECT w configu,
-	•	uruchamianymi w CreateDatabase z wstrzykniętym shard_condition.
-
-To jest najlepsze rozwiązanie.
-
-⸻
-
-Co bym zrobił teraz
-	1.	Usunął z db_init tworzenie:
-	•	query_create_stats_pivot_view
-	•	query_create_dataset_raw_view
-	2.	W configu dodał:
-	•	query_stats_pivot_select
-	•	query_dataset_raw_select
-	3.	W CreateDatabase przebudował sekcję dataset_tab, żeby używała:
-	•	batch po dacie,
-	•	shard,
-	•	INSERT INTO dataset_tab ... WITH stats_pivot_view AS (...) SELECT ...
-
-To będzie i czyste, i szybkie.
-
-W następnym kroku mogę Ci rozpisać gotowy kod:
-	•	nowe klucze do configa,
-	•	nowy SQL query_stats_pivot_select,
-	•	nowy SQL query_dataset_raw_select,
-	•	gotowy blok Pythona do CreateDatabase 1:1 do wklejenia.
+zrobiłem w configu i init jak chciałeś, ale teraz przerób mi to:
+
+        for shard in range(NUM_SHARDS + 1):
+            if shard < NUM_SHARDS:
+                shard_condition_sql = f"""
+                    (
+                        INVO_DEBC_NO IS NOT NULL
+                        AND INVO_DEBC_NO NOT GLOB '*[^0-9]*'
+                        AND (CAST(INVO_DEBC_NO AS INTEGER) % {NUM_SHARDS}) = {shard}
+                    )
+                """
+            else:
+                shard_condition_sql = """
+                    (
+                        INVO_DEBC_NO IS NULL
+                        OR INVO_DEBC_NO GLOB '*[^0-9]*'
+                    )
+                """
+        
+            batch_size = 1000
+            current_date = pd.to_datetime(min_date)
+            total_inserted = 0
+        
+            while current_date <= pd.to_datetime(data_end_str):
+                next_date = current_date + pd.Timedelta(days=batch_size - 1)
+        
+                query_batch_insert = f"""
+                INSERT INTO dataset_tab
+                SELECT *
+                FROM dataset_raw_view
+                WHERE INVO_CLNTNO = ?
+                  AND DATE(DZIEN) >= DATE(?)
+                  AND DATE(DZIEN) <= DATE(?)
+                  AND {shard_condition_sql};
+                """
+        
+                cursor.execute(
+                    query_batch_insert,
+                    (
+                        client_id,
+                        current_date.strftime('%Y-%m-%d'),
+                        next_date.strftime('%Y-%m-%d'),
+                    )
+                )
+                conn.commit()
+        
+                batch_inserted = cursor.rowcount
+                total_inserted += (batch_inserted if batch_inserted != -1 else 0)
+        
+                print(
+                    f"Dla client={client_id}, shard={shard} zaimportowano "
+                    f"{batch_inserted} rekordów dla dni "
+                    f"{current_date.strftime('%Y-%m-%d')} - {next_date.strftime('%Y-%m-%d')}."
+                )
+                print(datetime.now().strftime("%H:%M:%S"))
+        
+                current_date = next_date + pd.Timedelta(days=1)
+        
+        refill_dataset_for_client(
+            conn,
+            client_id=client_id,
+            source_table="dataset_tab",
+            target_table="dataset",
+            batch_days=params.get("dataset_batch_days", 31)
+        )
+        print(datetime.now().strftime("%H:%M:%S"))
+
+na poprawną wersję, przypominam jak to wyglądało zanim zaczęliśmy zmienić:
+        
+        NUM_SHARDS = params['NUM_SHARDS']
+        
+        for shard in range(NUM_SHARDS + 1):  # dodatkowy shard 10 = nie-numeryczne
+            if shard < NUM_SHARDS:
+                shard_condition = f"""
+                    (
+                        CAST(g.INVO_DEBC_NO AS INTEGER) IS NOT NULL
+                        AND (CAST(g.INVO_DEBC_NO AS INTEGER) % {NUM_SHARDS}) = {shard}
+                    )
+                """
+            else:
+                shard_condition = "CAST(g.INVO_DEBC_NO AS INTEGER) IS NULL"
+        
+        for shard in range(NUM_SHARDS + 1):
+        
+            if shard < NUM_SHARDS:
+                shard_condition = f"""
+                    (
+                        g.INVO_DEBC_NO IS NOT NULL
+                        AND g.INVO_DEBC_NO NOT GLOB '*[^0-9]*'
+                        AND (CAST(g.INVO_DEBC_NO AS INTEGER) % {NUM_SHARDS}) = {shard}
+                    )
+                """
+            else:
+                shard_condition = """
+                    (
+                        g.INVO_DEBC_NO IS NULL
+                        OR g.INVO_DEBC_NO GLOB '*[^0-9]*'
+                    )
+                """            
+            # Wstrzyknięcie warunku do SQL
+            pivot_sql = params['query_create_stats_pivot_view'].replace("{shard_condition}", shard_condition)
+            raw_sql   = params['query_create_dataset_raw_view'].replace("{shard_condition}", shard_condition)
+                
+            cursor.execute("DROP VIEW IF EXISTS stats_pivot_view;")
+            cursor.execute(pivot_sql)
+            
+            cursor.execute("DROP VIEW IF EXISTS dataset_raw_view;")
+            cursor.execute(raw_sql)
+            
+            # Insertowanie danych partiami
+            batch_size = 1000  # Liczba dni w jednej partii
+            current_date = pd.to_datetime(min_date)
+            total_inserted = 0
+        
+            while current_date <= pd.to_datetime(data_end_str):
+                next_date = current_date + pd.Timedelta(days=batch_size - 1)
+                
+                # Zapytanie dla bieżącego zakresu
+                query_batch_insert = f"""
+                INSERT INTO dataset_tab 
+                SELECT * FROM dataset_raw_view
+                WHERE dzien >= '{current_date.strftime('%Y-%m-%d')}' AND dzien <= '{next_date.strftime('%Y-%m-%d')}';
+                """
+                
+                cursor.execute(query_batch_insert)
+                conn.commit()
+        
+                # Liczba rekordów z bieżącej partii
+                batch_inserted = cursor.rowcount
+                total_inserted += batch_inserted
+                
+                # Wyświetlanie statystyk
+                print(f"Dla shard = {shard} zaimportowano {batch_inserted} rekordów dla dni {current_date.strftime('%Y-%m-%d')} - {next_date.strftime('%Y-%m-%d')}.")
+                print(datetime.now().strftime("%H:%M:%S"))
+        
+                # Przejście do następnej partii
+                current_date = next_date + pd.Timedelta(days=1)
+        
+        create_and_insert_processed_table_chunked(
+            conn,
+            original_table_name="dataset_tab",
+            target_table_name="dataset",
+            limit_first_batch=params['data_limit']  # lub inny
+        )
+        print(datetime.now().strftime("%H:%M:%S"))
+
+
+podaj mi ten fragment z wykorzystaniem query_dataset_raw_select i query_dataset_raw_select
