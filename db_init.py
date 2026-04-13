@@ -32,30 +32,6 @@ def table_exists(cursor: sqlite3.Cursor, table_name: str) -> bool:
     )
     return cursor.fetchone() is not None
 
-
-def view_exists(cursor: sqlite3.Cursor, view_name: str) -> bool:
-    cursor.execute(
-        """
-        SELECT 1
-        FROM sqlite_master
-        WHERE type = 'view' AND name = ?
-        LIMIT 1
-        """,
-        (view_name,),
-    )
-    return cursor.fetchone() is not None
-
-
-def get_columns(cursor: sqlite3.Cursor, view_name: str):
-    cursor.execute(f"PRAGMA table_info({view_name});")
-    return [(col[1], col[2]) for col in cursor.fetchall()]
-
-
-def get_columns_from_view(cursor: sqlite3.Cursor, view_name: str):
-    cursor.execute(f"PRAGMA table_info({view_name});")
-    return [col[1] for col in cursor.fetchall()]
-
-
 def create_indexes(index_definitions: dict[str, list[str]], conn: sqlite3.Connection) -> None:
     cursor = conn.cursor()
 
@@ -71,6 +47,16 @@ def create_indexes(index_definitions: dict[str, list[str]], conn: sqlite3.Connec
 
     conn.commit()
 
+def create_and_import_swieta(conn, params, file_path):
+
+    # Wczytaj dane z pliku Excel
+    data = pd.read_excel(file_path)
+    
+    # Konwertuj kolumnę 'data' na typ daty
+    data['data'] = pd.to_datetime(data['data'], format='%d.%m.%Y')
+    
+    # Import danych do tabeli
+    data.to_sql('swieta', conn, if_exists='append', index=False)
 
 def create_aggregated_data_temp_schema(cursor: sqlite3.Cursor, params: dict) -> None:
     cursor.execute(params.get("query_aggregated_data_temp"))
@@ -104,6 +90,7 @@ def main():
         # 2. Tabele statyczne / deterministyczne
         # ============================================================
         create_aggregated_data_temp_schema(cursor, params)
+        create_and_import_swieta(conn_new, params, file_path = r'C:\Users\OE00SG\CashPredictor\dev3\co i jak baza\Arkusz w C  Users OQ38TT jupiter dev3 co i jak baza co i jak baza.xls')
 
         exec_sql(conn, params.get("query_swieta"), "query_swieta")
         exec_sql(conn, params.get("query_create_group_cust_inv_days"), "query_create_group_cust_inv_days")
@@ -138,7 +125,6 @@ def main():
             exec_sql(conn, params.get("query_create_INVO_CLHS_JOINED"), "query_create_INVO_CLHS_JOINED")
             exec_sql(conn, params.get("query_create_summary_client_days_view"), "query_create_summary_client_days_view")
             exec_sql(conn, params.get("query_create_extended_grouped_client_days_view"), "query_create_extended_grouped_client_days_view")
-            exec_sql(conn, params.get("query_create_summary_client_days_view"), "query_create_summary_client_days_view")            
             conn.commit()
         else:
             print(
@@ -161,6 +147,15 @@ def main():
         }
         create_indexes(index_definitions, conn)
 
+        cursor.execute(params['idx_invo_debcno_invdate_etc'])
+        cursor.execute(params['idx_invo_debcno_invdate'])
+        cursor.execute(params['idx_summary_days_ids_dzien'])
+        cursor.execute(params['idx_ext_days_ids_dzien'])
+        cursor.execute(params['idx_clhs_joined_keys_datetime'])
+        cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_aggregated_data_temp_all
+ON aggregated_data_temp (DZIEN, DZIS_DZIEN_TYG, DZIS_SOBOTA, DZIS_NIEDZIELA);')
+        conn.commit()
+        
         # indeksy jawnie z configu: idx_*
         for key, sql in params.items():
             if not key.startswith("idx_"):
