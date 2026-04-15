@@ -1,1049 +1,368 @@
+Błąd wynika z tego, że po podstawieniach Twój finalny SQL ma tylko 3 placeholdery ?, a Ty przekazujesz 6 parametrów.
 
-        for shard in range(NUM_SHARDS + 1):
-            if shard < NUM_SHARDS:
-                shard_condition = f"""
-                    (
-                        g.INVO_DEBC_NO IS NOT NULL
-                        AND g.INVO_DEBC_NO NOT GLOB '*[^0-9]*'
-                        AND (CAST(g.INVO_DEBC_NO AS INTEGER) % {NUM_SHARDS}) = {shard}
-                    )
-                """
-            else:
-                shard_condition = """
-                    (
-                        g.INVO_DEBC_NO IS NULL
-                        OR g.INVO_DEBC_NO GLOB '*[^0-9]*'
-                    )
-                """
+To widać po komunikacie:
 
-            client_filter = """
-                AND g.INVO_CLNTNO = ?
-                AND DATE(g.DZIEN) >= DATE(?)
-                AND DATE(g.DZIEN) <= DATE(?)
-            """
+sqlite3.ProgrammingError: Incorrect number of bindings supplied.
+The current statement uses 3, and there are 6 supplied.
 
-            stats_pivot_sql = params['query_stats_pivot_select'] \
-                .replace("{shard_condition}", shard_condition) \
-                .replace("{client_filter}", client_filter)
+Skąd się to bierze
 
-            dataset_raw_sql = params['query_dataset_raw_select'] \
-                .replace("{stats_pivot_select}", stats_pivot_sql) \
-                .replace("{shard_condition}", shard_condition) \
-                .replace("{client_filter}", client_filter)
+W Pythonie robisz:
 
-            current_date = pd.to_datetime(min_date)
-            total_inserted_shard = 0
+stats_pivot_sql = params['query_stats_pivot_select'] \
+    .replace("{shard_condition}", shard_condition) \
+    .replace("{client_filter}", client_filter)
 
-            while current_date <= pd.to_datetime(data_end_str):
-                next_date = current_date + pd.Timedelta(days=batch_size - 1)
+dataset_raw_sql = params['query_dataset_raw_select'] \
+    .replace("{stats_pivot_select}", stats_pivot_sql) \
+    .replace("{shard_condition}", shard_condition) \
+    .replace("{client_filter}", client_filter)
 
-                query_batch_insert = f"""
-                INSERT INTO dataset_tab
-                {dataset_raw_sql}
-                """
+a potem:
 
-                cursor.execute(
-                    query_batch_insert,
-                    (
-                        client_id,
-                        current_date.strftime('%Y-%m-%d'),
-                        next_date.strftime('%Y-%m-%d'),
-                        client_id,
-                        current_date.strftime('%Y-%m-%d'),
-                        next_date.strftime('%Y-%m-%d'),
-                    )
-                )
-                conn.commit()
+cursor.execute(
+    query_batch_insert,
+    (
+        client_id,
+        current_date.strftime('%Y-%m-%d'),
+        next_date.strftime('%Y-%m-%d'),
+        client_id,
+        current_date.strftime('%Y-%m-%d'),
+        next_date.strftime('%Y-%m-%d'),
+    )
+)
 
-                batch_inserted = cursor.rowcount if cursor.rowcount != -1 else 0
-                total_inserted_shard += batch_inserted
-                total_inserted_all += batch_inserted
+czyli zakładasz, że:
+	•	3 ? są w stats_pivot_select
+	•	3 ? są w zewnętrznym query_dataset_raw_select
 
-                print(
-                    f"Dla client={client_id}, shard={shard} zaimportowano "
-                    f"{batch_inserted} rekordów dla dni "
-                    f"{current_date.strftime('%Y-%m-%d')} - {next_date.strftime('%Y-%m-%d')}."
-                )
-                print(datetime.now().strftime("%H:%M:%S"))
+Ale z błędu wynika, że finalnie SQL ma tylko te wewnętrzne 3, a zewnętrzne {client_filter} w query_dataset_raw_select najpewniej w ogóle nie występuje albo nie jest już użyte w końcowej części zapytania.
 
-                current_date = next_date + pd.Timedelta(days=1)
+⸻
 
-            print(
-                f"[INFO] Client={client_id}, shard={shard} zakończony. "
-                f"Łącznie w shardzie: {total_inserted_shard}"
-            )
+Najważniejsza diagnoza
 
-        cursor.execute("DELETE FROM dataset WHERE INVO_CLNTNO = ?", (client_id,))
-        conn.commit()
+Masz niespójność między Pythonem a configiem:
+	•	Python przekazuje 6 parametrów
+	•	config finalnie używa tylko 3 placeholderów
 
+Czyli trzeba zrobić jedno z dwóch:
 
+wariant A — szybka naprawa błędu
 
-  
-  shard_condition: ""
-  
-  query_stats_pivot_select: |
-    SELECT 
-        g.INVO_ADMNO,
-        g.INVO_CLNTNO,
-        g.INVO_DEBH_NO,
-        g.INVO_DEBC_NO,
-        g.DZIEN,        
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_DNI_DO_ZAPLATY     END) AS F7_11_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_DNI_DO_ZAPLATY   END) AS F7_11_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_DNI_OPOZNIENIA     END) AS F7_11_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_DNI_OPOZNIENIA   END) AS F7_11_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN SUM_INVO_AINITIALH     END) AS F7_11_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_INVO_AINITIALH     END) AS F7_11_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_INVO_AINITIALH   END) AS F7_11_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN ILE_FAKTUR             END) AS F7_11_ILE_FAKTUR,
+przekazać tylko 3 parametry
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_DNI_DO_ZAPLATY   END) AS F7_10_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_DNI_DO_ZAPLATY END) AS F7_10_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_DNI_OPOZNIENIA   END) AS F7_10_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_DNI_OPOZNIENIA END) AS F7_10_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN SUM_INVO_AINITIALH   END) AS F7_10_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_INVO_AINITIALH   END) AS F7_10_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_INVO_AINITIALH END) AS F7_10_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN ILE_FAKTUR           END) AS F7_10_ILE_FAKTUR,
+albo
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_DNI_DO_ZAPLATY   END) AS F7_00_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_DNI_DO_ZAPLATY END) AS F7_00_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_DNI_OPOZNIENIA   END) AS F7_00_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_DNI_OPOZNIENIA END) AS F7_00_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN SUM_INVO_AINITIALH   END) AS F7_00_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_INVO_AINITIALH   END) AS F7_00_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_INVO_AINITIALH END) AS F7_00_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN ILE_FAKTUR           END) AS F7_00_ILE_FAKTUR,
+wariant B — poprawna naprawa logiczna
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_DNI_DO_ZAPLATY   END) AS F7_01_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_DNI_DO_ZAPLATY END) AS F7_01_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_DNI_OPOZNIENIA   END) AS F7_01_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_DNI_OPOZNIENIA END) AS F7_01_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN SUM_INVO_AINITIALH   END) AS F7_01_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_INVO_AINITIALH   END) AS F7_01_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_INVO_AINITIALH END) AS F7_01_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN ILE_FAKTUR           END) AS F7_01_ILE_FAKTUR,
+dopisać {client_filter} także do zewnętrznego query_dataset_raw_select, tak aby faktycznie były łącznie 6 placeholderów.
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_DNI_DO_ZAPLATY   END) AS F7_99_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_DNI_DO_ZAPLATY END) AS F7_99_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_DNI_OPOZNIENIA   END) AS F7_99_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_DNI_OPOZNIENIA END) AS F7_99_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN SUM_INVO_AINITIALH   END) AS F7_99_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_INVO_AINITIALH   END) AS F7_99_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_INVO_AINITIALH END) AS F7_99_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 7 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN ILE_FAKTUR           END) AS F7_99_ILE_FAKTUR,
+W Twoim przypadku poprawny jest wariant B, bo on zachowuje starą optymalizację: filtrowanie shardem i klientem ma działać nie tylko w pivot, ale też na głównym group_cust_inv_days g.
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_DNI_DO_ZAPLATY     END) AS F14_11_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_DNI_DO_ZAPLATY   END) AS F14_11_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_DNI_OPOZNIENIA     END) AS F14_11_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_DNI_OPOZNIENIA   END) AS F14_11_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN SUM_INVO_AINITIALH     END) AS F14_11_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_INVO_AINITIALH     END) AS F14_11_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_INVO_AINITIALH   END) AS F14_11_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN ILE_FAKTUR             END) AS F14_11_ILE_FAKTUR,
+⸻
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_DNI_DO_ZAPLATY   END) AS F14_10_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_DNI_DO_ZAPLATY END) AS F14_10_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_DNI_OPOZNIENIA   END) AS F14_10_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_DNI_OPOZNIENIA END) AS F14_10_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN SUM_INVO_AINITIALH   END) AS F14_10_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_INVO_AINITIALH   END) AS F14_10_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_INVO_AINITIALH END) AS F14_10_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN ILE_FAKTUR           END) AS F14_10_ILE_FAKTUR,
+Co trzeba poprawić
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_DNI_DO_ZAPLATY   END) AS F14_00_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_DNI_DO_ZAPLATY END) AS F14_00_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_DNI_OPOZNIENIA   END) AS F14_00_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_DNI_OPOZNIENIA END) AS F14_00_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN SUM_INVO_AINITIALH   END) AS F14_00_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_INVO_AINITIALH   END) AS F14_00_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_INVO_AINITIALH END) AS F14_00_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN ILE_FAKTUR           END) AS F14_00_ILE_FAKTUR,
+1. W query_dataset_raw_select dodaj końcowy filtr zewnętrzny
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_DNI_DO_ZAPLATY   END) AS F14_01_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_DNI_DO_ZAPLATY END) AS F14_01_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_DNI_OPOZNIENIA   END) AS F14_01_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_DNI_OPOZNIENIA END) AS F14_01_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN SUM_INVO_AINITIALH   END) AS F14_01_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_INVO_AINITIALH   END) AS F14_01_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_INVO_AINITIALH END) AS F14_01_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN ILE_FAKTUR           END) AS F14_01_ILE_FAKTUR,
+Na końcu tego SQL-a, po joinie do pivota, musi być jeszcze normalny ON ... dla pivota, a potem WHERE.
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_DNI_DO_ZAPLATY   END) AS F14_99_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_DNI_DO_ZAPLATY END) AS F14_99_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_DNI_OPOZNIENIA   END) AS F14_99_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_DNI_OPOZNIENIA END) AS F14_99_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN SUM_INVO_AINITIALH   END) AS F14_99_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_INVO_AINITIALH   END) AS F14_99_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_INVO_AINITIALH END) AS F14_99_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 14 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN ILE_FAKTUR           END) AS F14_99_ILE_FAKTUR,
+Teraz w pokazanym fragmencie urywa się na:
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_DNI_DO_ZAPLATY     END) AS F30_11_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_DNI_DO_ZAPLATY   END) AS F30_11_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_DNI_OPOZNIENIA     END) AS F30_11_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_DNI_OPOZNIENIA   END) AS F30_11_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN SUM_INVO_AINITIALH     END) AS F30_11_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_INVO_AINITIALH     END) AS F30_11_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_INVO_AINITIALH   END) AS F30_11_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN ILE_FAKTUR             END) AS F30_11_ILE_FAKTUR,
+LEFT JOIN (
+{stats_pivot_select}
+) pivot
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_DNI_DO_ZAPLATY   END) AS F30_10_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_DNI_DO_ZAPLATY END) AS F30_10_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_DNI_OPOZNIENIA   END) AS F30_10_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_DNI_OPOZNIENIA END) AS F30_10_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN SUM_INVO_AINITIALH   END) AS F30_10_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_INVO_AINITIALH   END) AS F30_10_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_INVO_AINITIALH END) AS F30_10_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN ILE_FAKTUR           END) AS F30_10_ILE_FAKTUR,
+czyli brakuje dalszej części.
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_DNI_DO_ZAPLATY   END) AS F30_00_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_DNI_DO_ZAPLATY END) AS F30_00_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_DNI_OPOZNIENIA   END) AS F30_00_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_DNI_OPOZNIENIA END) AS F30_00_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN SUM_INVO_AINITIALH   END) AS F30_00_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_INVO_AINITIALH   END) AS F30_00_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_INVO_AINITIALH END) AS F30_00_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN ILE_FAKTUR           END) AS F30_00_ILE_FAKTUR,
+Powinno być mniej więcej tak:
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_DNI_DO_ZAPLATY   END) AS F30_01_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_DNI_DO_ZAPLATY END) AS F30_01_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_DNI_OPOZNIENIA   END) AS F30_01_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_DNI_OPOZNIENIA END) AS F30_01_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN SUM_INVO_AINITIALH   END) AS F30_01_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_INVO_AINITIALH   END) AS F30_01_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_INVO_AINITIALH END) AS F30_01_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN ILE_FAKTUR           END) AS F30_01_ILE_FAKTUR,
+query_dataset_raw_select: |
+  SELECT 
+      ...
+  FROM 
+      group_cust_inv_days g
+      LEFT JOIN invo i
+        ON ...
+      LEFT JOIN (...) c
+        ON ...
+      LEFT JOIN extended_grouped_client_days_tab e
+        ON ...
+      LEFT JOIN summary_client_days_tab s
+        ON ...
+      LEFT JOIN (
+      {stats_pivot_select}
+      ) pivot
+        ON g.INVO_ADMNO = pivot.INVO_ADMNO
+       AND g.INVO_CLNTNO = pivot.INVO_CLNTNO
+       AND g.INVO_DEBH_NO = pivot.INVO_DEBH_NO
+       AND g.INVO_DEBC_NO = pivot.INVO_DEBC_NO
+       AND DATE(g.DZIEN) = DATE(pivot.DZIEN)
+  WHERE 1=1
+  {client_filter}
+  AND {shard_condition}
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_DNI_DO_ZAPLATY   END) AS F30_99_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_DNI_DO_ZAPLATY END) AS F30_99_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_DNI_OPOZNIENIA   END) AS F30_99_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_DNI_OPOZNIENIA END) AS F30_99_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN SUM_INVO_AINITIALH   END) AS F30_99_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_INVO_AINITIALH   END) AS F30_99_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_INVO_AINITIALH END) AS F30_99_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 30 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN ILE_FAKTUR           END) AS F30_99_ILE_FAKTUR,
+To jest kluczowe.
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_DNI_DO_ZAPLATY     END) AS F60_11_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_DNI_DO_ZAPLATY   END) AS F60_11_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_DNI_OPOZNIENIA     END) AS F60_11_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_DNI_OPOZNIENIA   END) AS F60_11_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN SUM_INVO_AINITIALH     END) AS F60_11_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_INVO_AINITIALH     END) AS F60_11_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_INVO_AINITIALH   END) AS F60_11_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN ILE_FAKTUR             END) AS F60_11_ILE_FAKTUR,
+Dzięki temu:
+	•	wewnętrzny subquery pivot ma swoje 3 ?
+	•	zewnętrzny select ma kolejne 3 ?
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_DNI_DO_ZAPLATY   END) AS F60_10_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_DNI_DO_ZAPLATY END) AS F60_10_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_DNI_OPOZNIENIA   END) AS F60_10_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_DNI_OPOZNIENIA END) AS F60_10_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN SUM_INVO_AINITIALH   END) AS F60_10_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_INVO_AINITIALH   END) AS F60_10_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_INVO_AINITIALH END) AS F60_10_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN ILE_FAKTUR           END) AS F60_10_ILE_FAKTUR,
+I wtedy Twoje 6 parametrów będzie poprawne.
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_DNI_DO_ZAPLATY   END) AS F60_00_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_DNI_DO_ZAPLATY END) AS F60_00_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_DNI_OPOZNIENIA   END) AS F60_00_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_DNI_OPOZNIENIA END) AS F60_00_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN SUM_INVO_AINITIALH   END) AS F60_00_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_INVO_AINITIALH   END) AS F60_00_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_INVO_AINITIALH END) AS F60_00_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN ILE_FAKTUR           END) AS F60_00_ILE_FAKTUR,
+⸻
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_DNI_DO_ZAPLATY   END) AS F60_01_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_DNI_DO_ZAPLATY END) AS F60_01_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_DNI_OPOZNIENIA   END) AS F60_01_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_DNI_OPOZNIENIA END) AS F60_01_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN SUM_INVO_AINITIALH   END) AS F60_01_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_INVO_AINITIALH   END) AS F60_01_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_INVO_AINITIALH END) AS F60_01_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN ILE_FAKTUR           END) AS F60_01_ILE_FAKTUR,
+2. Jeśli nie chcesz jeszcze ruszać configa, to tymczasowo zmień execute na 3 parametry
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_DNI_DO_ZAPLATY   END) AS F60_99_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_DNI_DO_ZAPLATY END) AS F60_99_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_DNI_OPOZNIENIA   END) AS F60_99_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_DNI_OPOZNIENIA END) AS F60_99_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN SUM_INVO_AINITIALH   END) AS F60_99_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_INVO_AINITIALH   END) AS F60_99_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_INVO_AINITIALH END) AS F60_99_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 60 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN ILE_FAKTUR           END) AS F60_99_ILE_FAKTUR,
+Tylko to będzie obejście, nie docelowe rozwiązanie:
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_DNI_DO_ZAPLATY     END) AS F90_11_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_DNI_DO_ZAPLATY   END) AS F90_11_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_DNI_OPOZNIENIA     END) AS F90_11_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_DNI_OPOZNIENIA   END) AS F90_11_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN SUM_INVO_AINITIALH     END) AS F90_11_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_INVO_AINITIALH     END) AS F90_11_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_INVO_AINITIALH   END) AS F90_11_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN ILE_FAKTUR             END) AS F90_11_ILE_FAKTUR,
+cursor.execute(
+    query_batch_insert,
+    (
+        client_id,
+        current_date.strftime('%Y-%m-%d'),
+        next_date.strftime('%Y-%m-%d'),
+    )
+)
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_DNI_DO_ZAPLATY   END) AS F90_10_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_DNI_DO_ZAPLATY END) AS F90_10_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_DNI_OPOZNIENIA   END) AS F90_10_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_DNI_OPOZNIENIA END) AS F90_10_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN SUM_INVO_AINITIALH   END) AS F90_10_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_INVO_AINITIALH   END) AS F90_10_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_INVO_AINITIALH END) AS F90_10_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN ILE_FAKTUR           END) AS F90_10_ILE_FAKTUR,
+Ale tego nie polecam jako finalnej wersji, bo wtedy outer query nie ma filtrowania klienta/date i wydajność może siąść albo logika może brać za szeroki zakres.
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_DNI_DO_ZAPLATY   END) AS F90_00_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_DNI_DO_ZAPLATY END) AS F90_00_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_DNI_OPOZNIENIA   END) AS F90_00_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_DNI_OPOZNIENIA END) AS F90_00_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN SUM_INVO_AINITIALH   END) AS F90_00_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_INVO_AINITIALH   END) AS F90_00_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_INVO_AINITIALH END) AS F90_00_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN ILE_FAKTUR           END) AS F90_00_ILE_FAKTUR,
+⸻
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_DNI_DO_ZAPLATY   END) AS F90_01_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_DNI_DO_ZAPLATY END) AS F90_01_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_DNI_OPOZNIENIA   END) AS F90_01_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_DNI_OPOZNIENIA END) AS F90_01_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN SUM_INVO_AINITIALH   END) AS F90_01_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_INVO_AINITIALH   END) AS F90_01_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_INVO_AINITIALH END) AS F90_01_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN ILE_FAKTUR           END) AS F90_01_ILE_FAKTUR,
+Drugi realny problem, który już widać w logach
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_DNI_DO_ZAPLATY   END) AS F90_99_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_DNI_DO_ZAPLATY END) AS F90_99_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_DNI_OPOZNIENIA   END) AS F90_99_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_DNI_OPOZNIENIA END) AS F90_99_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN SUM_INVO_AINITIALH   END) AS F90_99_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_INVO_AINITIALH   END) AS F90_99_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_INVO_AINITIALH END) AS F90_99_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 90 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN ILE_FAKTUR           END) AS F90_99_ILE_FAKTUR,
+To jest bardzo ważne:
 
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_DNI_DO_ZAPLATY     END) AS F365_11_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_DNI_DO_ZAPLATY   END) AS F365_11_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_DNI_OPOZNIENIA     END) AS F365_11_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_DNI_OPOZNIENIA   END) AS F365_11_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN SUM_INVO_AINITIALH     END) AS F365_11_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN AVG_INVO_AINITIALH     END) AS F365_11_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN STDEV_INVO_AINITIALH   END) AS F365_11_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'zap_acone_przed_terminem' THEN ILE_FAKTUR             END) AS F365_11_ILE_FAKTUR,
-
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_DNI_DO_ZAPLATY   END) AS F365_10_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_DNI_DO_ZAPLATY END) AS F365_10_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_DNI_OPOZNIENIA   END) AS F365_10_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_DNI_OPOZNIENIA END) AS F365_10_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN SUM_INVO_AINITIALH   END) AS F365_10_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN AVG_INVO_AINITIALH   END) AS F365_10_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN STDEV_INVO_AINITIALH END) AS F365_10_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'zap_acone_po_terminie' THEN ILE_FAKTUR           END) AS F365_10_ILE_FAKTUR,
-
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_DNI_DO_ZAPLATY   END) AS F365_00_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_DNI_DO_ZAPLATY END) AS F365_00_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_DNI_OPOZNIENIA   END) AS F365_00_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_DNI_OPOZNIENIA END) AS F365_00_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN SUM_INVO_AINITIALH   END) AS F365_00_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN AVG_INVO_AINITIALH   END) AS F365_00_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN STDEV_INVO_AINITIALH END) AS F365_00_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'niezap_acone_po_terminie' THEN ILE_FAKTUR           END) AS F365_00_ILE_FAKTUR,
-
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_DNI_DO_ZAPLATY   END) AS F365_01_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_DNI_DO_ZAPLATY END) AS F365_01_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_DNI_OPOZNIENIA   END) AS F365_01_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_DNI_OPOZNIENIA END) AS F365_01_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN SUM_INVO_AINITIALH   END) AS F365_01_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN AVG_INVO_AINITIALH   END) AS F365_01_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN STDEV_INVO_AINITIALH END) AS F365_01_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'niezap_acone_przed_terminem' THEN ILE_FAKTUR           END) AS F365_01_ILE_FAKTUR,
-
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_DNI_DO_ZAPLATY   END) AS F365_99_AVG_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_DNI_DO_ZAPLATY END) AS F365_99_STDEV_DNI_DO_ZAPLATY,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_DNI_OPOZNIENIA   END) AS F365_99_AVG_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_DNI_OPOZNIENIA END) AS F365_99_STDEV_DNI_OPOZNIENIA,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN SUM_INVO_AINITIALH   END) AS F365_99_SUM_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN AVG_INVO_AINITIALH   END) AS F365_99_AVG_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN STDEV_INVO_AINITIALH END) AS F365_99_STDEV_INVO_AINITIALH,
-        MAX(CASE WHEN PARAM_Z_ILU_DNI = 365 AND SCENARIUSZ LIKE 'wszystkie_faktury' THEN ILE_FAKTUR           END) AS F365_99_ILE_FAKTUR    
-    FROM 
-        group_cust_inv_days g
-    -- Dołączenie danych z statystyki_faktur
-    LEFT JOIN statystyki_faktur stats_pivot
-    ON g.INVO_ADMNO = stats_pivot.INVO_ADMNO
-       AND g.INVO_CLNTNO = stats_pivot.INVO_CLNTNO
-       AND g.INVO_DEBH_NO = stats_pivot.INVO_DEBH_NO
-       AND (g.INVO_DEBH_NO = stats_pivot.INVO_DEBH_NO AND g.INVO_DEBC_NO = stats_pivot.INVO_DEBC_NO)
-       AND DATE(g.DZIEN) = DATE(stats_pivot.DZIEN)
-    WHERE {shard_condition}
-    {client_filter}
-    GROUP BY
-        g.INVO_ADMNO,
-        g.INVO_CLNTNO,
-        g.INVO_DEBH_NO,
-        g.INVO_DEBC_NO,
-        g.DZIEN
-
-  query_dataset_raw_select: |
-    SELECT 
-        g.INVO_NO,
-        g.INVO_ADMNO,
-        g.INVO_CLNTNO,
-        g.INVO_DEBH_NO,
-        g.INVO_DEBC_NO,
-        g.INVO_INVDATE,
-        g.DZIEN,
-        g.ROK,
-        g.MIESIAC,
-        g.INVO_FINALPAYMENTDATE,
-        
-        -- Dane z INVO_CLHS_JOINED_TAB
-        i.INVO_VALUEDATE,
-        i.INVO_DUEDATE,
-        i.INVO_MARKCODESPECDATE,
-        i.INVO_MARKCODETEXTDATE,
-        i.INVO_BOOKINGDATE,
-        i.INVO_CURRENCY,
-        i.INVO_AINITIALH,
-        i.INVO_AINITIALC,
-        -- i.INVO_ATAXI,
-        i.INVO_MARKCODESPEC,
-        i.INVO_MAXFINANCETIMPASSED,
-        i.INVO_DATSTARTDELCREDEREINVST,
-        i.INVO_NETDAYS,
-        i.INVO_INVO_INVOICENO,
-        i.INVO_TEXT,
-        i.INVO_HOLDCODE,
-        i.INVO_DUMMY,
-        c.CLHS_CHANGED_DATETIME,
-        c.CLHS_DATVALID,
-        c.CLHS_DATPRINTED,
-        c.CLHS_LIMITOLD,
-        c.CLHS_CURRENCYOLD,
-        c.CLHS_LIMITNEW,
-        c.CLHS_CURRENCYNEW,
-        c.CLHS_TEXTCODE1,
-        c.CLHS_TEXTCODE2,
-        c.CLHS_TEXTCODE3,
-        c.CLHS_VARIABLETEXT1,
-        c.CLHS_VARIABLETEXT2,
-        c.CLHS_USRID,
-        c.CLHS_AUTOMATICDECISION,
-        c.CLHS_NEWDEBTOR,
-        c.CLHS_NEXT_CHANGED_DATETIME,
-        
-        -- Dane z extended_grouped_client_days_tab
-        e.DCMO_PAIDAMOUNT_M,
-        e.DCMO_PAIDAMOUNTINVDATE_M,
-        e.DCMO_PAIDAMOUNTDUEDATE_M,
-        e.DCMO_PAIDAMOUNTBEFOREDUEDATE_M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT30_M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT60_M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT90_M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT120_M,
-        e.DCMO_PAIDAMOUNTAFTDUEDATG120_M,
-        e.DCMO_PAIDNINVBEFDUEDATE_M,
-        e.DCMO_PAIDNINVAFTDUEDATE30_M,
-        e.DCMO_PAIDNINVAFTDUEDATE60_M,
-        e.DCMO_PAIDNINVAFTDUEDATE90_M,
-        e.DCMO_PAIDNINVAFTDUEDATE120_M,
-        e.DCMO_PAIDNINVAFTDUEDATEG120_M,
-        e.DCMO_TOTASALESDEBTNOTES_M,
-        e.DCMO_TOTNDEBTNOTES_M,
-        e.DCMO_TOTASALESCREDNOTES_M,
-        e.DCMO_TOTNCREDNOTES_M,
-        e.DCMO_AVGBALANCEOUTSTANDING_M,
-        e.DCMO_BALANCEHI_M,
-        e.DCMO_NDUNNINGLETTERS_M,
-        e.DCMO_BALANCELO_M,
-        e.DCMO_BALANCE_M,
-        e.DCMO_NINVOICESOUTSTANDING_M,
-        e.DCMO_PAIDAMOUNTDISPUTES_M,
-        e.DCMO_PAIDAMOUNTPARTIALPAYM_M,
-        e.DCMO_PAIDAMOUNT_M1,
-        e.DCMO_PAIDAMOUNTINVDATE_M1,
-        e.DCMO_PAIDAMOUNTDUEDATE_M1,
-        e.DCMO_PAIDAMOUNTBEFOREDUEDATE_M1,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT30_M1,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT60_M1,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT90_M1,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT120_M1,
-        e.DCMO_PAIDAMOUNTAFTDUEDATG120_M1,
-        e.DCMO_PAIDNINVBEFDUEDATE_M1,
-        e.DCMO_PAIDNINVAFTDUEDATE30_M1,
-        e.DCMO_PAIDNINVAFTDUEDATE60_M1,
-        e.DCMO_PAIDNINVAFTDUEDATE90_M1,
-        e.DCMO_PAIDNINVAFTDUEDATE120_M1,
-        e.DCMO_PAIDNINVAFTDUEDATEG120_M1,
-        e.DCMO_TOTASALESDEBTNOTES_M1,
-        e.DCMO_TOTNDEBTNOTES_M1,
-        e.DCMO_TOTASALESCREDNOTES_M1,
-        e.DCMO_TOTNCREDNOTES_M1,
-        e.DCMO_AVGBALANCEOUTSTANDING_M1,
-        e.DCMO_BALANCEHI_M1,
-        e.DCMO_NDUNNINGLETTERS_M1,
-        e.DCMO_BALANCELO_M1,
-        e.DCMO_BALANCE_M1,
-        e.DCMO_NINVOICESOUTSTANDING_M1,
-        e.DCMO_PAIDAMOUNTDISPUTES_M1,
-        e.DCMO_PAIDAMOUNTPARTIALPAYM_M1,
-        e.DCMO_PAIDAMOUNT_M2,
-        e.DCMO_PAIDAMOUNTINVDATE_M2,
-        e.DCMO_PAIDAMOUNTDUEDATE_M2,
-        e.DCMO_PAIDAMOUNTBEFOREDUEDATE_M2,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT30_M2,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT60_M2,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT90_M2,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT120_M2,
-        e.DCMO_PAIDAMOUNTAFTDUEDATG120_M2,
-        e.DCMO_PAIDNINVBEFDUEDATE_M2,
-        e.DCMO_PAIDNINVAFTDUEDATE30_M2,
-        e.DCMO_PAIDNINVAFTDUEDATE60_M2,
-        e.DCMO_PAIDNINVAFTDUEDATE90_M2,
-        e.DCMO_PAIDNINVAFTDUEDATE120_M2,
-        e.DCMO_PAIDNINVAFTDUEDATEG120_M2,
-        e.DCMO_TOTASALESDEBTNOTES_M2,
-        e.DCMO_TOTNDEBTNOTES_M2,
-        e.DCMO_TOTASALESCREDNOTES_M2,
-        e.DCMO_TOTNCREDNOTES_M2,
-        e.DCMO_AVGBALANCEOUTSTANDING_M2,
-        e.DCMO_BALANCEHI_M2,
-        e.DCMO_NDUNNINGLETTERS_M2,
-        e.DCMO_BALANCELO_M2,
-        e.DCMO_BALANCE_M2,
-        e.DCMO_NINVOICESOUTSTANDING_M2,
-        e.DCMO_PAIDAMOUNTDISPUTES_M2,
-        e.DCMO_PAIDAMOUNTPARTIALPAYM_M2,
-        e.DCMO_PAIDAMOUNT_M3,
-        e.DCMO_PAIDAMOUNTINVDATE_M3,
-        e.DCMO_PAIDAMOUNTDUEDATE_M3,
-        e.DCMO_PAIDAMOUNTBEFOREDUEDATE_M3,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT30_M3,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT60_M3,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT90_M3,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT120_M3,
-        e.DCMO_PAIDAMOUNTAFTDUEDATG120_M3,
-        e.DCMO_PAIDNINVBEFDUEDATE_M3,
-        e.DCMO_PAIDNINVAFTDUEDATE30_M3,
-        e.DCMO_PAIDNINVAFTDUEDATE60_M3,
-        e.DCMO_PAIDNINVAFTDUEDATE90_M3,
-        e.DCMO_PAIDNINVAFTDUEDATE120_M3,
-        e.DCMO_PAIDNINVAFTDUEDATEG120_M3,
-        e.DCMO_TOTASALESDEBTNOTES_M3,
-        e.DCMO_TOTNDEBTNOTES_M3,
-        e.DCMO_TOTASALESCREDNOTES_M3,
-        e.DCMO_TOTNCREDNOTES_M3,
-        e.DCMO_AVGBALANCEOUTSTANDING_M3,
-        e.DCMO_BALANCEHI_M3,
-        e.DCMO_NDUNNINGLETTERS_M3,
-        e.DCMO_BALANCELO_M3,
-        e.DCMO_BALANCE_M3,
-        e.DCMO_NINVOICESOUTSTANDING_M3,
-        e.DCMO_PAIDAMOUNTDISPUTES_M3,
-        e.DCMO_PAIDAMOUNTPARTIALPAYM_M3,
-        e.DCMO_PAIDAMOUNT_M6,
-        e.DCMO_PAIDAMOUNTINVDATE_M6,
-        e.DCMO_PAIDAMOUNTDUEDATE_M6,
-        e.DCMO_PAIDAMOUNTBEFOREDUEDATE_M6,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT30_M6,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT60_M6,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT90_M6,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT120_M6,
-        e.DCMO_PAIDAMOUNTAFTDUEDATG120_M6,
-        e.DCMO_PAIDNINVBEFDUEDATE_M6,
-        e.DCMO_PAIDNINVAFTDUEDATE30_M6,
-        e.DCMO_PAIDNINVAFTDUEDATE60_M6,
-        e.DCMO_PAIDNINVAFTDUEDATE90_M6,
-        e.DCMO_PAIDNINVAFTDUEDATE120_M6,
-        e.DCMO_PAIDNINVAFTDUEDATEG120_M6,
-        e.DCMO_TOTASALESDEBTNOTES_M6,
-        e.DCMO_TOTNDEBTNOTES_M6,
-        e.DCMO_TOTASALESCREDNOTES_M6,
-        e.DCMO_TOTNCREDNOTES_M6,
-        e.DCMO_AVGBALANCEOUTSTANDING_M6,
-        e.DCMO_BALANCEHI_M6,
-        e.DCMO_NDUNNINGLETTERS_M6,
-        e.DCMO_BALANCELO_M6,
-        e.DCMO_BALANCE_M6,
-        e.DCMO_NINVOICESOUTSTANDING_M6,
-        e.DCMO_PAIDAMOUNTDISPUTES_M6,
-        e.DCMO_PAIDAMOUNTPARTIALPAYM_M6,
-        e.DCMO_PAIDAMOUNT_M12,
-        e.DCMO_PAIDAMOUNTINVDATE_M12,
-        e.DCMO_PAIDAMOUNTDUEDATE_M12,
-        e.DCMO_PAIDAMOUNTBEFOREDUEDATE_M12,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT30_M12,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT60_M12,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT90_M12,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT120_M12,
-        e.DCMO_PAIDAMOUNTAFTDUEDATG120_M12,
-        e.DCMO_PAIDNINVBEFDUEDATE_M12,
-        e.DCMO_PAIDNINVAFTDUEDATE30_M12,
-        e.DCMO_PAIDNINVAFTDUEDATE60_M12,
-        e.DCMO_PAIDNINVAFTDUEDATE90_M12,
-        e.DCMO_PAIDNINVAFTDUEDATE120_M12,
-        e.DCMO_PAIDNINVAFTDUEDATEG120_M12,
-        e.DCMO_TOTASALESDEBTNOTES_M12,
-        e.DCMO_TOTNDEBTNOTES_M12,
-        e.DCMO_TOTASALESCREDNOTES_M12,
-        e.DCMO_TOTNCREDNOTES_M12,
-        e.DCMO_AVGBALANCEOUTSTANDING_M12,
-        e.DCMO_BALANCEHI_M12,
-        e.DCMO_NDUNNINGLETTERS_M12,
-        e.DCMO_BALANCELO_M12,
-        e.DCMO_BALANCE_M12,
-        e.DCMO_NINVOICESOUTSTANDING_M12,
-        e.DCMO_PAIDAMOUNTDISPUTES_M12,
-        e.DCMO_PAIDAMOUNTPARTIALPAYM_M12,
-        e.DCMO_PAIDAMOUNT_D1_3M,
-        e.DCMO_PAIDAMOUNT_D2_3M,
-        e.DCMO_PAIDAMOUNT_D1_6M,
-        e.DCMO_PAIDAMOUNT_D2_6M,
-        e.DCMO_PAIDAMOUNTINVDATE_D1_3M,
-        e.DCMO_PAIDAMOUNTINVDATE_D2_3M,
-        e.DCMO_PAIDAMOUNTINVDATE_D1_6M,
-        e.DCMO_PAIDAMOUNTINVDATE_D2_6M,
-        e.DCMO_PAIDAMOUNTDUEDATE_D1_3M,
-        e.DCMO_PAIDAMOUNTDUEDATE_D2_3M,
-        e.DCMO_PAIDAMOUNTDUEDATE_D1_6M,
-        e.DCMO_PAIDAMOUNTDUEDATE_D2_6M,
-        e.DCMO_PAIDAMOUNTBEFOREDUEDATE_D1_3M,
-        e.DCMO_PAIDAMOUNTBEFOREDUEDATE_D2_3M,
-        e.DCMO_PAIDAMOUNTBEFOREDUEDATE_D1_6M,
-        e.DCMO_PAIDAMOUNTBEFOREDUEDATE_D2_6M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT30_D1_3M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT30_D2_3M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT30_D1_6M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT30_D2_6M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT60_D1_3M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT60_D2_3M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT60_D1_6M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT60_D2_6M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT90_D1_3M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT90_D2_3M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT90_D1_6M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT90_D2_6M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT120_D1_3M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT120_D2_3M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT120_D1_6M,
-        e.DCMO_PAIDAMOUNTAFTDUEDAT120_D2_6M,
-        e.DCMO_PAIDAMOUNTAFTDUEDATG120_D1_3M,
-        e.DCMO_PAIDAMOUNTAFTDUEDATG120_D2_3M,
-        e.DCMO_PAIDAMOUNTAFTDUEDATG120_D1_6M,
-        e.DCMO_PAIDAMOUNTAFTDUEDATG120_D2_6M,
-        e.DCMO_PAIDNINVBEFDUEDATE_D1_3M,
-        e.DCMO_PAIDNINVBEFDUEDATE_D2_3M,
-        e.DCMO_PAIDNINVBEFDUEDATE_D1_6M,
-        e.DCMO_PAIDNINVBEFDUEDATE_D2_6M,
-        e.DCMO_PAIDNINVAFTDUEDATE30_D1_3M,
-        e.DCMO_PAIDNINVAFTDUEDATE30_D2_3M,
-        e.DCMO_PAIDNINVAFTDUEDATE30_D1_6M,
-        e.DCMO_PAIDNINVAFTDUEDATE30_D2_6M,
-        e.DCMO_PAIDNINVAFTDUEDATE60_D1_3M,
-        e.DCMO_PAIDNINVAFTDUEDATE60_D2_3M,
-        e.DCMO_PAIDNINVAFTDUEDATE60_D1_6M,
-        e.DCMO_PAIDNINVAFTDUEDATE60_D2_6M,
-        e.DCMO_PAIDNINVAFTDUEDATE90_D1_3M,
-        e.DCMO_PAIDNINVAFTDUEDATE90_D2_3M,
-        e.DCMO_PAIDNINVAFTDUEDATE90_D1_6M,
-        e.DCMO_PAIDNINVAFTDUEDATE90_D2_6M,
-        e.DCMO_PAIDNINVAFTDUEDATE120_D1_3M,
-        e.DCMO_PAIDNINVAFTDUEDATE120_D2_3M,
-        e.DCMO_PAIDNINVAFTDUEDATE120_D1_6M,
-        e.DCMO_PAIDNINVAFTDUEDATE120_D2_6M,
-        e.DCMO_PAIDNINVAFTDUEDATEG120_D1_3M,
-        e.DCMO_PAIDNINVAFTDUEDATEG120_D2_3M,
-        e.DCMO_PAIDNINVAFTDUEDATEG120_D1_6M,
-        e.DCMO_PAIDNINVAFTDUEDATEG120_D2_6M,
-        e.DCMO_TOTASALESDEBTNOTES_D1_3M,
-        e.DCMO_TOTASALESDEBTNOTES_D2_3M,
-        e.DCMO_TOTASALESDEBTNOTES_D1_6M,
-        e.DCMO_TOTASALESDEBTNOTES_D2_6M,
-        e.DCMO_TOTNDEBTNOTES_D1_3M,
-        e.DCMO_TOTNDEBTNOTES_D2_3M,
-        e.DCMO_TOTNDEBTNOTES_D1_6M,
-        e.DCMO_TOTNDEBTNOTES_D2_6M,
-        e.DCMO_TOTASALESCREDNOTES_D1_3M,
-        e.DCMO_TOTASALESCREDNOTES_D2_3M,
-        e.DCMO_TOTASALESCREDNOTES_D1_6M,
-        e.DCMO_TOTASALESCREDNOTES_D2_6M,
-        e.DCMO_TOTNCREDNOTES_D1_3M,
-        e.DCMO_TOTNCREDNOTES_D2_3M,
-        e.DCMO_TOTNCREDNOTES_D1_6M,
-        e.DCMO_TOTNCREDNOTES_D2_6M,
-        e.DCMO_AVGBALANCEOUTSTANDING_D1_3M,
-        e.DCMO_AVGBALANCEOUTSTANDING_D2_3M,
-        e.DCMO_AVGBALANCEOUTSTANDING_D1_6M,
-        e.DCMO_AVGBALANCEOUTSTANDING_D2_6M,
-        e.DCMO_BALANCEHI_D1_3M,
-        e.DCMO_BALANCEHI_D2_3M,
-        e.DCMO_BALANCEHI_D1_6M,
-        e.DCMO_BALANCEHI_D2_6M,
-        e.DCMO_NDUNNINGLETTERS_D1_3M,
-        e.DCMO_NDUNNINGLETTERS_D2_3M,
-        e.DCMO_NDUNNINGLETTERS_D1_6M,
-        e.DCMO_NDUNNINGLETTERS_D2_6M,
-        e.DCMO_BALANCELO_D1_3M,
-        e.DCMO_BALANCELO_D2_3M,
-        e.DCMO_BALANCELO_D1_6M,
-        e.DCMO_BALANCELO_D2_6M,
-        e.DCMO_BALANCE_D1_3M,
-        e.DCMO_BALANCE_D2_3M,
-        e.DCMO_BALANCE_D1_6M,
-        e.DCMO_BALANCE_D2_6M,
-        e.DCMO_NINVOICESOUTSTANDING_D1_3M,
-        e.DCMO_NINVOICESOUTSTANDING_D2_3M,
-        e.DCMO_NINVOICESOUTSTANDING_D1_6M,
-        e.DCMO_NINVOICESOUTSTANDING_D2_6M,
-        e.DCMO_PAIDAMOUNTDISPUTES_D1_3M,
-        e.DCMO_PAIDAMOUNTDISPUTES_D2_3M,
-        e.DCMO_PAIDAMOUNTDISPUTES_D1_6M,
-        e.DCMO_PAIDAMOUNTDISPUTES_D2_6M,
-        e.DCMO_PAIDAMOUNTPARTIALPAYM_D1_3M,
-        e.DCMO_PAIDAMOUNTPARTIALPAYM_D2_3M,
-        e.DCMO_PAIDAMOUNTPARTIALPAYM_D1_6M,
-        e.DCMO_PAIDAMOUNTPARTIALPAYM_D2_6M,
-    
-        -- tutaj sumy z na koniec ostatniego miesiąca plus to co w tym miesiącu do dani:
-        IFNULL(e.DCMO_PAIDAMOUNT_M,0) + IFNULL(SUMA_ZAPLACONE,0) DCMO_PAIDAMOUNT_NOW,
-        IFNULL(e.DCMO_PAIDAMOUNTINVDATE_M,0) + IFNULL(SUMA_RAZY_CZAS_ZAPLACONE,0) DCMO_PAIDAMOUNTINVDATE_NOW,
-        IFNULL(e.DCMO_PAIDAMOUNTDUEDATE_M,0) + IFNULL(SUMA_PO_TERMINIE,0) DCMO_PAIDAMOUNTDUEDAT_NOW,
-        IFNULL(e.DCMO_PAIDAMOUNTBEFOREDUEDATE_M,0) + IFNULL(SUMA_PO_TERMINIE,0) DCMO_PAIDAMOUNTBEFOREDUEDATE_NOW,
-        
-        -- Dane z summary_client_days_tab
-        s.SUMA_RAZY_CZAS_ZAPLACONE,
-        s.SUMA_ZAPLACONE,
-        s.LICZNIK_ZAPLACONE,
-        s.SUMA_PRZED_TERMINEM,
-        s.LICZNIK_PRZED_TERMINEM,
-        s.SUMA_PO_TERMINIE,
-        s.LICZNIK_PO_TERMINIE,
-        s.SUMA_WYSTAWIONYCH,
-        s.LICZNIK_WYSTAWIONYCH,
-        
-        -- Dane z statystyki_faktur
-        F7_11_AVG_DNI_DO_ZAPLATY,
-        F7_11_STDEV_DNI_DO_ZAPLATY,
-        F7_11_AVG_DNI_OPOZNIENIA,
-        F7_11_STDEV_DNI_OPOZNIENIA,
-        F7_11_SUM_INVO_AINITIALH,
-        F7_11_AVG_INVO_AINITIALH,
-        F7_11_STDEV_INVO_AINITIALH,
-        F7_11_ILE_FAKTUR,
-        F7_10_AVG_DNI_DO_ZAPLATY,
-        F7_10_STDEV_DNI_DO_ZAPLATY,
-        F7_10_AVG_DNI_OPOZNIENIA,
-        F7_10_STDEV_DNI_OPOZNIENIA,
-        F7_10_SUM_INVO_AINITIALH,
-        F7_10_AVG_INVO_AINITIALH,
-        F7_10_STDEV_INVO_AINITIALH,
-        F7_10_ILE_FAKTUR,
-        F7_00_AVG_DNI_DO_ZAPLATY,
-        F7_00_STDEV_DNI_DO_ZAPLATY,
-        F7_00_AVG_DNI_OPOZNIENIA,
-        F7_00_STDEV_DNI_OPOZNIENIA,
-        F7_00_SUM_INVO_AINITIALH,
-        F7_00_AVG_INVO_AINITIALH,
-        F7_00_STDEV_INVO_AINITIALH,
-        F7_00_ILE_FAKTUR,
-        F7_01_AVG_DNI_DO_ZAPLATY,
-        F7_01_STDEV_DNI_DO_ZAPLATY,
-        F7_01_AVG_DNI_OPOZNIENIA,
-        F7_01_STDEV_DNI_OPOZNIENIA,
-        F7_01_SUM_INVO_AINITIALH,
-        F7_01_AVG_INVO_AINITIALH,
-        F7_01_STDEV_INVO_AINITIALH,
-        F7_01_ILE_FAKTUR,
-        F7_99_AVG_DNI_DO_ZAPLATY,
-        F7_99_STDEV_DNI_DO_ZAPLATY,
-        F7_99_AVG_DNI_OPOZNIENIA,
-        F7_99_STDEV_DNI_OPOZNIENIA,
-        F7_99_SUM_INVO_AINITIALH,
-        F7_99_AVG_INVO_AINITIALH,
-        F7_99_STDEV_INVO_AINITIALH,
-        F7_99_ILE_FAKTUR,
-        F14_11_AVG_DNI_DO_ZAPLATY,
-        F14_11_STDEV_DNI_DO_ZAPLATY,
-        F14_11_AVG_DNI_OPOZNIENIA,
-        F14_11_STDEV_DNI_OPOZNIENIA,
-        F14_11_SUM_INVO_AINITIALH,
-        F14_11_AVG_INVO_AINITIALH,
-        F14_11_STDEV_INVO_AINITIALH,
-        F14_11_ILE_FAKTUR,
-        F14_10_AVG_DNI_DO_ZAPLATY,
-        F14_10_STDEV_DNI_DO_ZAPLATY,
-        F14_10_AVG_DNI_OPOZNIENIA,
-        F14_10_STDEV_DNI_OPOZNIENIA,
-        F14_10_SUM_INVO_AINITIALH,
-        F14_10_AVG_INVO_AINITIALH,
-        F14_10_STDEV_INVO_AINITIALH,
-        F14_10_ILE_FAKTUR,
-        F14_00_AVG_DNI_DO_ZAPLATY,
-        F14_00_STDEV_DNI_DO_ZAPLATY,
-        F14_00_AVG_DNI_OPOZNIENIA,
-        F14_00_STDEV_DNI_OPOZNIENIA,
-        F14_00_SUM_INVO_AINITIALH,
-        F14_00_AVG_INVO_AINITIALH,
-        F14_00_STDEV_INVO_AINITIALH,
-        F14_00_ILE_FAKTUR,
-        F14_01_AVG_DNI_DO_ZAPLATY,
-        F14_01_STDEV_DNI_DO_ZAPLATY,
-        F14_01_AVG_DNI_OPOZNIENIA,
-        F14_01_STDEV_DNI_OPOZNIENIA,
-        F14_01_SUM_INVO_AINITIALH,
-        F14_01_AVG_INVO_AINITIALH,
-        F14_01_STDEV_INVO_AINITIALH,
-        F14_01_ILE_FAKTUR,
-        F14_99_AVG_DNI_DO_ZAPLATY,
-        F14_99_STDEV_DNI_DO_ZAPLATY,
-        F14_99_AVG_DNI_OPOZNIENIA,
-        F14_99_STDEV_DNI_OPOZNIENIA,
-        F14_99_SUM_INVO_AINITIALH,
-        F14_99_AVG_INVO_AINITIALH,
-        F14_99_STDEV_INVO_AINITIALH,
-        F14_99_ILE_FAKTUR,
-        F30_11_AVG_DNI_DO_ZAPLATY,
-        F30_11_STDEV_DNI_DO_ZAPLATY,
-        F30_11_AVG_DNI_OPOZNIENIA,
-        F30_11_STDEV_DNI_OPOZNIENIA,
-        F30_11_SUM_INVO_AINITIALH,
-        F30_11_AVG_INVO_AINITIALH,
-        F30_11_STDEV_INVO_AINITIALH,
-        F30_11_ILE_FAKTUR,
-        F30_10_AVG_DNI_DO_ZAPLATY,
-        F30_10_STDEV_DNI_DO_ZAPLATY,
-        F30_10_AVG_DNI_OPOZNIENIA,
-        F30_10_STDEV_DNI_OPOZNIENIA,
-        F30_10_SUM_INVO_AINITIALH,
-        F30_10_AVG_INVO_AINITIALH,
-        F30_10_STDEV_INVO_AINITIALH,
-        F30_10_ILE_FAKTUR,
-        F30_00_AVG_DNI_DO_ZAPLATY,
-        F30_00_STDEV_DNI_DO_ZAPLATY,
-        F30_00_AVG_DNI_OPOZNIENIA,
-        F30_00_STDEV_DNI_OPOZNIENIA,
-        F30_00_SUM_INVO_AINITIALH,
-        F30_00_AVG_INVO_AINITIALH,
-        F30_00_STDEV_INVO_AINITIALH,
-        F30_00_ILE_FAKTUR,
-        F30_01_AVG_DNI_DO_ZAPLATY,
-        F30_01_STDEV_DNI_DO_ZAPLATY,
-        F30_01_AVG_DNI_OPOZNIENIA,
-        F30_01_STDEV_DNI_OPOZNIENIA,
-        F30_01_SUM_INVO_AINITIALH,
-        F30_01_AVG_INVO_AINITIALH,
-        F30_01_STDEV_INVO_AINITIALH,
-        F30_01_ILE_FAKTUR,
-        F30_99_AVG_DNI_DO_ZAPLATY,
-        F30_99_STDEV_DNI_DO_ZAPLATY,
-        F30_99_AVG_DNI_OPOZNIENIA,
-        F30_99_STDEV_DNI_OPOZNIENIA,
-        F30_99_SUM_INVO_AINITIALH,
-        F30_99_AVG_INVO_AINITIALH,
-        F30_99_STDEV_INVO_AINITIALH,
-        F30_99_ILE_FAKTUR,
-        F60_11_AVG_DNI_DO_ZAPLATY,
-        F60_11_STDEV_DNI_DO_ZAPLATY,
-        F60_11_AVG_DNI_OPOZNIENIA,
-        F60_11_STDEV_DNI_OPOZNIENIA,
-        F60_11_SUM_INVO_AINITIALH,
-        F60_11_AVG_INVO_AINITIALH,
-        F60_11_STDEV_INVO_AINITIALH,
-        F60_11_ILE_FAKTUR,
-        F60_10_AVG_DNI_DO_ZAPLATY,
-        F60_10_STDEV_DNI_DO_ZAPLATY,
-        F60_10_AVG_DNI_OPOZNIENIA,
-        F60_10_STDEV_DNI_OPOZNIENIA,
-        F60_10_SUM_INVO_AINITIALH,
-        F60_10_AVG_INVO_AINITIALH,
-        F60_10_STDEV_INVO_AINITIALH,
-        F60_10_ILE_FAKTUR,
-        F60_00_AVG_DNI_DO_ZAPLATY,
-        F60_00_STDEV_DNI_DO_ZAPLATY,
-        F60_00_AVG_DNI_OPOZNIENIA,
-        F60_00_STDEV_DNI_OPOZNIENIA,
-        F60_00_SUM_INVO_AINITIALH,
-        F60_00_AVG_INVO_AINITIALH,
-        F60_00_STDEV_INVO_AINITIALH,
-        F60_00_ILE_FAKTUR,
-        F60_01_AVG_DNI_DO_ZAPLATY,
-        F60_01_STDEV_DNI_DO_ZAPLATY,
-        F60_01_AVG_DNI_OPOZNIENIA,
-        F60_01_STDEV_DNI_OPOZNIENIA,
-        F60_01_SUM_INVO_AINITIALH,
-        F60_01_AVG_INVO_AINITIALH,
-        F60_01_STDEV_INVO_AINITIALH,
-        F60_01_ILE_FAKTUR,
-        F60_99_AVG_DNI_DO_ZAPLATY,
-        F60_99_STDEV_DNI_DO_ZAPLATY,
-        F60_99_AVG_DNI_OPOZNIENIA,
-        F60_99_STDEV_DNI_OPOZNIENIA,
-        F60_99_SUM_INVO_AINITIALH,
-        F60_99_AVG_INVO_AINITIALH,
-        F60_99_STDEV_INVO_AINITIALH,
-        F60_99_ILE_FAKTUR,
-        F90_11_AVG_DNI_DO_ZAPLATY,
-        F90_11_STDEV_DNI_DO_ZAPLATY,
-        F90_11_AVG_DNI_OPOZNIENIA,
-        F90_11_STDEV_DNI_OPOZNIENIA,
-        F90_11_SUM_INVO_AINITIALH,
-        F90_11_AVG_INVO_AINITIALH,
-        F90_11_STDEV_INVO_AINITIALH,
-        F90_11_ILE_FAKTUR,
-        F90_10_AVG_DNI_DO_ZAPLATY,
-        F90_10_STDEV_DNI_DO_ZAPLATY,
-        F90_10_AVG_DNI_OPOZNIENIA,
-        F90_10_STDEV_DNI_OPOZNIENIA,
-        F90_10_SUM_INVO_AINITIALH,
-        F90_10_AVG_INVO_AINITIALH,
-        F90_10_STDEV_INVO_AINITIALH,
-        F90_10_ILE_FAKTUR,
-        F90_00_AVG_DNI_DO_ZAPLATY,
-        F90_00_STDEV_DNI_DO_ZAPLATY,
-        F90_00_AVG_DNI_OPOZNIENIA,
-        F90_00_STDEV_DNI_OPOZNIENIA,
-        F90_00_SUM_INVO_AINITIALH,
-        F90_00_AVG_INVO_AINITIALH,
-        F90_00_STDEV_INVO_AINITIALH,
-        F90_00_ILE_FAKTUR,
-        F90_01_AVG_DNI_DO_ZAPLATY,
-        F90_01_STDEV_DNI_DO_ZAPLATY,
-        F90_01_AVG_DNI_OPOZNIENIA,
-        F90_01_STDEV_DNI_OPOZNIENIA,
-        F90_01_SUM_INVO_AINITIALH,
-        F90_01_AVG_INVO_AINITIALH,
-        F90_01_STDEV_INVO_AINITIALH,
-        F90_01_ILE_FAKTUR,
-        F90_99_AVG_DNI_DO_ZAPLATY,
-        F90_99_STDEV_DNI_DO_ZAPLATY,
-        F90_99_AVG_DNI_OPOZNIENIA,
-        F90_99_STDEV_DNI_OPOZNIENIA,
-        F90_99_SUM_INVO_AINITIALH,
-        F90_99_AVG_INVO_AINITIALH,
-        F90_99_STDEV_INVO_AINITIALH,
-        F90_99_ILE_FAKTUR,
-        F365_11_AVG_DNI_DO_ZAPLATY,
-        F365_11_STDEV_DNI_DO_ZAPLATY,
-        F365_11_AVG_DNI_OPOZNIENIA,
-        F365_11_STDEV_DNI_OPOZNIENIA,
-        F365_11_SUM_INVO_AINITIALH,
-        F365_11_AVG_INVO_AINITIALH,
-        F365_11_STDEV_INVO_AINITIALH,
-        F365_11_ILE_FAKTUR,
-        F365_10_AVG_DNI_DO_ZAPLATY,
-        F365_10_STDEV_DNI_DO_ZAPLATY,
-        F365_10_AVG_DNI_OPOZNIENIA,
-        F365_10_STDEV_DNI_OPOZNIENIA,
-        F365_10_SUM_INVO_AINITIALH,
-        F365_10_AVG_INVO_AINITIALH,
-        F365_10_STDEV_INVO_AINITIALH,
-        F365_10_ILE_FAKTUR,
-        F365_00_AVG_DNI_DO_ZAPLATY,
-        F365_00_STDEV_DNI_DO_ZAPLATY,
-        F365_00_AVG_DNI_OPOZNIENIA,
-        F365_00_STDEV_DNI_OPOZNIENIA,
-        F365_00_SUM_INVO_AINITIALH,
-        F365_00_AVG_INVO_AINITIALH,
-        F365_00_STDEV_INVO_AINITIALH,
-        F365_00_ILE_FAKTUR,
-        F365_01_AVG_DNI_DO_ZAPLATY,
-        F365_01_STDEV_DNI_DO_ZAPLATY,
-        F365_01_AVG_DNI_OPOZNIENIA,
-        F365_01_STDEV_DNI_OPOZNIENIA,
-        F365_01_SUM_INVO_AINITIALH,
-        F365_01_AVG_INVO_AINITIALH,
-        F365_01_STDEV_INVO_AINITIALH,
-        F365_01_ILE_FAKTUR,
-        F365_99_AVG_DNI_DO_ZAPLATY,
-        F365_99_STDEV_DNI_DO_ZAPLATY,
-        F365_99_AVG_DNI_OPOZNIENIA,
-        F365_99_STDEV_DNI_OPOZNIENIA,
-        F365_99_SUM_INVO_AINITIALH,
-        F365_99_AVG_INVO_AINITIALH,
-        F365_99_STDEV_INVO_AINITIALH,
-        F365_99_ILE_FAKTUR        
-    FROM 
-        group_cust_inv_days g
-        left join invo i
-    on 
-        g.INVO_NO = i.INVO_NO
-        AND g.INVO_CLNTNO = i.INVO_CLNTNO
-        AND g.INVO_ADMNO = i.INVO_ADMNO 
-        AND (i.INVO_DEBH_NO = g.INVO_DEBH_NO AND i.INVO_DEBC_NO = g.INVO_DEBC_NO)
-        
-    LEFT JOIN (
-        SELECT 
-            c1.*, ROWID AS rid
-        FROM INVO_CLHS_JOINED_TAB c1
-    ) c
-    ON c.rid = (
-            SELECT rid
-            FROM (
-                SELECT ROWID AS rid
-                FROM INVO_CLHS_JOINED_TAB c2
-                WHERE 
-                       c2.INVO_NO = g.INVO_NO
-                   AND c2.INVO_CLNTNO = g.INVO_CLNTNO
-                   AND c2.INVO_ADMNO = g.INVO_ADMNO
-                   AND c2.INVO_DEBH_NO = g.INVO_DEBH_NO
-                   AND c2.INVO_DEBC_NO = g.INVO_DEBC_NO
-                   AND c2.CLHS_CHANGED_DATETIME <= g.DZIEN
-                ORDER BY c2.CLHS_CHANGED_DATETIME DESC, RANDOM()
-                LIMIT 1
-            ) x
-        )
-      
-    LEFT JOIN extended_grouped_client_days_tab e
-    ON 
-        g.INVO_ADMNO = e.INVO_ADMNO
-        AND g.INVO_CLNTNO = e.INVO_CLNTNO
-        AND g.INVO_DEBH_NO = e.INVO_DEBH_NO
-        AND (e.INVO_DEBH_NO = g.INVO_DEBH_NO AND e.INVO_DEBC_NO = g.INVO_DEBC_NO)
-        AND DATE(g.DZIEN) = DATE(e.DZIEN)
-    
-    -- Dołączenie danych z summary_client_days_tab
-    LEFT JOIN summary_client_days_tab s
-    ON 
-        g.INVO_CLNTNO = s.INVO_CLNTNO
-        AND g.INVO_DEBH_NO = s.INVO_DEBH_NO
-        AND (s.INVO_DEBH_NO = g.INVO_DEBH_NO AND s.INVO_DEBC_NO = g.INVO_DEBC_NO)
-        AND DATE(g.DZIEN) = DATE(s.DZIEN)
-    
-    -- Dołączenie danych z statystyki_faktur
-    LEFT JOIN (
-    {stats_pivot_select}
-    ) pivot 
-
-
-
-i błąd:
-Proces zakończony.
 Rozpoczynam partiami wstawianie do 'summary_client_days_tab'...
 Ostatnio wstawiony miesiąc: ROK=2026, MIESIAC=6
 Wszystkie partie zostały zaimportowane. Łącznie wstawiono (teraz) = 0.
-11:25:50
-[2026-04-15 11:30:00.007148] Inserted rows so far: 51545
-[2026-04-15 11:30:00.007148] Remaining rows to insert: -25225
-[2026-04-15 11:30:00.007148] Last row in statystyki_faktur: [('1', '13581', '27939', '529572', Timestamp('2026-02-23 00:00:00'), 'zapłacone_przed_terminem', 60.07843137254902, 1.507887757824195, -0.5098039215686274, 1.3619478553837197, 732322.64, 14359.267450980393, 5243.565681153557, 51, 90, Timestamp('2026-04-15 11:30:00'))]
-Statystyki faktur zostały obliczone i zapisane.
-11:30:21
-Zakres dat w widoku: 2025-01-27 - 2026-06-27
-Traceback (most recent call last):
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\build_client_db.py", line 67, in <module>
-    main()
-    ~~~~^^
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\build_client_db.py", line 60, in main
-    CreateDatabase.CreateDatabase(
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
-        config["first_model_params"],
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        t0,
-        ^^^
-        create_db_from_one_excel=True
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\CreateDatabase.py", line 1366, in CreateDatabase
-    cursor.execute(
-    ~~~~~~~~~~~~~~^
-        query_batch_insert,
-        ^^^^^^^^^^^^^^^^^^^
-    ...<7 lines>...
-        )
-        ^
-    )
-    ^
-sqlite3.ProgrammingError: Incorrect number of bindings supplied. The current statement uses 3, and there are 6 supplied.
 
-przeanlizuj powyższy fragment kodu po zmianach i powyższy fragment configu oraz błąd, zastanów się z czego wynika i jak go rozwiażać, podaj poprawki oraz zastanów się czy wszystko inne już jest ok.
+To jest błąd logiki.
+
+Dlaczego
+
+W aktualnym kodzie robisz:
+	1.	odczytujesz last_row z summary_client_days_tab
+	2.	potem robisz:
+
+DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?
+
+
+	3.	ale dalej nadal używasz starego last_inserted_year/month
+	4.	więc wszystko uznajesz za „już było” i nic nie wstawiasz
+
+To trzeba uprościć
+
+Skoro teraz przebudowujesz dane klienta od zera, to nie potrzebujesz już logiki “kontynuuj od ostatniego miesiąca”.
+
+Zrób tak:
+	•	usuń cały blok z last_row
+	•	usuń porównywanie last_val / cur_val
+	•	najpierw wyczyść klienta
+	•	potem wstaw wszystkie miesiące od nowa
+
+Czyli zamiast tego:
+
+cursor.execute("""
+    SELECT ROK, MIESIAC
+    FROM summary_client_days_tab
+    WHERE INVO_CLNTNO = ?
+    ORDER BY ROK DESC, MIESIAC DESC
+    LIMIT 1
+""", (client_id,))
+last_row = cursor.fetchone()
+...
+cursor.execute("DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
+...
+if cur_val <= last_val:
+    continue
+
+zrób po prostu:
+
+cursor.execute("DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
+conn.commit()
+
+cursor.execute("""
+    SELECT DISTINCT ROK, MIESIAC
+    FROM extended_grouped_client_days
+    WHERE INVO_CLNTNO = ?
+    ORDER BY ROK, MIESIAC
+""", (client_id,))
+all_rows = cursor.fetchall()
+
+inserted_count = 0
+
+for (year, month) in all_rows:
+    insert_sql = """
+        INSERT INTO summary_client_days_tab
+        SELECT *
+        FROM summary_client_days_view
+        WHERE ROK = ?
+          AND MIESIAC = ?
+          AND INVO_CLNTNO = ?
+    """
+    cursor.execute(insert_sql, (year, month, client_id))
+    conn.commit()
+
+    row_count = cursor.rowcount if cursor.rowcount != -1 else 0
+    inserted_count += row_count
+    print(f"Wstawiono ROK={year}, MIESIAC={month} -> {row_count} wierszy (narastająco={inserted_count})")
+
+To jest dużo bardziej zgodne z nową logiką „delete + refill”.
+
+⸻
+
+Trzeci problem: masz jeszcze trochę SQL-i jako f-stringi
+
+Na przykład:
+
+query_invo = f"""
+SELECT ...
+FROM invo_view
+WHERE INVO_INVDATE IS NOT NULL
+and date(INVO_INVDATE) >= {params['od_dnia']}
+AND INVO_CLNTNO = {client_id};
+"""
+
+To powinno być parametryzowane:
+
+query_invo = """
+SELECT 
+    INVO_NO,
+    INVO_ADMNO,
+    INVO_CLNTNO,
+    INVO_DEBH_NO,
+    INVO_DEBC_NO,
+    INVO_INVDATE,
+    INVO_FINALPAYMENTDATE
+FROM invo_view
+WHERE INVO_INVDATE IS NOT NULL
+  AND DATE(INVO_INVDATE) >= DATE(?)
+  AND INVO_CLNTNO = ?
+"""
+cursor.execute(query_invo, (params['od_dnia'], client_id))
+
+Tak samo dla:
+	•	insert do extended_grouped_client_days_tab
+	•	insert do summary_client_days_tab
+	•	wszędzie gdzie dziś wstrzykujesz year, month, client_id jako tekst
+
+To nie jest źródło obecnego błędu, ale warto od razu posprzątać.
+
+⸻
+
+Czwarty problem: insert_aggregated_data_temp
+
+Masz teraz:
+
+INSERT INTO aggregated_data_temp
+
+a opisujesz to jakby ignorowało duplikaty.
+
+Jeśli to ma dopisywać tylko brakujące dni, to musi być:
+
+insert_query = """
+    INSERT OR IGNORE INTO aggregated_data_temp
+    (DZIEN, DZIS_DZIEN_TYG, DZIS_SOBOTA, DZIS_NIEDZIELA)
+    VALUES (?, ?, ?, ?)
+"""
+
+i tabela musi mieć unikalność po DZIEN.
+
+⸻
+
+Co bym poprawił teraz krok po kroku
+
+Poprawka 1 — config query_dataset_raw_select
+
+Dodaj brakujący zewnętrzny filtr i pełny join do pivota.
+
+Poprawka 2 — zostaw 6 parametrów w cursor.execute(...)
+
+ale dopiero po poprawce configa.
+
+Poprawka 3 — uprość summary_client_days_tab
+
+usuń logikę „last inserted month”, bo teraz robisz pełny refill klienta.
+
+Poprawka 4 — parametryzuj SQL zamiast f-stringów
+
+zwłaszcza query_invo i inserty po (year, month, client_id).
+
+⸻
+
+Gotowa poprawka dla problematycznego fragmentu summary
+
+Wklej zamiast obecnego bloku summary_client_days_tab:
+
+print("Rozpoczynam partiami wstawianie do 'summary_client_days_tab'...")
+
+cursor.execute("DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
+conn.commit()
+
+cursor.execute("""
+    SELECT DISTINCT ROK, MIESIAC
+    FROM extended_grouped_client_days
+    WHERE INVO_CLNTNO = ?
+    ORDER BY ROK, MIESIAC
+""", (client_id,))
+all_rows = cursor.fetchall()
+
+inserted_count = 0
+
+for (year, month) in all_rows:
+    insert_sql = """
+        INSERT INTO summary_client_days_tab
+        SELECT *
+        FROM summary_client_days_view
+        WHERE ROK = ?
+          AND MIESIAC = ?
+          AND INVO_CLNTNO = ?
+    """
+    cursor.execute(insert_sql, (year, month, client_id))
+    conn.commit()
+
+    row_count = cursor.rowcount if cursor.rowcount != -1 else 0
+    inserted_count += row_count
+    print(f"Wstawiono ROK={year}, MIESIAC={month} -> {row_count} wierszy (narastająco={inserted_count})")
+
+print(f"Wszystkie partie zostały zaimportowane. Łącznie wstawiono = {inserted_count}.")
+print(datetime.now().strftime("%H:%M:%S"))
+
+
+⸻
+
+Gotowa poprawka dla query_invo
+
+query_invo = """
+SELECT 
+    INVO_NO,
+    INVO_ADMNO,
+    INVO_CLNTNO,
+    INVO_DEBH_NO,
+    INVO_DEBC_NO,
+    INVO_INVDATE,
+    INVO_FINALPAYMENTDATE
+FROM invo_view
+WHERE INVO_INVDATE IS NOT NULL
+  AND DATE(INVO_INVDATE) >= DATE(?)
+  AND INVO_CLNTNO = ?
+"""
+cursor.execute(query_invo, (params['od_dnia'], client_id))
+rows = cursor.fetchall()
+
+
+⸻
+
+Wniosek
+
+Na teraz masz dwa realne błędy:
+	1.	binding mismatch 3 vs 6
+bo query_dataset_raw_select nie ma jeszcze aktywnego zewnętrznego {client_filter}
+	2.	summary_client_days_tab wstawia 0
+bo mieszasz starą logikę incremental z nową logiką delete+refill
+
+To są relikty po starej architekturze i właśnie one teraz wychodzą.
+
+Jeżeli chcesz, w następnym kroku mogę Ci rozpisać już gotowy finalny fragment query_dataset_raw_select końcówki, dokładnie w formie do wklejenia do configa.
