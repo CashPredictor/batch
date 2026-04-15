@@ -1,195 +1,325 @@
-(cpdev50)C:\Users\OE00SG\CashPredictor\dev3\gcp batch>python build_client_db.py ^
-More?   --t0 2026-03-02 ^
-More?   --build-clients 13581,10095,6089,8964,8989 ^
-More?   --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
-Traceback (most recent call last):
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\build_client_db.py", line 4, in <module>
-    import CreateDatabase
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\CreateDatabase.py", line 1304
-    )        min_date, max_date = cursor.fetchone()
-             ^^^^^^^^
-SyntaxError: invalid syntax
+Tak — to jest dokładnie relikt po starym podejściu.
 
-(cpdev50)C:\Users\OE00SG\CashPredictor\dev3\gcp batch>python build_client_db.py ^
-More?   --t0 2026-03-02 ^
-More?   --build-clients 13581,10095,6089,8964,8989 ^
-More?   --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
-Traceback (most recent call last):
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\build_client_db.py", line 4, in <module>
-    import CreateDatabase
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\CreateDatabase.py", line 1304
-    )        min_date, max_date = cursor.fetchone()
-             ^^^^^^^^
-SyntaxError: invalid syntax
+Błąd:
 
-(cpdev50)C:\Users\OE00SG\CashPredictor\dev3\gcp batch>python build_client_db.py ^
-More?   --t0 2026-03-02 ^
-More?   --build-clients 13581,10095,6089,8964,8989 ^
-More?   --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
-Traceback (most recent call last):
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\build_client_db.py", line 4, in <module>
-    import CreateDatabase
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\CreateDatabase.py", line 1304
-    )        min_date, max_date = cursor.fetchone()
-             ^^^^^^^^
-SyntaxError: invalid syntax
-
-(cpdev50)C:\Users\OE00SG\CashPredictor\dev3\gcp batch>python build_client_db.py ^
-More?   --t0 2026-03-02 ^
-More?   --build-clients 13581,10095,6089,8964,8989 ^
-More?   --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
-[INFO] Using client list from CLI: [13581, 10095, 6089, 8964, 8989]
-przed client_ids = df_invo_all['INVO_CLNTNO'].dropna().unique()
-Kolejność przetwarzania (od najmniejszej liczby wierszy INVO):
- 1. klient 13581 → 838 wierszy INVO
- 2. klient 10095 → 1225 wierszy INVO
- 3. klient 6089 → 2424 wierszy INVO
- 4. klient 8964 → 2966 wierszy INVO
- 5. klient 8989 → 3040 wierszy INVO
- 6. klient 9320 → 3695 wierszy INVO
- 7. klient 6558 → 4933 wierszy INVO
- 8. klient 10069 → 33915 wierszy INVO
-[INFO] Finalna lista klientów do przetworzenia: [13581, 10095, 6089, 8964, 8989]
-Kolejność przetwarzania (od najmniejszej liczby wierszy INVO):
- 1. klient 13581 → 838 wierszy INVO
- 2. klient 10095 → 1225 wierszy INVO
- 3. klient 6089 → 2424 wierszy INVO
- 4. klient 8964 → 2966 wierszy INVO
- 5. klient 8989 → 3040 wierszy INVO
- 6. klient 9320 → 3695 wierszy INVO
- 7. klient 6558 → 4933 wierszy INVO
- 8. klient 10069 → 33915 wierszy INVO
-po client_ids = df_invo_all['INVO_CLNTNO'].dropna().unique() order by _counts.sort_values('cnt', ascending=True)['INVO_CLNTNO']
-client_id:  13581
-Traceback (most recent call last):
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\build_client_db.py", line 66, in <module>
-    main()
-    ~~~~^^
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\build_client_db.py", line 59, in main
-    CreateDatabase.CreateDatabase(
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
-        config["first_model_params"],
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        t0,
-        ^^^
-        create_db_from_one_excel=True
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\CreateDatabase.py", line 770, in CreateDatabase
-    validate_required_schema_for_create_database(cursor)
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\CreateDatabase.py", line 85, in validate_required_schema_for_create_database
-    raise RuntimeError(
-    ...<2 lines>...
-    )
-RuntimeError: Baza nie ma pełnego schematu wymaganego przez CreateDatabase; najpierw uruchom DBInit. brak widoków: stats_pivot_view, dataset_raw_view
-
-(cpdev50)C:\Users\OE00SG\CashPredictor\dev3\gcp batch>python build_client_db.py ^
-More?   --t0 2026-03-02 ^
-More?   --build-clients 13581,10095,6089,8964,8989 ^
-More?   --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
-[INFO] Using client list from CLI: [13581, 10095, 6089, 8964, 8989]
-przed client_ids = df_invo_all['INVO_CLNTNO'].dropna().unique()
-Kolejność przetwarzania (od najmniejszej liczby wierszy INVO):
- 1. klient 13581 → 838 wierszy INVO
- 2. klient 10095 → 1225 wierszy INVO
- 3. klient 6089 → 2424 wierszy INVO
- 4. klient 8964 → 2966 wierszy INVO
- 5. klient 8989 → 3040 wierszy INVO
- 6. klient 9320 → 3695 wierszy INVO
- 7. klient 6558 → 4933 wierszy INVO
- 8. klient 10069 → 33915 wierszy INVO
-[INFO] Finalna lista klientów do przetworzenia: [13581, 10095, 6089, 8964, 8989]
-Kolejność przetwarzania (od najmniejszej liczby wierszy INVO):
- 1. klient 13581 → 838 wierszy INVO
- 2. klient 10095 → 1225 wierszy INVO
- 3. klient 6089 → 2424 wierszy INVO
- 4. klient 8964 → 2966 wierszy INVO
- 5. klient 8989 → 3040 wierszy INVO
- 6. klient 9320 → 3695 wierszy INVO
- 7. klient 6558 → 4933 wierszy INVO
- 8. klient 10069 → 33915 wierszy INVO
-po client_ids = df_invo_all['INVO_CLNTNO'].dropna().unique() order by _counts.sort_values('cnt', ascending=True)['INVO_CLNTNO']
-client_id:  13581
-Dane zostały skopiowane z widoku do tabeli 'INVO_CLHS_JOINED_TAB'.
-Operacja zakończona sukcesem.
-Tabela 'group_cust_inv_days' została pomyślnie wypełniona.
-08:57:54
-Rozpoczynam partiami wstawianie do 'extended_grouped_client_days_tab'...
-Wstawiono partię: ROK=2025, MIESIAC=1 (rowcount=5)
-Wstawiono partię: ROK=2025, MIESIAC=2 (rowcount=32)
-Wstawiono partię: ROK=2025, MIESIAC=3 (rowcount=315)
-Wstawiono partię: ROK=2025, MIESIAC=4 (rowcount=444)
-Wstawiono partię: ROK=2025, MIESIAC=5 (rowcount=451)
-Wstawiono partię: ROK=2025, MIESIAC=6 (rowcount=430)
-Wstawiono partię: ROK=2025, MIESIAC=7 (rowcount=445)
-Wstawiono partię: ROK=2025, MIESIAC=8 (rowcount=488)
-Wstawiono partię: ROK=2025, MIESIAC=9 (rowcount=490)
-Wstawiono partię: ROK=2025, MIESIAC=10 (rowcount=658)
-Wstawiono partię: ROK=2025, MIESIAC=11 (rowcount=671)
-Wstawiono partię: ROK=2025, MIESIAC=12 (rowcount=723)
-Wstawiono partię: ROK=2026, MIESIAC=1 (rowcount=716)
-Wstawiono partię: ROK=2026, MIESIAC=2 (rowcount=664)
-Wstawiono partię: ROK=2026, MIESIAC=3 (rowcount=705)
-Wstawiono partię: ROK=2026, MIESIAC=4 (rowcount=660)
-Wstawiono partię: ROK=2026, MIESIAC=5 (rowcount=682)
-Wstawiono partię: ROK=2026, MIESIAC=6 (rowcount=448)
-Wszystkie partie zostały zaimportowane.
-08:57:55
-Proces zakończony.
-Rozpoczynam partiami wstawianie do 'summary_client_days_tab'...
-Tabela summary_client_days_tab jest pusta. Zaczynam od początku.
-08:57:55
-Wstawiono ROK=2025, MIESIAC=1 -> 5 wierszy (narastająco=5)
-Wstawiono ROK=2025, MIESIAC=2 -> 32 wierszy (narastająco=37)
-Wstawiono ROK=2025, MIESIAC=3 -> 315 wierszy (narastająco=352)
-Wstawiono ROK=2025, MIESIAC=4 -> 444 wierszy (narastająco=796)
-Wstawiono ROK=2025, MIESIAC=5 -> 451 wierszy (narastająco=1247)
-Wstawiono ROK=2025, MIESIAC=6 -> 430 wierszy (narastająco=1677)
-Wstawiono ROK=2025, MIESIAC=7 -> 445 wierszy (narastająco=2122)
-Wstawiono ROK=2025, MIESIAC=8 -> 488 wierszy (narastająco=2610)
-Wstawiono ROK=2025, MIESIAC=9 -> 490 wierszy (narastająco=3100)
-Wstawiono ROK=2025, MIESIAC=10 -> 658 wierszy (narastająco=3758)
-Wstawiono ROK=2025, MIESIAC=11 -> 671 wierszy (narastająco=4429)
-Wstawiono ROK=2025, MIESIAC=12 -> 723 wierszy (narastająco=5152)
-Wstawiono ROK=2026, MIESIAC=1 -> 716 wierszy (narastająco=5868)
-Wstawiono ROK=2026, MIESIAC=2 -> 664 wierszy (narastająco=6532)
-Wstawiono ROK=2026, MIESIAC=3 -> 705 wierszy (narastająco=7237)
-Wstawiono ROK=2026, MIESIAC=4 -> 660 wierszy (narastająco=7897)
-Wstawiono ROK=2026, MIESIAC=5 -> 682 wierszy (narastająco=8579)
-Wstawiono ROK=2026, MIESIAC=6 -> 448 wierszy (narastająco=9027)
-Wszystkie partie zostały zaimportowane. Łącznie wstawiono (teraz) = 9027.
-08:57:57
-[2026-04-15 09:00:00.000030] Inserted rows so far: 37997
-[2026-04-15 09:00:00.000030] Remaining rows to insert: -11677
-[2026-04-15 09:00:00.000030] Last row in statystyki_faktur: [('1', '13581', '313534', '529575', Timestamp('2026-02-27 00:00:00'), 'zapłacone_po_terminie', 38.5, 7.7781745930520225, 7.5, 9.192388155425117, 2280.42, 1140.21, 1351.5780436955908, 2, 60, Timestamp('2026-04-15 09:00:00'))]
-Statystyki faktur zostały obliczone i zapisane.
-09:00:58
-Zakres dat w widoku: 2025-01-27 - 2026-06-27
-Traceback (most recent call last):
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\build_client_db.py", line 66, in <module>
-    main()
-    ~~~~^^
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\build_client_db.py", line 59, in main
-    CreateDatabase.CreateDatabase(
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
-        config["first_model_params"],
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-        t0,
-        ^^^
-        create_db_from_one_excel=True
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\CreateDatabase.py", line 1365, in CreateDatabase
-    cursor.execute(
-    ~~~~~~~~~~~~~~^
-        query_batch_insert,
-        ^^^^^^^^^^^^^^^^^^^
-    ...<7 lines>...
-        )
-        ^
-    )
-    ^
 sqlite3.OperationalError: no such table: stats_pivot_view
+
+oznacza, że w momencie budowania dataset_tab nadal gdzieś odwołujesz się do:
+
+stats_pivot_view
+
+czyli do starego widoku shardowego, który wcześniej był dynamicznie DROP/CREATE, a teraz miał zostać zastąpiony przez SQL składany z SELECT.
+
+SQLite przy FROM stats_pivot_view albo JOIN stats_pivot_view potrafi zwrócić komunikat „no such table”, nawet jeśli chodzi o widok.
+
+Co się stało
+
+Doszło do tego miejsca:
+	•	stats_pivot_view i dataset_raw_view przestały być realnymi, stałymi obiektami używanymi w runtime
+	•	zamiast nich miały być:
+	•	query_stats_pivot_select
+	•	query_dataset_raw_select
+	•	ale w jednym z tych SQL-i nadal siedzi odwołanie do starego widoku stats_pivot_view
+
+Czyli nowa logika w Pythonie jest już prawie dobra, ale config albo fragment SQL-a nadal jest częściowo stary.
+
+⸻
+
+Co trzeba poprawić
+
+1. Najważniejsze: popraw query_dataset_raw_select w configu
+
+W tej definicji nie może już być:
+
+LEFT JOIN stats_pivot_view pivot
+
+Zamiast tego ma być wstrzykiwany subquery z placeholdera, czyli coś w tym stylu:
+
+LEFT JOIN (
+{stats_pivot_select}
+) pivot
+
+czyli docelowo w configu query_dataset_raw_select powinno mieć fragment:
+
+query_dataset_raw_select: |
+  SELECT
+      ...
+  FROM group_cust_inv_days g
+  ...
+  LEFT JOIN summary_client_days_tab s
+    ON g.INVO_CLNTNO = s.INVO_CLNTNO
+   AND g.INVO_DEBH_NO = s.INVO_DEBH_NO
+   AND (s.INVO_DEBH_NO = g.INVO_DEBH_NO AND s.INVO_DEBC_NO = g.INVO_DEBC_NO)
+   AND DATE(g.DZIEN) = DATE(s.DZIEN)
+
+  LEFT JOIN (
+  {stats_pivot_select}
+  ) pivot
+    ON g.INVO_ADMNO = pivot.INVO_ADMNO
+   AND g.INVO_CLNTNO = pivot.INVO_CLNTNO
+   AND g.INVO_DEBH_NO = pivot.INVO_DEBH_NO
+   AND (g.INVO_DEBH_NO = pivot.INVO_DEBH_NO AND g.INVO_DEBC_NO = pivot.INVO_DEBC_NO)
+   AND DATE(g.DZIEN) = DATE(pivot.DZIEN)
+
+  WHERE 1=1
+  {client_filter}
+  AND {shard_condition}
+
+Kluczowe jest to:
+
+LEFT JOIN (
+{stats_pivot_select}
+) pivot
+
+a nie:
+
+LEFT JOIN stats_pivot_view pivot
+
+
+⸻
+
+2. query_stats_pivot_select ma być pełnym SELECT-em, bez CREATE VIEW
+
+On powinien zwracać coś w rodzaju:
+
+query_stats_pivot_select: |
+  SELECT
+      g.INVO_ADMNO,
+      g.INVO_CLNTNO,
+      g.INVO_DEBH_NO,
+      g.INVO_DEBC_NO,
+      g.DZIEN,
+      MAX(CASE WHEN ... END) AS ...,
+      ...
+  FROM group_cust_inv_days g
+  LEFT JOIN statystyki_faktur stats_pivot
+    ON ...
+  WHERE 1=1
+  {client_filter}
+  AND {shard_condition}
+  GROUP BY
+      g.INVO_ADMNO,
+      g.INVO_CLNTNO,
+      g.INVO_DEBH_NO,
+      g.INVO_DEBC_NO,
+      g.DZIEN
+
+Czyli:
+	•	bez CREATE VIEW
+	•	bez nazwy widoku
+	•	sam SELECT
+
+⸻
+
+3. validate_required_schema_for_create_database() też masz jeszcze częściowo stare
+
+Skoro runtime już nie używa fizycznych widoków:
+	•	stats_pivot_view
+	•	dataset_raw_view
+
+to nie powinieneś ich dalej wymagać.
+
+Usuń je z:
+
+required_views = [
+    "invo_view",
+    "clhs_view",
+    "DEBC_view",
+    "dcmo_view",
+    "INVO_CLHS_JOINED",
+    "summary_client_days_view",
+    "extended_grouped_client_days",
+    "stats_pivot_view",
+    "dataset_raw_view",
+]
+
+ma zostać:
+
+required_views = [
+    "invo_view",
+    "clhs_view",
+    "DEBC_view",
+    "dcmo_view",
+    "INVO_CLHS_JOINED",
+    "summary_client_days_view",
+    "extended_grouped_client_days",
+]
+
+Bo teraz stats_pivot i dataset_raw są logiką SQL w configu, a nie obiektami schematu.
+
+⸻
+
+4. W DBInit też nie powinieneś już tworzyć tych widoków, jeśli przeszedłeś na selecty
+
+Jeżeli masz jeszcze coś takiego:
+
+exec_sql(conn, params.get("query_create_stats_pivot_view"), "query_create_stats_pivot_view")
+exec_sql(conn, params.get("query_create_dataset_raw_view"), "query_create_dataset_raw_view")
+
+to to jest relikt starej koncepcji.
+
+W nowej logice:
+	•	DBInit tworzy schemat trwały
+	•	CreateDatabase składa wydajne INSERT INTO ... SELECT ...
+
+A więc te 2 linie powinny wylecieć z DBInit, jeżeli faktycznie przeszliście na:
+	•	query_stats_pivot_select
+	•	query_dataset_raw_select
+
+⸻
+
+Dlaczego błąd pojawił się dopiero teraz
+
+Bo dopiero tu weszło w użycie:
+
+dataset_raw_sql = params['query_dataset_raw_select'] \
+    .replace("{stats_pivot_select}", stats_pivot_sql) \
+    .replace("{shard_condition}", shard_condition) \
+    .replace("{client_filter}", client_filter)
+
+I ten SQL po podstawieniu nadal zawiera gdzieś:
+
+stats_pivot_view
+
+więc dopiero przy:
+
+cursor.execute(query_batch_insert, ...)
+
+SQLite próbuje to wykonać i wywala.
+
+⸻
+
+Najbardziej prawdopodobne miejsce błędu
+
+Prawie na pewno w configu masz jeszcze coś w tym stylu:
+
+query_dataset_raw_select: |
+  SELECT ...
+  FROM ...
+  LEFT JOIN stats_pivot_view pivot
+    ON ...
+
+To trzeba zmienić.
+
+⸻
+
+Czy są jeszcze inne relikty?
+
+Tak, są jeszcze 3 miejsca, które wyglądają na relikty albo niedoczyszczone fragmenty.
+
+A. insert_aggregated_data_temp — opis nie zgadza się z kodem
+
+Masz:
+
+print(f"Próbowano wstawić {len(rows_to_insert)} wierszy do aggregated_data_temp (duplikaty pominięte).")
+
+ale używasz:
+
+INSERT INTO aggregated_data_temp
+
+a nie INSERT OR IGNORE.
+
+Jeśli chcesz pomijać duplikaty, zmień na:
+
+insert_query = """
+    INSERT OR IGNORE INTO aggregated_data_temp
+    (DZIEN, DZIS_DZIEN_TYG, DZIS_SOBOTA, DZIS_NIEDZIELA)
+    VALUES (?, ?, ?, ?)
+"""
+
+i zadbaj o unikalność po DZIEN.
+
+⸻
+
+B. grouped_query musi mieć filtr klienta, skoro wywołujesz:
+
+df = pd.read_sql_query(grouped_query, conn, params=(client_id,))
+
+To znaczy, że w configu grouped_query musi zawierać placeholder ?, np.:
+
+grouped_query: |
+  SELECT 
+      g.INVO_ADMNO,
+      g.INVO_CLNTNO,
+      g.INVO_DEBH_NO,
+      g.INVO_DEBC_NO,
+      g.DZIEN,
+      g.MIESIAC,
+      g.ROK
+  FROM group_cust_inv_days g
+  WHERE g.INVO_CLNTNO = ?
+  GROUP BY 
+      g.INVO_ADMNO,
+      g.INVO_CLNTNO,
+      g.INVO_DEBH_NO,
+      g.INVO_DEBC_NO,
+      g.DZIEN,
+      g.MIESIAC,
+      g.ROK
+
+Jeśli tam nie ma ?, to też będzie problem.
+
+⸻
+
+C. query_invo i kilka innych miejsc dalej masz jako f-string z danymi
+
+To nie wywala teraz, ale lepiej przepisać na placeholdery.
+
+⸻
+
+Co konkretnie teraz zrobić
+
+Krok 1
+
+W configu znajdź query_dataset_raw_select i zamień:
+
+LEFT JOIN stats_pivot_view pivot
+
+na:
+
+LEFT JOIN (
+{stats_pivot_select}
+) pivot
+
+Krok 2
+
+Sprawdź, czy query_stats_pivot_select jest czystym SELECT, a nie CREATE VIEW.
+
+Krok 3
+
+W CreateDatabase.py zmień walidację:
+
+required_views = [
+    "invo_view",
+    "clhs_view",
+    "DEBC_view",
+    "dcmo_view",
+    "INVO_CLHS_JOINED",
+    "summary_client_days_view",
+    "extended_grouped_client_days",
+]
+
+Krok 4
+
+W DBInit usuń tworzenie:
+	•	stats_pivot_view
+	•	dataset_raw_view
+
+jeśli już naprawdę przeszliście na selecty.
+
+⸻
+
+Wniosek
+
+To nie jest nowy problem logiczny. To jest dokładnie:
+	•	niedoczyszczony relikt po starej architekturze shardowych widoków,
+	•	który został w configu albo walidacji.
+
+Najpewniej wystarczy poprawić query_dataset_raw_select, bo właśnie ono nadal oczekuje fizycznego stats_pivot_view.
+
+Jeżeli chcesz, mogę Ci teraz od razu rozpisać gotowe, finalne wersje:
+	•	query_stats_pivot_select
+	•	query_dataset_raw_select
+	•	required_views w Pythonie
+
+tak, żebyś mógł wkleić 1:1.
