@@ -1,486 +1,372 @@
-Jesteście już wyraźnie po dwóch ważnych krokach:
-
-1. etap 1 – first_model_only
-2. etap 1.5 – porządkowanie uruchamiania i bazy pod nową logikę wielu klientów
-
-I to już nie jest tylko plan. To jest działający szkielet nowej wersji aplikacji.
-
-Gdzie jesteście teraz
-
-Aktualnie projekt jest już podzielony na trzy główne obszary:
-
-1. Inicjalizacja schematu bazy
-
-To robi teraz db_init.py.
-
-Rola:
-
-* tworzy pustą bazę SQLite,
-* zakłada wszystkie potrzebne tabele,
-* zakłada widoki,
-* zakłada indeksy,
-* zasila dane statyczne (swieta),
-* przygotowuje bazę tak, żeby CreateDatabase.py już tylko ją ładował, a nie budował od zera.
-
-To jest bardzo ważna zmiana architektoniczna. Wcześniej CreateDatabase.py mieszał:
-
-* budowę schematu,
-* logikę danych,
-* zasilanie.
-
-Teraz schemat został wydzielony do osobnego kroku bootstrapowego.
-
-⸻
-
-2. Ładowanie danych i budowa datasetu
-
-To robi CreateDatabase.py.
-
-Rola:
-
-* ładuje Excel,
-* filtruje dane,
-* zasila RAW tables (invo, debc, clhs, dcmo),
-* buduje warstwy pochodne,
-* liczy statystyki,
-* buduje dataset_tab,
-* przepisuje finalnie do dataset,
-* działa już na jednej wspólnej bazie z wieloma klientami.
-
-To też jest duża zmiana. Wcześniej dominował model:
-
-* jedna baza per klient.
-
-Teraz masz już obsłużony model:
-
-* jedna wspólna baza
-* wiele klientów
-* dane rozróżniane przez INVO_CLNTNO
-
-czyli dokładnie kierunek potrzebny pod dalszą migrację.
-
-⸻
-
-3. Batch runner modelu
-
-To robi runner_batch.py.
-
-Rola:
-
-* uruchamia first_model,
-* obsługuje train,
-* obsługuje test,
-* obsługuje train+test,
-* przy testach wielu klientów iteruje po bazach klientowych,
-* zapisuje wyniki runów do Excela.
-
-To jest już praktycznie nowy batchowy entrypoint dla MVP modelowego.
-
-⸻
-
-Co zostało już zrobione
-
-A. Wycięcie pełnego pipeline’u z głównego flow
-
-W praktyce aktywne są teraz:
-
-* first_model.py
-* CreateDatabase.py
-* db_init.py
-* build_client_db.py
-* runner_batch.py
-* config.yaml
-
-A poza aktywnym MVP zostały:
-
-* second_model.py
-* prep_data_for_sec_mod.py
-* cash_flow_visualization.py
-* stary main.py
-
-Czyli to, co miało zostać odcięte na etapie first_model_only, zostało odcięte funkcjonalnie.
-
-⸻
-
-B. Rozdzielenie „schema init” od „data loading”
-
-To jest chyba najważniejsza rzecz, którą zrobiliście w etapie 1.5.
-
-Macie teraz dwa osobne kroki:
-
-db_init.py
-
-robi:
-
-* schemat,
-* widoki,
-* indeksy,
-* dane statyczne.
-
-build_client_db.py + CreateDatabase.py
-
-robi:
-
-* zasilenie danych klientowych,
-* policzenie warstw pochodnych,
-* zbudowanie datasetu.
-
-To jest dużo lepsze niż stary model, w którym jedno uruchomienie robiło wszystko naraz.
-
-⸻
-
-C. Przejście z „wiele baz z jednego Excela” na „jedna baza dla wielu klientów z jednego Excela”
-
-To też już macie.
-
-build_client_db.py:
-
-* bierze listę klientów,
-* ustawia wspólną bazę przez --db-path,
-* przekazuje listę klientów do CreateDatabase.CreateDatabase(...),
-* a CreateDatabase.py iteruje po klientach i dopisuje ich dane do tej samej bazy.
-
-To jest dokładnie krok w stronę późniejszego Postgresa i wspólnego storage.
-
-⸻
-
-D. Obsługa datasetu w nowej logice
-
-Macie już wdrożone:
-
-* dataset_tab jako warstwę pośrednią,
-* refill_dataset_for_client(...) jako kontrolowany rebuild finalnego dataset,
-* czyszczenie dataset i dataset_tab per klient,
-* shardowanie przy budowie dataset_tab,
-* batchowe przetwarzanie po zakresie dni.
-
-To jest istotne, bo zachowaliście wcześniejszą optymalizację wydajnościową, ale w nowej architekturze.
-
-⸻
-
-E. Statyczne święta przeniesione z Excela do config/init
-
-To również jest ważne porządkowanie:
-
-* dane swieta nie są już elementem runtime ETL,
-* zostały potraktowane jako dane statyczne,
-* seed odbywa się w db_init.py.
-
-To usuwa jedną z ukrytych zależności środowiskowych.
-
-⸻
-
-F. Walidacja wymaganego schematu
-
-W CreateDatabase.py macie:
-
-* validate_required_schema_for_create_database(...)
-
-To zabezpiecza nową logikę:
-
-* CreateDatabase zakłada, że baza jest już zainicjalizowana,
-* jeśli nie jest, proces kończy się jasno.
-
-To jest dobre i zgodne z nową architekturą.
-
-⸻
-
-Jak wygląda teraz aktualna logika uruchamiania
-
-Krok 1: bootstrap bazy
-
-python db_init.py --config config.yaml --db-path ...
-
-Efekt:
-
-* tworzy bazę,
-* zakłada schemat,
-* seeduje dane statyczne.
-
-⸻
-
-Krok 2: zasilenie wspólnej bazy klientami
-
-python build_client_db.py --t0 ... --build-clients ... --db-path ...
-
-Efekt:
-
-* ładuje dane z Excela,
-* zasila wspólną bazę klientami,
-* buduje finalny dataset.
-
-⸻
-
-Krok 3: train/test modelu
-
-python runner_batch.py ...
-
-Efekt:
-
-* trenuje model na wspólnej bazie lub testuje na klientowych,
-* zapisuje wyniki runów.
-
-⸻
-
-Co to oznacza architektonicznie
-
-Macie już de facto taki podział:
-
-Warstwa 1 — bootstrap infrastruktury lokalnej
-
-* db_init.py
-
-Warstwa 2 — ETL / data build
-
-* build_client_db.py
-* CreateDatabase.py
-
-Warstwa 3 — model execution
-
-* runner_batch.py
-* first_model.py
-
-To już jest dużo bliżej docelowego podejścia batchowego niż stary main.py.
-
-⸻
-
-Jakie pliki są teraz najważniejsze
-
-db_init.py
-
-Nowy bootstrap schematu.
-
-CreateDatabase.py
-
-Nadal duży i ciężki, ale już w nowej roli:
-
-* loader + transform + dataset builder,
-* nie centralny twórca całej bazy od zera.
-
-build_client_db.py
-
-Launcher ETL do wspólnej bazy.
-
-runner_batch.py
-
-Nowy batch runner dla first_model.
-
-first_model.py
-
-Silnik modelowy MVP.
-
-config.yaml
-
-Nadal bardzo ważny, ale wciąż za ciężki logicznie.
-
-⸻
-
-Co jeszcze widać po kodzie
-
-Projekt jest już po dużym porządkowaniu, ale nadal jest etapem przejściowym, nie końcowym refaktorem.
-
-Najważniejsze ślady przejściowości:
-
-1. CreateDatabase.py nadal jest za duży
-
-On dalej zawiera:
-
-* logikę IO,
-* logikę transformacji,
-* logikę statystyk,
-* logikę datasetu,
-* logikę shardowania,
-* logikę refill dataset.
-
-Czyli architektura jest lepsza niż była, ale CreateDatabase.py nadal jest monolitem.
-
-2. runner_batch.py jest już dobrym runnerem, ale jeszcze nie finalnym
-
-Bo:
-
-* nadal ma tryb pomostowy dla testów,
-* nadal zakłada per-client DB w testach,
-* nadal używa starych konwencji ścieżek.
-
-3. config.yaml nadal jest centrum logiki SQL
-
-To znaczy:
-
-* konfiguracja nie jest jeszcze „czystym configiem”,
-* tylko nadal przenosi dużą część logiki danych.
-
-4. SQLite nadal jest centralne
-
-To naturalne na tym etapie, ale oznacza, że jeszcze nie weszliście w etap:
-
-* repository abstraction,
-* PostgreSQL,
-* Alembic.
-
-⸻
-
-W którym dokładnie miejscu planu teraz jesteście
-
-Najuczciwiej:
-
-Etap 1 — zrobiony
-
-Bo:
-
-* aktywny flow to już first_model only,
-* drugi model i cash flow są poza głównym przebiegiem,
-* macie batchowy runner dla modelu.
-
-Etap 1.5 — w dużej mierze zrobiony
-
-Bo:
-
-* rozdzieliliście schema init i data load,
-* przeszliście na jedną wspólną bazę dla wielu klientów,
-* ogarnęliście nową logikę datasetu,
-* uporządkowaliście bootstrap bazy.
-
-Etap 2 — jeszcze nie w pełni
-
-Bo etap 2 to już byłoby mocniejsze uporządkowanie struktury kodu:
-
-* service layer,
-* repository layer,
-* wydzielenie modułów,
-* odchudzenie CreateDatabase.py,
-* odchudzenie config.yaml,
-* jasny podział active vs legacy.
-
-Czyli:
-jesteście na granicy końca 1.5 i wejścia w etap 2.
-
-⸻
-
-Jaki jest aktualny stan projektu w jednym zdaniu
-
-Aktualnie macie już działający, batchowy pipeline MVP dla first_model, oparty na:
-
-* osobnym bootstrapie schematu,
-* wspólnej bazie SQLite dla wielu klientów,
-* osobnym ETL loaderze,
-* osobnym runnerze modelowym,
-* ale jeszcze przed właściwym refaktorem strukturalnym kodu i migracją z SQLite.
-
-⸻
-
-Kolejne etapy
-
-Teraz logiczna kolejność wygląda tak:
-
-Etap 2 — struktura kodu
-
-To powinno być następne.
-
-Najważniejsze zadania:
-
-* podzielić CreateDatabase.py na mniejsze moduły,
-* wydzielić warstwy:
-    * runner,
-    * service,
-    * DB/repository,
-    * config,
-* uprościć runner_batch.py,
-* ustalić, co jest active, a co legacy,
-* uporządkować nazwy i tryby.
-
-Etap 3 — konteneryzacja
-
-Dopiero jak etap 2 trochę uporządkuje strukturę:
-
-* Dockerfile,
-* uruchomienie batchowe w kontenerze,
-* parametry przez CLI / env,
-* bez zależności od lokalnych ścieżek.
-
-Etap 4 — schema + Alembic
-
-Po uporządkowaniu aplikacji:
-
-* jawny schemat trwały,
-* migracje,
-* rozdział staging / durable schema.
-
-Etap 5 — PostgreSQL lokalnie
-
-Dopiero wtedy ma sens przejście:
-
-* ze sqlite3,
-* na PostgreSQL,
-* z przepisaniem SQL-i i dostępu do bazy.
-
-Etapy 6–7
-
-* GKE DEV
-* pipeline
-
-⸻
-
-Co bym uznał za najważniejsze następne zadania techniczne
-
-W praktyce teraz priorytetowo są cztery rzeczy:
-
-1. Ustalić docelowy aktywny entrypoint
-
-Najpewniej:
-
-* db_init.py
-* build_client_db.py
-* runner_batch.py
-
-i jasno uznać:
-
-* main.py = legacy
-* main_batch.py = legacy/pomocniczy wzorzec
-
-2. Rozbić CreateDatabase.py
-
-Minimum na:
-
-* excel loading,
-* raw import,
-* derived tables,
-* statystyki,
-* dataset build,
-* dataset refill.
-
-3. Oczyścić config.yaml
-
-Bo teraz jest tam za dużo logiki.
-
-4. Przygotować projekt pod Docker
-
-To znaczy:
-
-* usunąć twarde ścieżki,
-* ujednolicić parametry wejściowe,
-* sprawdzić, czy wszystko daje się uruchamiać tylko przez CLI.
-
-⸻
-
-Podsumowanie
-
-Macie już:
-
-* działający bootstrap bazy (db_init.py),
-* działający loader wspólnej bazy (build_client_db.py + CreateDatabase.py),
-* działający runner modelowy (runner_batch.py),
-* wspólną bazę dla wielu klientów,
-* odcięty główny flow od modelu 2 i cash flow,
-* batchowy sposób uruchamiania.
-
-Czyli MVP nie jest już tylko koncepcją — ono już istnieje.
-
-Natomiast jeszcze nie jesteście po refaktorze strukturalnym. Nadal główny ciężar siedzi w:
-
-* CreateDatabase.py
-* config.yaml
-
-i to właśnie wygląda na następny właściwy krok.
-
-Jeżeli chcesz, mogę teraz na tej podstawie rozpisać Ci bardzo konkretnie:
-„Etap 2 — struktura kodu: co dokładnie wydzielić z CreateDatabase.py, do jakich nowych plików i w jakiej kolejności”.
+# runner_batch.py
+import argparse
+import copy
+import logging
+import os
+from datetime import datetime
+
+import pandas as pd
+import yaml
+
+import first_model
+from first_model import get_train_test_params
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+
+def load_config(config_path="config.yaml"):
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def save_model_run(results_file, config, operation_mode, avg_accuracy):
+    row_data = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "train_client_id": config["first_model_params"]["train_client_id"],
+        "test_client_id": config["first_model_params"]["test_client_id"],
+        "model_path": config["first_model_params"]["model_path"],
+        "database": config["first_model_params"]["database"],
+        "test_database": config["first_model_params"].get("test_database"),
+        "operation_mode": operation_mode,
+        "avg_accuracy": avg_accuracy,
+    }
+
+    df_new = pd.DataFrame([row_data])
+
+    if not os.path.exists(results_file):
+        df_new.to_excel(results_file, index=False, sheet_name="runs")
+        logging.info("Created results file: %s", results_file)
+    else:
+        existing_df = pd.read_excel(results_file, sheet_name="runs")
+        combined_df = pd.concat([existing_df, df_new], ignore_index=True)
+        combined_df.to_excel(results_file, index=False, sheet_name="runs")
+        logging.info("Appended run to results file: %s", results_file)
+
+
+def build_db_path(db_root, t0_str, client_id):
+    return os.path.join(db_root, t0_str, t0_str, f"CashPredictorT_{client_id}.db")
+
+def build_db_path_from_template(db_template, client_id):
+    """
+    Przykład template:
+    C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictorT_{client_id}.db
+    """
+    return db_template.format(client_id=client_id)
+
+def parse_client_ids(raw_value):
+    if raw_value is None:
+        return None
+
+    parts = [x.strip() for x in str(raw_value).split(",") if x.strip()]
+    ids = [int(x) for x in parts]
+
+    if len(ids) == 1:
+        return ids[0]
+    return ids
+
+def ensure_list(client_ids):
+    if client_ids is None:
+        return []
+    if isinstance(client_ids, list):
+        return client_ids
+    return [client_ids]
+
+
+def resolve_db_path(db_root, t0, client_ids, explicit_db_path=None):
+    if explicit_db_path:
+        if not os.path.exists(explicit_db_path):
+            raise FileNotFoundError(f"Baza nie istnieje: {explicit_db_path}")
+        return explicit_db_path
+
+    if isinstance(client_ids, list):
+        raise ValueError(
+            "Dla wielu client IDs musisz podać jawnie --train-db-path albo --test-db-path"
+        )
+
+    t0_str = t0.strftime("%Y-%m-%d")
+    db_path = build_db_path(db_root, t0_str, client_ids)
+
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"Baza nie istnieje: {db_path}")
+
+    return db_path
+
+
+def prepare_config_for_run(
+    config,
+    train_client_ids,
+    test_client_ids,
+    model_path,
+    train_db_path,
+    test_db_path,
+):
+    cfg = copy.deepcopy(config)
+
+    cfg["first_model_params"]["train_client_id"] = train_client_ids
+    cfg["first_model_params"]["test_client_id"] = test_client_ids
+    cfg["first_model_params"]["database"] = train_db_path
+    cfg["first_model_params"]["test_database"] = test_db_path
+    cfg["first_model_params"]["model_path"] = model_path
+
+    # jeśli te pola istnieją/mają znaczenie w first_model
+    cfg["first_model_params"]["client_ids_to_train_on_one_db"] = train_client_ids
+    cfg["first_model_params"]["client_ids_to_test_on_one_db"] = test_client_ids
+
+    return cfg
+
+
+def run_phase(
+    config,
+    t0,
+    operation_mode,
+    train_client_ids,
+    test_client_ids,
+    model_path,
+    train_db_path,
+    test_db_path,
+    results_file,
+):
+    cfg = prepare_config_for_run(
+        config=config,
+        train_client_ids=train_client_ids,
+        test_client_ids=test_client_ids,
+        model_path=model_path,
+        train_db_path=train_db_path,
+        test_db_path=test_db_path,
+    )
+
+    acceptance_period = cfg["first_model_params"]["acceptance_period"]
+    retrain_period = cfg["first_model_params"]["retrain_period"]
+
+    actual_model_path, test_start, test_end, train_start, train_end = get_train_test_params(
+        cfg["first_model_params"],
+        operation_mode,
+        t0,
+        acceptance_period,
+        retrain_period,
+    )
+
+    logging.info("=== START phase %s ===", operation_mode)
+    logging.info("train_client_id=%s", cfg["first_model_params"]["train_client_id"])
+    logging.info("test_client_id=%s", cfg["first_model_params"]["test_client_id"])
+    logging.info("database=%s", cfg["first_model_params"]["database"])
+    logging.info("test_database=%s", cfg["first_model_params"]["test_database"])
+    logging.info("model_path=%s", cfg["first_model_params"]["model_path"])
+
+    avg_acc = first_model.first_model(
+        actual_model_path,
+        test_start,
+        test_end,
+        train_start,
+        train_end,
+        cfg["first_model_params"],
+        operation_mode,
+        t0,
+        acceptance_period,
+        retrain_period,
+    )
+
+    save_model_run(results_file, cfg, operation_mode, avg_acc)
+
+    logging.info("=== END phase %s ===", operation_mode)
+    return avg_acc
+
+def run_test_for_each_client(
+    config,
+    t0,
+    test_mode,
+    train_client_ids,
+    test_client_ids,
+    model_path,
+    test_db_template,
+    results_file,
+):
+    failures = []
+
+    for test_client_id in ensure_list(test_client_ids):
+        logging.info("=== START single-client test: %s ===", test_client_id)
+
+        try:
+            test_db_path = build_db_path_from_template(test_db_template, test_client_id)
+
+            if not os.path.exists(test_db_path):
+                raise FileNotFoundError(f"Baza nie istnieje: {test_db_path}")
+
+            # w trybie pomostowym test ma czytać i zapisywać do pojedynczej bazy klienta
+            run_phase(
+                config=config,
+                t0=t0,
+                operation_mode=test_mode,
+                train_client_ids=train_client_ids,
+                test_client_ids=test_client_id,
+                model_path=model_path,
+                train_db_path=test_db_path,
+                test_db_path=test_db_path,
+                results_file=results_file,
+            )
+
+        except first_model.NoDataError as e:
+            logging.warning("[SKIP TEST] client %s: %s", test_client_id, e)
+        except Exception as e:
+            logging.exception("Test failed for client %s: %s", test_client_id, e)
+            failures.append(test_client_id)
+
+        logging.info("=== END single-client test: %s ===", test_client_id)
+
+    return failures
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Batch runner for first_model")
+
+    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+    parser.add_argument("--t0", required=True, help="Current date in YYYY-MM-DD")
+    parser.add_argument("--model-path", required=True, help="Base path to .pt model")
+    parser.add_argument("--db-root", default="databases", help="Root directory for per-client databases")
+    parser.add_argument("--results-file", default="model_runs.xlsx", help="Excel file for run results")
+
+    parser.add_argument("--run-train", action="store_true", help="Run training phase")
+    parser.add_argument("--run-test", action="store_true", help="Run test phase")
+
+    parser.add_argument("--train-mode", default="train", help="Operation mode for training")
+    parser.add_argument("--test-mode", default="test_today", help="Operation mode for testing")
+
+    parser.add_argument("--train-client-ids", help="Single client id or comma-separated list for training")
+    parser.add_argument("--test-client-ids", help="Single client id or comma-separated list for testing")
+
+    parser.add_argument("--train-db-path", help="Explicit DB path for training")
+    parser.add_argument("--test-db-path", help="Explicit DB path for testing")
+
+    parser.add_argument("--test-db-template", help="Template path for per-client test DB, e.g. C:/.../CashPredictorT_{client_id}.db")    
+
+    # opcjonalnie dla zgodności wstecznej z Twoim starym test runnerem
+    parser.add_argument("--client-id", type=int, help="Single client id shortcut for test")
+    parser.add_argument("--client-list", help="Comma separated client ids shortcut for test")
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    config = load_config(args.config)
+    t0 = datetime.strptime(args.t0, "%Y-%m-%d").date()
+
+    if not args.run_train and not args.run_test:
+        raise SystemExit("Podaj przynajmniej --run-train albo --run-test")
+
+    # zgodność wsteczna: stary test runner
+    fallback_test_client_ids = None
+    if args.client_id is not None:
+        fallback_test_client_ids = args.client_id
+    elif args.client_list:
+        fallback_test_client_ids = [int(x.strip()) for x in args.client_list.split(",") if x.strip()]
+
+    train_client_ids = parse_client_ids(args.train_client_ids)
+    test_client_ids = parse_client_ids(args.test_client_ids)
+
+    if test_client_ids is None and fallback_test_client_ids is not None:
+        test_client_ids = fallback_test_client_ids
+
+    if args.run_train and train_client_ids is None:
+        raise SystemExit("Dla --run-train musisz podać --train-client-ids")
+
+    if args.run_test and test_client_ids is None:
+        raise SystemExit("Dla --run-test musisz podać --test-client-ids albo --client-id/--client-list")
+
+    failures = []
+
+    trained_model_path = args.model_path
+
+    # TRAIN
+    if args.run_train:
+        try:
+            train_db_path = resolve_db_path(
+                db_root=args.db_root,
+                t0=t0,
+                client_ids=train_client_ids,
+                explicit_db_path=args.train_db_path,
+            )
+
+            # przy samym train test_client_ids może być takie samo jak train_client_ids
+            effective_test_ids_for_train = test_client_ids if test_client_ids is not None else train_client_ids
+
+            run_phase(
+                config=config,
+                t0=t0,
+                operation_mode=args.train_mode,
+                train_client_ids=train_client_ids,
+                test_client_ids=effective_test_ids_for_train,
+                model_path=trained_model_path,
+                train_db_path=train_db_path,
+                test_db_path=train_db_path,
+                results_file=args.results_file,
+            )
+        except first_model.NoDataError as e:
+            logging.warning("[SKIP TRAIN] %s", e)
+        except Exception as e:
+            logging.exception("Train failed: %s", e)
+            failures.append("train")
+
+    # TEST
+    if args.run_test:
+        try:
+            effective_train_ids_for_test = train_client_ids if train_client_ids is not None else test_client_ids
+
+            # TRYB POMOSTOWY:
+            # test wielu klientów przez pętlę po pojedynczych bazach
+            if isinstance(test_client_ids, list):
+                if not args.test_db_template:
+                    raise SystemExit(
+                        "Dla testu wielu klientów w rozwiązaniu pomostowym musisz podać --test-db-template"
+                    )
+
+                test_failures = run_test_for_each_client(
+                    config=config,
+                    t0=t0,
+                    test_mode=args.test_mode,
+                    train_client_ids=effective_train_ids_for_test,
+                    test_client_ids=test_client_ids,
+                    model_path=trained_model_path,
+                    test_db_template=args.test_db_template,
+                    results_file=args.results_file,
+                )
+
+                if test_failures:
+                    failures.extend([f"test:{client_id}" for client_id in test_failures])
+
+            else:
+                # stary wariant: test jednego klienta
+                test_db_path = resolve_db_path(
+                    db_root=args.db_root,
+                    t0=t0,
+                    client_ids=test_client_ids,
+                    explicit_db_path=args.test_db_path,
+                )
+
+                run_phase(
+                    config=config,
+                    t0=t0,
+                    operation_mode=args.test_mode,
+                    train_client_ids=effective_train_ids_for_test,
+                    test_client_ids=test_client_ids,
+                    model_path=trained_model_path,
+                    train_db_path=test_db_path,
+                    test_db_path=test_db_path,
+                    results_file=args.results_file,
+                )
+
+        except first_model.NoDataError as e:
+            logging.warning("[SKIP TEST] %s", e)
+        except Exception as e:
+            logging.exception("Test failed: %s", e)
+            failures.append("test")
+
+    if failures:
+        raise SystemExit(f"Run finished with failures in phases: {failures}")
+
+
+if __name__ == "__main__":
+    main()
