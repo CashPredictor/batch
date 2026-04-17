@@ -1,540 +1,443 @@
-Masz teraz runner jeszcze z trybu pomostowego, czyli:
+Podsumowując: chcesz zrobić 3 rzeczy naraz.
 
-* train może działać na jednej bazie wspólnej,
-* ale test dla wielu klientów nadal idzie pętlą po osobnych bazach klientowych przez --test-db-template,
-* dodatkowo w runnerze zostały helpery i argumenty z dawnego modelu „1 klient = 1 baza”.
+Po pierwsze, przenieść schemat first_model_tab do db_init, tak żeby first_model.py już nie tworzył tabeli dynamicznie. Już wcześniej miałeś to przewidziane w starej koncepcji jako query_create_first_model_tab  ￼.
 
-Przy nowej logice to już nie pasuje.
+Po drugie, zmienić zapis wyników w first_model.py, żeby:
 
-Jak powinno to działać teraz
+* nie było DROP TABLE,
+* nie było CREATE TABLE,
+* tylko append nowych wierszy do istniejącej tabeli,
+* z dodatkową kolumną RunIdentifier.
 
-Skoro masz już:
+Po trzecie, chcesz dostać skrypt do wygenerowania listy kolumn z aktualnego outputu modelu, żeby wkleić je do config.yaml jako definicję schematu.
 
-* jedną wspólną bazę SQLite,
-* w niej wielu klientów,
-* zarówno do treningu, jak i do testu,
-* a klient jest rozróżniany po INVO_CLNTNO,
-
-to runner powinien działać tak:
-
-Train
-
-* dostaje listę klientów treningowych,
-* ustawia database i test_database na tę samą wspólną bazę,
-* przekazuje listę klientów treningowych do first_model.
-
-Test
-
-* dostaje listę klientów testowych,
-* nadal używa tej samej wspólnej bazy,
-* ale iteruje test po klientach logicznie, nie po bazach,
-* czyli dla każdego test_client_id:
-    * ustawia test_client_id na jednego klienta,
-    * zostawia database/test_database jako tę samą wspólną bazę,
-    * uruchamia first_model.
-
-Czyli:
-
-* iteracja zostaje,
-* ale iterujesz po client_id we wspólnej bazie,
-* a nie po osobnych plikach .db.
-
-To jest ważne, bo:
-
-* zachowujesz dotychczasowe zachowanie testu per klient,
-* ale usuwasz zbędny poziom „osobna baza dla klienta”.
+I to jest dobry kierunek, bo dziś zapis outputu modelu nadal idzie przez ogólną funkcję, która dla first_model_tab robi najpierw DELETE, a potem i tak DROP TABLE i CREATE TABLE, więc finalnie tabela jest niszczona przy każdym runie  ￼. Jednocześnie sam first_model.py kończy na write_output_to_db(..., 'first_model_tab', ...)  ￼, więc zmiana powinna pójść głównie w warstwę database.py plus lekka korekta w first_model.py.
 
 ⸻
 
-Co w obecnym runnerze jest już niepotrzebne
+Co dokładnie trzeba zmienić
 
-Do usunięcia:
+1. db_init.py
 
-1. build_db_path
+Musisz dodać tworzenie tabeli first_model_tab z configa, tak samo jak robisz to dla innych tabel. Teraz db_init.py tworzy m.in. dataset, dataset_tab, group_cust_inv_days, INVO_CLHS_JOINED_TAB, ale nie widać tam query_create_first_model_tab  ￼.
 
-To służyło do budowania ścieżki:
-CashPredictorT_{client_id}.db
+2. config.yaml
 
-Przy jednej wspólnej bazie to już niepotrzebne.
+Musisz dodać:
 
-2. build_db_path_from_template
+* definicję kolumn outputu,
+* definicję CREATE TABLE first_model_tab,
+* najlepiej też indeksy dla tej tabeli.
 
-To był core trybu pomostowego testu per osobna baza klienta.
-Też już niepotrzebne.
+Masz już w configu parametr RunIdentifier_column: 'RunIdentifier'  ￼, więc to warto wykorzystać 1:1.
 
-3. resolve_db_path(db_root, t0, client_ids, explicit_db_path=None)
+3. database.py
 
-To też jest logika ze starego świata:
+Tu jest główny problem:
 
-* jak nie podasz jawnej ścieżki, to składamy ją z db_root/t0/client_id.
+* create_and_insert_processed_table(...) dziś robi:
+    * dla first_model_tab najpierw DELETE,
+    * potem i tak DROP TABLE IF EXISTS,
+    * potem CREATE TABLE ...  ￼
 
-Przy nowym modelu runner powinien po prostu wymagać:
+To trzeba rozdzielić:
 
-* --db-path
+* dla zwykłych tabel może zostać obecne zachowanie,
+* ale dla first_model_tab trzeba zrobić append do istniejącej tabeli.
 
-i tyle.
+4. first_model.py
 
-4. Argumenty:
+Tu trzeba:
 
-* --db-root
-* --train-db-path
-* --test-db-path
-* --test-db-template
-* --client-id
-* --client-list
-
-To są wszystko relikty starej logiki.
-
-5. run_test_for_each_client(...)
-
-W obecnej postaci też do zmiany, bo opiera się o test_db_template.
-Sam pomysł iteracji po klientach zostaje, ale funkcja ma działać na jednej bazie.
+* dodać kolumnę RunIdentifier do final_output_df tuż przed zapisem,
+* zostawić samo write_output_to_db(...), ale już z nową logiką append.
 
 ⸻
 
-Co powinno zostać
+Jak wygenerować listę kolumn do configa
 
-Zostaje i jest sensowne:
+Najpraktyczniej zrób to z realnego outputu final_output_df, bo on i tak jest ostatnim DataFrame przed zapisem do first_model_tab  ￼.
 
-* load_config
-* save_model_run
-* parse_client_ids
-* ensure_list
-* prepare_config_for_run
-* run_phase
+Skrypt pomocniczy
 
-To są dobre klocki.
+Uruchom to lokalnie na próbce DataFrame, albo wstaw tymczasowo przed write_output_to_db(...):
 
-⸻
+def generate_first_model_schema_yaml(df):
+    import pandas as pd
+    lines = []
+    lines.append("  first_model_output_columns:")
+    for col in df.columns:
+        dtype = df[col].dtype
+        if pd.api.types.is_integer_dtype(dtype):
+            sql_type = "INTEGER"
+        elif pd.api.types.is_float_dtype(dtype):
+            sql_type = "REAL"
+        elif pd.api.types.is_datetime64_any_dtype(dtype):
+            sql_type = "DATETIME"
+        else:
+            sql_type = "TEXT"
+        lines.append(f'    - ["{col}", "{sql_type}"]')
+    return "\n".join(lines)
 
-Co trzeba zmienić
+A potem tymczasowo w first_model.py, tuż przed zapisem:
 
-1. Jeden parametr bazy
-
-Zamiast kilku wariantów:
-
-* --train-db-path
-* --test-db-path
-* --test-db-template
-
-powinien być jeden:
-
---db-path
-
-i on jest używany:
-
-* do train,
-* do test,
-* do train+test.
-
-2. Test wielu klientów
-
-Zostaje iteracja po klientach, ale:
-
-* każdy test bierze ten sam db_path
-* zmienia się tylko test_client_id
-
-3. Train + test
-
-W trybie łączonym:
-
-* train leci na wspólnej bazie i liście klientów treningowych,
-* test leci po klientach testowych, ale na tej samej wspólnej bazie.
+print(generate_first_model_schema_yaml(final_output_df))
 
 ⸻
 
-Dlaczego tak, a nie inaczej
+Co wkleić do config.yaml
 
-Bo to jest najprostsze i najbardziej zgodne z tym, co już masz:
+W first_model_params dodaj najpierw listę kolumn:
 
-* nie robisz rewolucji w first_model,
-* zachowujesz obecny sposób przekazywania train_client_id i test_client_id,
-* po prostu upraszczasz storage model z „wiele baz” do „jedna baza”.
+  first_model_output_columns:
+    - ["RunIdentifier", "TEXT"]
+    - ["INVO_NO", "TEXT"]
+    - ["INVO_ADMNO", "TEXT"]
+    - ["INVO_CLNTNO", "TEXT"]
+    - ["INVO_DEBH_NO", "TEXT"]
+    - ["INVO_DEBC_NO", "TEXT"]
+    - ["INVO_INVDATE", "DATETIME"]
+    - ["DZIEN", "DATETIME"]
+    - ["INVO_DUEDATE", "DATETIME"]
+    - ["INVO_AINITIALH", "REAL"]
+    - ["INVO_FINALPAYMENTDATE", "DATETIME"]
+    - ["INVO_FINALPAYMENTDATE_DAYS_DIFF", "REAL"]
+    - ["predicted_INVO_FINALPAYMENTDATE", "REAL"]
+    - ["PREDICTED_PAYMENT_DATE", "DATETIME"]
 
-To też dobrze pasuje do dalszych etapów:
+To tylko przykład początku — resztę wygenerujesz skryptem.
 
-* PostgreSQL,
-* jedna baza dev/test/train-like,
-* klient filtrowany logicznie, a nie plikowo.
+Potem dodaj definicję tabeli:
+
+  query_create_first_model_tab: |
+    CREATE TABLE IF NOT EXISTS first_model_tab (
+        RunIdentifier TEXT,
+        INVO_NO TEXT,
+        INVO_ADMNO TEXT,
+        INVO_CLNTNO TEXT,
+        INVO_DEBH_NO TEXT,
+        INVO_DEBC_NO TEXT,
+        INVO_INVDATE DATETIME,
+        DZIEN DATETIME,
+        INVO_DUEDATE DATETIME,
+        INVO_AINITIALH REAL,
+        INVO_FINALPAYMENTDATE DATETIME,
+        INVO_FINALPAYMENTDATE_DAYS_DIFF REAL,
+        predicted_INVO_FINALPAYMENTDATE REAL,
+        PREDICTED_PAYMENT_DATE DATETIME
+        -- dalsze kolumny wygenerowane skryptem
+    );
+
+Jeszcze lepiej: wygenerować od razu cały blok CREATE TABLE skryptem.
 
 ⸻
 
-Pełny kod nowego runner_batch.py
+Lepszy skrypt: generowanie gotowego query_create_first_model_tab
 
-import argparse
-import copy
-import logging
-import os
-from datetime import datetime
-import pandas as pd
-import yaml
-import first_model
-from first_model import get_train_test_params
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+To będzie dla Ciebie wygodniejsze niż ręczne składanie.
+
+def generate_first_model_create_table_yaml(df, table_name="first_model_tab"):
+    import pandas as pd
+    col_defs = ['        RunIdentifier TEXT']
+    for col in df.columns:
+        if col == "RunIdentifier":
+            continue
+        dtype = df[col].dtype
+        if pd.api.types.is_integer_dtype(dtype):
+            sql_type = "INTEGER"
+        elif pd.api.types.is_float_dtype(dtype):
+            sql_type = "REAL"
+        elif pd.api.types.is_datetime64_any_dtype(dtype):
+            sql_type = "DATETIME"
+        else:
+            sql_type = "TEXT"
+        col_defs.append(f'        {col} {sql_type}')
+    sql = "  query_create_first_model_tab: |\n"
+    sql += f"    CREATE TABLE IF NOT EXISTS {table_name} (\n"
+    sql += ",\n".join(col_defs)
+    sql += "\n    );"
+    return sql
+
+I tymczasowo:
+
+final_output_df_with_run = final_output_df.copy()
+final_output_df_with_run.insert(0, "RunIdentifier", "TEST_RUN")
+print(generate_first_model_create_table_yaml(final_output_df_with_run))
+
+To wkleić do config.yaml.
+
+⸻
+
+Co dodać do db_init.py
+
+W sekcji tworzenia tabel dopisz:
+
+exec_sql(conn, params.get("query_create_first_model_tab"), "query_create_first_model_tab")
+
+Najlepiej tutaj, razem z innymi tabelami, przed widokami:
+
+exec_sql(conn, params.get("query_create_grouped_client_days_table"), "query_create_grouped_client_days_table")
+exec_sql(conn, params.get("query_create_dataset"), "query_create_dataset")
+exec_sql(conn, params.get("query_create_invo_clhs_joined_tab_table"), "query_create_invo_clhs_joined_tab_table")
+exec_sql(conn, params.get("query_create_extended_grouped_client_days_tab_table"), "query_create_extended_grouped_client_days_tab_table")
+exec_sql(conn, params.get("query_create_first_model_tab"), "query_create_first_model_tab")
+
+Dodatkowo możesz dodać indeksy:
+
+if table_exists(cursor, "first_model_tab"):
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_first_model_tab_runid ON first_model_tab (RunIdentifier);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_first_model_tab_client_day ON first_model_tab (INVO_CLNTNO, DZIEN);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_first_model_tab_invoice ON first_model_tab (INVO_NO);")
+
+⸻
+
+Co zmienić w first_model.py
+
+Masz teraz końcówkę z zapisem przez write_output_to_db(...)  ￼. Tu przed zapisem dodaj RunIdentifier.
+
+Dodaj helper
+
+Na górze pliku:
+
+from uuid import uuid4
+
+albo bez UUID, jeśli chcesz prostszy run id.
+
+Dodaj przed write_output_to_db(...)
+
+Znajdź blok:
+
+write_output_to_db(final_output_df, 'first_model_tab', params, original_table_name=None, currently_testing=True, create_indexes=True, index_columns=[ 'INVO_NO', 'INVO_DEBC_NO', 'INVO_INVDATE', 'DZIEN', 'INVO_FINALPAYMENTDATE', 'PREDICTED_PAYMENT_DATE'])
+
+i zamień na:
+
+run_identifier = f"{operation_mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+final_output_df = final_output_df.copy()
+if "RunIdentifier" not in final_output_df.columns:
+    final_output_df.insert(0, "RunIdentifier", run_identifier)
+write_output_to_db(
+    final_output_df,
+    'first_model_tab',
+    params,
+    original_table_name="first_model_tab",
+    currently_testing=True,
+    create_indexes=False,
+    index_columns=None
 )
-def load_config(config_path: str = "config.yaml") -> dict:
-    with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-def save_model_run(results_file, config, operation_mode, avg_accuracy):
-    row_data = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "train_client_id": str(config["first_model_params"]["train_client_id"]),
-        "test_client_id": str(config["first_model_params"]["test_client_id"]),
-        "model_path": config["first_model_params"]["model_path"],
-        "database": config["first_model_params"]["database"],
-        "test_database": config["first_model_params"].get("test_database"),
-        "operation_mode": operation_mode,
-        "avg_accuracy": avg_accuracy,
-    }
-    df_new = pd.DataFrame([row_data])
-    if not os.path.exists(results_file):
-        df_new.to_excel(results_file, index=False, sheet_name="runs")
-        logging.info("Created results file: %s", results_file)
+
+Dlaczego tak:
+
+* RunIdentifier dodajesz jawnie,
+* original_table_name="first_model_tab" będzie pomocne do typów,
+* nie tworzysz indeksów przy każdym runie, bo indeksy ma robić db_init.
+
+⸻
+
+Co zmienić w database.py
+
+To jest najważniejsza zmiana.
+
+Obecny problem
+
+Masz teraz:
+
+if sanitized_table_name == "first_model_tab":
+    if cursor.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;", (sanitized_table_name,)).fetchone():
+        cursor.execute(f"DELETE FROM {sanitized_table_name};")
+        conn.commit()
+cursor.execute(f"DROP TABLE IF EXISTS {sanitized_table_name};")
+create_table_query = f"CREATE TABLE {sanitized_table_name} ({', '.join(columns_sql)});"
+cursor.execute(create_table_query)
+
+czyli nawet jeśli skasujesz dane, to i tak za chwilę kasujesz całą tabelę  ￼.
+
+Zamień cały fragment tworzenia tabeli na taki:
+
+    # Tworzenie / użycie tabeli docelowej
+    sanitized_table_name = sanitize_table_name(target_table_name)
+    table_exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;",
+        (sanitized_table_name,)
+    ).fetchone() is not None
+    if sanitized_table_name == "first_model_tab":
+        if not table_exists:
+            create_table_query = f"CREATE TABLE {sanitized_table_name} ({', '.join(columns_sql)});"
+            cursor.execute(create_table_query)
+            if create_indexes and index_columns:
+                for col in index_columns:
+                    idx_name = sanitize_table_name(f"idx_{sanitized_table_name}_{col}")
+                    sql = f"CREATE INDEX IF NOT EXISTS {idx_name} ON {sanitized_table_name}({col});"
+                    cursor.execute(sql)
+                logging.info(f"Utworzono indeksy na kolumnach: {index_columns}")
     else:
-        existing_df = pd.read_excel(results_file, sheet_name="runs")
-        combined_df = pd.concat([existing_df, df_new], ignore_index=True)
-        combined_df.to_excel(results_file, index=False, sheet_name="runs")
-        logging.info("Appended run to results file: %s", results_file)
-def parse_client_ids(raw_value):
-    if raw_value is None:
-        return None
-    parts = [x.strip() for x in str(raw_value).split(",") if x.strip()]
-    ids = [int(x) for x in parts]
-    if len(ids) == 1:
-        return ids[0]
-    return ids
-def ensure_list(client_ids):
-    if client_ids is None:
-        return []
-    if isinstance(client_ids, list):
-        return client_ids
-    return [client_ids]
-def validate_db_path(db_path: str) -> str:
-    if not db_path:
-        raise ValueError("Musisz podać --db-path")
-    if not os.path.exists(db_path):
-        raise FileNotFoundError(f"Baza nie istnieje: {db_path}")
-    return db_path
-def prepare_config_for_run(
-    config,
-    train_client_ids,
-    test_client_ids,
-    model_path,
-    db_path,
+        cursor.execute(f"DROP TABLE IF EXISTS {sanitized_table_name};")
+        create_table_query = f"CREATE TABLE {sanitized_table_name} ({', '.join(columns_sql)});"
+        cursor.execute(create_table_query)
+        if create_indexes and index_columns:
+            for col in index_columns:
+                idx_name = sanitize_table_name(f"idx_{sanitized_table_name}_{col}")
+                sql = f"CREATE INDEX IF NOT EXISTS {idx_name} ON {sanitized_table_name}({col});"
+                cursor.execute(sql)
+            logging.info(f"Utworzono indeksy na kolumnach: {index_columns}")
+
+To daje:
+
+* dla first_model_tab: tylko użycie istniejącej tabeli,
+* dla reszty: stare zachowanie zostaje.
+
+⸻
+
+Jeszcze lepsza wersja: jawny append mode
+
+Lepiej docelowo nie opierać tego na nazwie tabeli, tylko na parametrze.
+
+Zmień sygnaturę:
+
+W database.py:
+
+def create_and_insert_processed_table(
+    conn,
+    processed_df,
+    target_table_name,
+    original_table_name=None,
+    batch_size=500000,
+    create_indexes=False,
+    index_columns=None,
+    append_if_exists=False
 ):
-    cfg = copy.deepcopy(config)
-    cfg["first_model_params"]["train_client_id"] = train_client_ids
-    cfg["first_model_params"]["test_client_id"] = test_client_ids
-    cfg["first_model_params"]["database"] = db_path
-    cfg["first_model_params"]["test_database"] = db_path
-    cfg["first_model_params"]["model_path"] = model_path
-    # pola pomocnicze dla nowej logiki jednej bazy
-    cfg["first_model_params"]["client_ids_to_train_on_one_db"] = train_client_ids
-    cfg["first_model_params"]["client_ids_to_test_on_one_db"] = test_client_ids
-    return cfg
-def run_phase(
-    config,
-    t0,
-    operation_mode,
-    train_client_ids,
-    test_client_ids,
-    model_path,
-    db_path,
-    results_file,
-):
-    cfg = prepare_config_for_run(
-        config=config,
-        train_client_ids=train_client_ids,
-        test_client_ids=test_client_ids,
-        model_path=model_path,
-        db_path=db_path,
-    )
-    acceptance_period = cfg["first_model_params"]["acceptance_period"]
-    retrain_period = cfg["first_model_params"]["retrain_period"]
-    actual_model_path, test_start, test_end, train_start, train_end = get_train_test_params(
-        cfg["first_model_params"],
-        operation_mode,
-        t0,
-        acceptance_period,
-        retrain_period,
-    )
-    logging.info("=== START phase %s ===", operation_mode)
-    logging.info("train_client_id=%s", cfg["first_model_params"]["train_client_id"])
-    logging.info("test_client_id=%s", cfg["first_model_params"]["test_client_id"])
-    logging.info("database=%s", cfg["first_model_params"]["database"])
-    logging.info("test_database=%s", cfg["first_model_params"]["test_database"])
-    logging.info("model_path=%s", cfg["first_model_params"]["model_path"])
-    avg_acc = first_model.first_model(
-        actual_model_path,
-        test_start,
-        test_end,
-        train_start,
-        train_end,
-        cfg["first_model_params"],
-        operation_mode,
-        t0,
-        acceptance_period,
-        retrain_period,
-    )
-    save_model_run(results_file, cfg, operation_mode, avg_acc)
-    logging.info("=== END phase %s ===", operation_mode)
-    return avg_acc
-def run_test_for_each_client_on_shared_db(
-    config,
-    t0,
-    test_mode,
-    train_client_ids,
-    test_client_ids,
-    model_path,
-    db_path,
-    results_file,
-):
-    failures = []
-    for test_client_id in ensure_list(test_client_ids):
-        logging.info("=== START single-client test on shared DB: %s ===", test_client_id)
-        try:
-            run_phase(
-                config=config,
-                t0=t0,
-                operation_mode=test_mode,
-                train_client_ids=train_client_ids,
-                test_client_ids=test_client_id,
-                model_path=model_path,
-                db_path=db_path,
-                results_file=results_file,
-            )
-        except first_model.NoDataError as e:
-            logging.warning("[SKIP TEST] client %s: %s", test_client_id, e)
-        except Exception as e:
-            logging.exception("Test failed for client %s: %s", test_client_id, e)
-            failures.append(test_client_id)
-        logging.info("=== END single-client test on shared DB: %s ===", test_client_id)
-    return failures
-def parse_args():
-    parser = argparse.ArgumentParser(description="Batch runner for first_model on one shared DB")
-    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
-    parser.add_argument("--t0", required=True, help="Current date in YYYY-MM-DD")
-    parser.add_argument("--model-path", required=True, help="Path to .pt model")
-    parser.add_argument("--db-path", required=True, help="Path to shared SQLite DB")
-    parser.add_argument("--results-file", default="model_runs.xlsx", help="Excel file for run results")
-    parser.add_argument("--run-train", action="store_true", help="Run training phase")
-    parser.add_argument("--run-test", action="store_true", help="Run test phase")
-    parser.add_argument("--train-mode", default="train", help="Operation mode for training")
-    parser.add_argument("--test-mode", default="test_today", help="Operation mode for testing")
-    parser.add_argument("--train-client-ids", help="Single client id or comma-separated list for training")
-    parser.add_argument("--test-client-ids", help="Single client id or comma-separated list for testing")
-    return parser.parse_args()
-def main():
-    args = parse_args()
-    config = load_config(args.config)
-    t0 = datetime.strptime(args.t0, "%Y-%m-%d").date()
-    if not args.run_train and not args.run_test:
-        raise SystemExit("Podaj przynajmniej --run-train albo --run-test")
-    db_path = validate_db_path(args.db_path)
-    train_client_ids = parse_client_ids(args.train_client_ids)
-    test_client_ids = parse_client_ids(args.test_client_ids)
-    if args.run_train and train_client_ids is None:
-        raise SystemExit("Dla --run-train musisz podać --train-client-ids")
-    if args.run_test and test_client_ids is None:
-        raise SystemExit("Dla --run-test musisz podać --test-client-ids")
-    failures = []
-    model_path = args.model_path
-    # TRAIN
-    if args.run_train:
-        try:
-            effective_test_ids_for_train = test_client_ids if test_client_ids is not None else train_client_ids
-            run_phase(
-                config=config,
-                t0=t0,
-                operation_mode=args.train_mode,
-                train_client_ids=train_client_ids,
-                test_client_ids=effective_test_ids_for_train,
-                model_path=model_path,
-                db_path=db_path,
-                results_file=args.results_file,
-            )
-        except first_model.NoDataError as e:
-            logging.warning("[SKIP TRAIN] %s", e)
-        except Exception as e:
-            logging.exception("Train failed: %s", e)
-            failures.append("train")
-    # TEST
-    if args.run_test:
-        try:
-            effective_train_ids_for_test = train_client_ids if train_client_ids is not None else test_client_ids
-            if isinstance(test_client_ids, list):
-                test_failures = run_test_for_each_client_on_shared_db(
-                    config=config,
-                    t0=t0,
-                    test_mode=args.test_mode,
-                    train_client_ids=effective_train_ids_for_test,
-                    test_client_ids=test_client_ids,
-                    model_path=model_path,
-                    db_path=db_path,
-                    results_file=args.results_file,
-                )
-                if test_failures:
-                    failures.extend([f"test:{client_id}" for client_id in test_failures])
-            else:
-                run_phase(
-                    config=config,
-                    t0=t0,
-                    operation_mode=args.test_mode,
-                    train_client_ids=effective_train_ids_for_test,
-                    test_client_ids=test_client_ids,
-                    model_path=model_path,
-                    db_path=db_path,
-                    results_file=args.results_file,
-                )
-        except first_model.NoDataError as e:
-            logging.warning("[SKIP TEST] %s", e)
-        except Exception as e:
-            logging.exception("Test failed: %s", e)
-            failures.append("test")
-    if failures:
-        raise SystemExit(f"Run finished with failures in phases: {failures}")
-if __name__ == "__main__":
-    main()
+
+Potem logika:
+
+    if append_if_exists:
+        if not table_exists:
+            create_table_query = f"CREATE TABLE {sanitized_table_name} ({', '.join(columns_sql)});"
+            cursor.execute(create_table_query)
+    else:
+        cursor.execute(f"DROP TABLE IF EXISTS {sanitized_table_name};")
+        create_table_query = f"CREATE TABLE {sanitized_table_name} ({', '.join(columns_sql)});"
+        cursor.execute(create_table_query)
+
+A w write_output_to_db(...) dodaj parametr:
+
+def write_output_to_db(df, table_name, params, original_table_name=None, currently_testing=False, create_indexes=False, index_columns=None, append_if_exists=False):
+
+i przekaż dalej.
+
+A w first_model.py wywołaj:
+
+write_output_to_db(
+    final_output_df,
+    'first_model_tab',
+    params,
+    original_table_name="first_model_tab",
+    currently_testing=True,
+    create_indexes=False,
+    index_columns=None,
+    append_if_exists=True
+)
+
+To jest czystsze niż specjalny if sanitized_table_name == "first_model_tab".
 
 ⸻
 
-Co konkretnie się zmieniło
+Co jeszcze warto dodać
 
-Usunięte
+Skoro tabela będzie appendowana, to dobrze dać też techniczne kolumny:
 
-Usunąłem:
+* RunIdentifier
+* InsertTimestamp
+* opcjonalnie OperationMode
+* opcjonalnie ModelPath
 
-* build_db_path
-* build_db_path_from_template
-* resolve_db_path
-* --db-root
-* --train-db-path
-* --test-db-path
-* --test-db-template
-* --client-id
-* --client-list
+Najmniejsza sensowna wersja:
 
-Bo to wszystko było z logiki:
-wiele plików baz per klient
+run_identifier = f"{operation_mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+insert_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+final_output_df.insert(0, "RunIdentifier", run_identifier)
+final_output_df["InsertTimestamp"] = insert_timestamp
 
-a Ty już jesteś w logice:
-jedna wspólna baza
+Wtedy do configa dodajesz jeszcze:
 
-⸻
+- ["InsertTimestamp", "DATETIME"]
 
-Dodane / zmienione
-
-1. --db-path
-
-Jeden obowiązkowy parametr bazy wspólnej.
-
-2. validate_db_path
-
-Prosta walidacja jednej wspólnej bazy.
-
-3. run_test_for_each_client_on_shared_db
-
-Nowa wersja iteracji po klientach testowych, ale na tej samej bazie.
-
-4. prepare_config_for_run
-
-Ustawia:
-
-* database = db_path
-* test_database = db_path
-
-czyli oba wskazują na tę samą wspólną bazę.
+To bardzo pomoże później filtrować wyniki.
 
 ⸻
 
-Jak teraz wygląda flow
+Minimalny zestaw zmian, który polecam teraz
 
-Test
+W config.yaml
 
-Przykład:
+Dodać:
 
-python runner_batch.py ^
-  --t0 2026-01-01 ^
-  --run-test ^
-  --test-client-ids 13581,10095,6089,8964,8989 ^
-  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db ^
-  --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+* query_create_first_model_tab
+* najlepiej też first_model_output_columns pomocniczo
 
-Działanie:
+W db_init.py
 
-* runner otwiera tę samą bazę CashPredictor2.db,
-* dla każdego klienta z listy uruchamia test osobno,
-* zmienia się tylko test_client_id.
+Dodać:
 
-Train
+exec_sql(conn, params.get("query_create_first_model_tab"), "query_create_first_model_tab")
 
-python runner_batch.py ^
-  --t0 2026-01-01 ^
-  --run-train ^
-  --train-client-ids 10069,9320,13581 ^
-  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db ^
-  --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+i indeksy dla first_model_tab.
 
-Działanie:
+W first_model.py
 
-* train idzie na jednej bazie wspólnej,
-* na wskazanej liście klientów treningowych.
+Dodać:
 
-Train + test
+* RunIdentifier
+* opcjonalnie InsertTimestamp
 
-python runner_batch.py ^
-  --t0 2026-01-01 ^
-  --run-train ^
-  --run-test ^
-  --train-client-ids 10069,9320,13581 ^
-  --test-client-ids 13581,10095,6089 ^
-  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db ^
-  --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+W database.py
+
+Usunąć dla first_model_tab:
+
+* DELETE
+* DROP TABLE
+* CREATE TABLE przy każdym runie
+
+i przejść na append.
 
 ⸻
 
-Na co jeszcze uważać
+Najkrótsza wersja „co podmienić”
 
-Są jeszcze 3 rzeczy do sprawdzenia poza runnerem:
+1. db_init.py — dodać
 
-1. first_model.py
+exec_sql(conn, params.get("query_create_first_model_tab"), "query_create_first_model_tab")
 
-Musi rzeczywiście poprawnie obsługiwać:
+2. first_model.py — podmienić końcówkę
 
-* train_client_id jako listę,
-* test_client_id jako pojedynczy klient lub listę,
-* oraz jedną wspólną bazę.
+Z:
 
-Jeżeli tam są jeszcze założenia „1 klient = 1 baza”, to runner sam tego nie naprawi.
+write_output_to_db(final_output_df, 'first_model_tab', params, original_table_name=None, currently_testing=True, create_indexes=True, index_columns=[ 'INVO_NO', 'INVO_DEBC_NO', 'INVO_INVDATE', 'DZIEN', 'INVO_FINALPAYMENTDATE', 'PREDICTED_PAYMENT_DATE'])
 
-2. save_model_run
+Na:
 
-Teraz zapisuję train_client_id i test_client_id jako str(...), bo przy listach Excel lubi potem robić bałagan. To jest bezpieczniejsze.
+run_identifier = f"{operation_mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+insert_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+final_output_df = final_output_df.copy()
+final_output_df.insert(0, "RunIdentifier", run_identifier)
+final_output_df["InsertTimestamp"] = insert_timestamp
+write_output_to_db(
+    final_output_df,
+    'first_model_tab',
+    params,
+    original_table_name="first_model_tab",
+    currently_testing=True,
+    create_indexes=False,
+    index_columns=None,
+    append_if_exists=True
+)
 
-3. Wyniki testu
+3. database.py — dodać parametr
 
-Przy wspólnej bazie test per klient jest nadal sensowny, bo:
+W write_output_to_db i create_and_insert_processed_table:
 
-* masz raport per klient,
-* łatwo zobaczyć, komu test się wywalił,
-* zachowujesz kontrolę jak wcześniej.
+append_if_exists=False
+
+i zrobić dla append brak DROP/CREATE.
 
 ⸻
 
-Krótkie uzasadnienie architektoniczne
-
-Te zmiany są dobre, bo:
-
-* upraszczają runner do aktualnego modelu danych,
-* usuwają przejściowe relikty,
-* zostawiają minimalną zmianę względem first_model,
-* wspierają Twój kolejny krok: dalsze odchudzanie i uproszczenie projektu.
-
-To jest dokładnie ruch z:
-“wiele plikowych baz klientowych”
-na
-“jedna baza, wielu klientów, filtrowanie logiczne”.
-
-Jeżeli chcesz, w następnym kroku mogę Ci od razu zrobić też wersję uproszczoną runner_batch.py jeszcze bardziej, już w stylu etapu 1.6, z mniejszą liczbą helperów i bardziej zwartym kodem.
+Jeśli chcesz, w kolejnym kroku mogę Ci od razu rozpisać gotowy blok query_create_first_model_tab w YAML w formie generatora: uruchamiasz skrypt raz, on wypluwa kompletny CREATE TABLE gotowy do wklejenia do configa.
