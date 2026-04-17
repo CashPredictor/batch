@@ -1,234 +1,3633 @@
-Tak — najprościej zrobić to tak:
+mamy już kod runner_batch.py po pierwszym etapie:import argparse
+import copy
+import logging
+import os
+from datetime import datetime
 
-1. zostawić obecny sposób ładowania z baz, bo działa,
-2. porównywać tylko dataset,
-3. przed porównaniem usunąć z analizy techniczną kolumnę __CLIENT_ID,
-4. dodatkowo ograniczyć nową bazę do tego samego klienta,
-5. porównywać tylko wspólne kolumny,
-6. klucz porównania zrobić jako:
-    * INVO_NO
-    * DZIEN
-    * __CLIENT_ID
+import pandas as pd
+import yaml
 
-Dzięki temu:
+import first_model
+from first_model import get_train_test_params
 
-* nie dostaniesz fałszywych różnic tylko dlatego, że w jednej bazie klient jest “w nazwie pliku”, a w drugiej “w kolumnie”,
-* zachowasz dokładnie logikę porównywania feature’ów z Twojego działającego kodu,
-* skupisz się na dataset, czyli finalnym wyniku całego pipeline.
 
-Najważniejsza zmiana względem Twojego kodu jest taka, że:
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
-* __CLIENT_ID ma wejść do klucza merge,
-* ale nie ma wejść do feature_cols.
 
-Poniżej gotowy kod.
+def load_config(config_path="config.yaml"):
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
+
+def save_model_run(results_file, config, operation_mode, avg_accuracy):
+    row_data = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "train_client_id": config["first_model_params"]["train_client_id"],
+        "test_client_id": config["first_model_params"]["test_client_id"],
+        "model_path": config["first_model_params"]["model_path"],
+        "database": config["first_model_params"]["database"],
+        "test_database": config["first_model_params"].get("test_database"),
+        "operation_mode": operation_mode,
+        "avg_accuracy": avg_accuracy,
+    }
+
+    df_new = pd.DataFrame([row_data])
+
+    if not os.path.exists(results_file):
+        df_new.to_excel(results_file, index=False, sheet_name="runs")
+        logging.info("Created results file: %s", results_file)
+    else:
+        existing_df = pd.read_excel(results_file, sheet_name="runs")
+        combined_df = pd.concat([existing_df, df_new], ignore_index=True)
+        combined_df.to_excel(results_file, index=False, sheet_name="runs")
+        logging.info("Appended run to results file: %s", results_file)
+
+
+def build_db_path(db_root, t0_str, client_id):
+    return os.path.join(db_root, t0_str, t0_str, f"CashPredictorT_{client_id}.db")
+
+def build_db_path_from_template(db_template, client_id):
+    """
+    Przykład template:
+    C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictorT_{client_id}.db
+    """
+    return db_template.format(client_id=client_id)
+
+def parse_client_ids(raw_value):
+    if raw_value is None:
+        return None
+
+    parts = [x.strip() for x in str(raw_value).split(",") if x.strip()]
+    ids = [int(x) for x in parts]
+
+    if len(ids) == 1:
+        return ids[0]
+    return ids
+
+def ensure_list(client_ids):
+    if client_ids is None:
+        return []
+    if isinstance(client_ids, list):
+        return client_ids
+    return [client_ids]
+
+
+def resolve_db_path(db_root, t0, client_ids, explicit_db_path=None):
+    if explicit_db_path:
+        if not os.path.exists(explicit_db_path):
+            raise FileNotFoundError(f"Baza nie istnieje: {explicit_db_path}")
+        return explicit_db_path
+
+    if isinstance(client_ids, list):
+        raise ValueError(
+            "Dla wielu client IDs musisz podać jawnie --train-db-path albo --test-db-path"
+        )
+
+    t0_str = t0.strftime("%Y-%m-%d")
+    db_path = build_db_path(db_root, t0_str, client_ids)
+
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"Baza nie istnieje: {db_path}")
+
+    return db_path
+
+
+def prepare_config_for_run(
+    config,
+    train_client_ids,
+    test_client_ids,
+    model_path,
+    train_db_path,
+    test_db_path,
+):
+    cfg = copy.deepcopy(config)
+
+    cfg["first_model_params"]["train_client_id"] = train_client_ids
+    cfg["first_model_params"]["test_client_id"] = test_client_ids
+    cfg["first_model_params"]["database"] = train_db_path
+    cfg["first_model_params"]["test_database"] = test_db_path
+    cfg["first_model_params"]["model_path"] = model_path
+
+    # jeśli te pola istnieją/mają znaczenie w first_model
+    cfg["first_model_params"]["client_ids_to_train_on_one_db"] = train_client_ids
+    cfg["first_model_params"]["client_ids_to_test_on_one_db"] = test_client_ids
+
+    return cfg
+
+
+def run_phase(
+    config,
+    t0,
+    operation_mode,
+    train_client_ids,
+    test_client_ids,
+    model_path,
+    train_db_path,
+    test_db_path,
+    results_file,
+):
+    cfg = prepare_config_for_run(
+        config=config,
+        train_client_ids=train_client_ids,
+        test_client_ids=test_client_ids,
+        model_path=model_path,
+        train_db_path=train_db_path,
+        test_db_path=test_db_path,
+    )
+
+    acceptance_period = cfg["first_model_params"]["acceptance_period"]
+    retrain_period = cfg["first_model_params"]["retrain_period"]
+
+    actual_model_path, test_start, test_end, train_start, train_end = get_train_test_params(
+        cfg["first_model_params"],
+        operation_mode,
+        t0,
+        acceptance_period,
+        retrain_period,
+    )
+
+    logging.info("=== START phase %s ===", operation_mode)
+    logging.info("train_client_id=%s", cfg["first_model_params"]["train_client_id"])
+    logging.info("test_client_id=%s", cfg["first_model_params"]["test_client_id"])
+    logging.info("database=%s", cfg["first_model_params"]["database"])
+    logging.info("test_database=%s", cfg["first_model_params"]["test_database"])
+    logging.info("model_path=%s", cfg["first_model_params"]["model_path"])
+
+    avg_acc = first_model.first_model(
+        actual_model_path,
+        test_start,
+        test_end,
+        train_start,
+        train_end,
+        cfg["first_model_params"],
+        operation_mode,
+        t0,
+        acceptance_period,
+        retrain_period,
+    )
+
+    save_model_run(results_file, cfg, operation_mode, avg_acc)
+
+    logging.info("=== END phase %s ===", operation_mode)
+    return avg_acc
+
+def run_test_for_each_client(
+    config,
+    t0,
+    test_mode,
+    train_client_ids,
+    test_client_ids,
+    model_path,
+    test_db_template,
+    results_file,
+):
+    failures = []
+
+    for test_client_id in ensure_list(test_client_ids):
+        logging.info("=== START single-client test: %s ===", test_client_id)
+
+        try:
+            test_db_path = build_db_path_from_template(test_db_template, test_client_id)
+
+            if not os.path.exists(test_db_path):
+                raise FileNotFoundError(f"Baza nie istnieje: {test_db_path}")
+
+            # w trybie pomostowym test ma czytać i zapisywać do pojedynczej bazy klienta
+            run_phase(
+                config=config,
+                t0=t0,
+                operation_mode=test_mode,
+                train_client_ids=train_client_ids,
+                test_client_ids=test_client_id,
+                model_path=model_path,
+                train_db_path=test_db_path,
+                test_db_path=test_db_path,
+                results_file=results_file,
+            )
+
+        except first_model.NoDataError as e:
+            logging.warning("[SKIP TEST] client %s: %s", test_client_id, e)
+        except Exception as e:
+            logging.exception("Test failed for client %s: %s", test_client_id, e)
+            failures.append(test_client_id)
+
+        logging.info("=== END single-client test: %s ===", test_client_id)
+
+    return failures
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Batch runner for first_model")
+
+    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+    parser.add_argument("--t0", required=True, help="Current date in YYYY-MM-DD")
+    parser.add_argument("--model-path", required=True, help="Base path to .pt model")
+    parser.add_argument("--db-root", default="databases", help="Root directory for per-client databases")
+    parser.add_argument("--results-file", default="model_runs.xlsx", help="Excel file for run results")
+
+    parser.add_argument("--run-train", action="store_true", help="Run training phase")
+    parser.add_argument("--run-test", action="store_true", help="Run test phase")
+
+    parser.add_argument("--train-mode", default="train", help="Operation mode for training")
+    parser.add_argument("--test-mode", default="test_today", help="Operation mode for testing")
+
+    parser.add_argument("--train-client-ids", help="Single client id or comma-separated list for training")
+    parser.add_argument("--test-client-ids", help="Single client id or comma-separated list for testing")
+
+    parser.add_argument("--train-db-path", help="Explicit DB path for training")
+    parser.add_argument("--test-db-path", help="Explicit DB path for testing")
+
+    parser.add_argument("--test-db-template", help="Template path for per-client test DB, e.g. C:/.../CashPredictorT_{client_id}.db")    
+
+    # opcjonalnie dla zgodności wstecznej z Twoim starym test runnerem
+    parser.add_argument("--client-id", type=int, help="Single client id shortcut for test")
+    parser.add_argument("--client-list", help="Comma separated client ids shortcut for test")
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    config = load_config(args.config)
+    t0 = datetime.strptime(args.t0, "%Y-%m-%d").date()
+
+    if not args.run_train and not args.run_test:
+        raise SystemExit("Podaj przynajmniej --run-train albo --run-test")
+
+    # zgodność wsteczna: stary test runner
+    fallback_test_client_ids = None
+    if args.client_id is not None:
+        fallback_test_client_ids = args.client_id
+    elif args.client_list:
+        fallback_test_client_ids = [int(x.strip()) for x in args.client_list.split(",") if x.strip()]
+
+    train_client_ids = parse_client_ids(args.train_client_ids)
+    test_client_ids = parse_client_ids(args.test_client_ids)
+
+    if test_client_ids is None and fallback_test_client_ids is not None:
+        test_client_ids = fallback_test_client_ids
+
+    if args.run_train and train_client_ids is None:
+        raise SystemExit("Dla --run-train musisz podać --train-client-ids")
+
+    if args.run_test and test_client_ids is None:
+        raise SystemExit("Dla --run-test musisz podać --test-client-ids albo --client-id/--client-list")
+
+    failures = []
+
+    trained_model_path = args.model_path
+
+    # TRAIN
+    if args.run_train:
+        try:
+            train_db_path = resolve_db_path(
+                db_root=args.db_root,
+                t0=t0,
+                client_ids=train_client_ids,
+                explicit_db_path=args.train_db_path,
+            )
+
+            # przy samym train test_client_ids może być takie samo jak train_client_ids
+            effective_test_ids_for_train = test_client_ids if test_client_ids is not None else train_client_ids
+
+            run_phase(
+                config=config,
+                t0=t0,
+                operation_mode=args.train_mode,
+                train_client_ids=train_client_ids,
+                test_client_ids=effective_test_ids_for_train,
+                model_path=trained_model_path,
+                train_db_path=train_db_path,
+                test_db_path=train_db_path,
+                results_file=args.results_file,
+            )
+        except first_model.NoDataError as e:
+            logging.warning("[SKIP TRAIN] %s", e)
+        except Exception as e:
+            logging.exception("Train failed: %s", e)
+            failures.append("train")
+
+    # TEST
+    if args.run_test:
+        try:
+            effective_train_ids_for_test = train_client_ids if train_client_ids is not None else test_client_ids
+
+            # TRYB POMOSTOWY:
+            # test wielu klientów przez pętlę po pojedynczych bazach
+            if isinstance(test_client_ids, list):
+                if not args.test_db_template:
+                    raise SystemExit(
+                        "Dla testu wielu klientów w rozwiązaniu pomostowym musisz podać --test-db-template"
+                    )
+
+                test_failures = run_test_for_each_client(
+                    config=config,
+                    t0=t0,
+                    test_mode=args.test_mode,
+                    train_client_ids=effective_train_ids_for_test,
+                    test_client_ids=test_client_ids,
+                    model_path=trained_model_path,
+                    test_db_template=args.test_db_template,
+                    results_file=args.results_file,
+                )
+
+                if test_failures:
+                    failures.extend([f"test:{client_id}" for client_id in test_failures])
+
+            else:
+                # stary wariant: test jednego klienta
+                test_db_path = resolve_db_path(
+                    db_root=args.db_root,
+                    t0=t0,
+                    client_ids=test_client_ids,
+                    explicit_db_path=args.test_db_path,
+                )
+
+                run_phase(
+                    config=config,
+                    t0=t0,
+                    operation_mode=args.test_mode,
+                    train_client_ids=effective_train_ids_for_test,
+                    test_client_ids=test_client_ids,
+                    model_path=trained_model_path,
+                    train_db_path=test_db_path,
+                    test_db_path=test_db_path,
+                    results_file=args.results_file,
+                )
+
+        except first_model.NoDataError as e:
+            logging.warning("[SKIP TEST] %s", e)
+        except Exception as e:
+            logging.exception("Test failed: %s", e)
+            failures.append("test")
+
+    if failures:
+        raise SystemExit(f"Run finished with failures in phases: {failures}")
+
+
+
+🔵 KONTEKST PROJEKTU – APLIKACJA CASH PREDICTOR (ML PIPELINE)
+
+1. Opis aplikacji
+
+Aplikacja jest systemem ML do prognozowania spływu należności (cash flow) na podstawie danych o fakturach i historii płatności.
+
+Biznesowo:
+	•	przewiduje, kiedy faktury zostaną zapłacone,
+	•	wspiera prognozowanie wpływów finansowych,
+	•	umożliwia analizę zachowań płatniczych klientów.
+
+Technicznie:
+Aplikacja działa jako pipeline przetwarzania danych + modele ML:
+	1.	Wejście danych
+	•	pliki Excel (arkusze: INVO, DEBC, CLHS, DCMO),
+	•	dane o fakturach, klientach, historii płatności.
+	2.	ETL / przygotowanie danych
+	•	CreateDatabase.py:
+	•	ładuje dane z Excela,
+	•	tworzy tabele i widoki,
+	•	buduje dataset do modelu.
+	3.	Model 1 (first_model)
+	•	model ML przewidujący datę zapłaty faktury,
+	•	zapis wyników do bazy,
+	•	zapis modelu do pliku .pt.
+	4.	(w dalszej wersji – poza MVP)
+	•	przygotowanie danych do modelu 2,
+	•	model 2 (cash flow),
+	•	agregacja i wizualizacja.
+
+⸻
+
+2. Aktualny stan aplikacji
+
+Baza danych:
+	•	lokalna SQLite (.db)
+	•	użycie:
+	•	sqlite3
+	•	PRAGMA
+	•	dynamiczne DROP TABLE / CREATE TABLE
+	•	widoki SQL
+
+Dane:
+	•	wejście z plików Excel (lokalne ścieżki)
+
+Modele:
+	•	pliki .pt zapisywane lokalnie
+
+Sterowanie:
+	•	main.py:
+	•	interaktywny (input()),
+	•	wybór trybu działania,
+	•	wybór klienta, bazy, modelu,
+	•	sterowanie całym pipeline (ETL + modele + wizualizacja)
+
+Struktura głównych plików:
+	•	main.py – interaktywny orchestrator
+	•	main_batch.py – uproszczony batch run
+	•	CreateDatabase.py – ETL i budowa bazy
+	•	database.py – operacje na SQLite
+	•	first_model.py – model ML (główny etap)
+	•	prep_data_for_sec_mod.py – przygotowanie danych do modelu 2
+	•	second_model.py – drugi model
+	•	cash_flow_visualization.py – agregacja i raporty
+	•	config.yaml – konfiguracja
+
+⸻
+
+3. Główne problemy
+
+Architektura:
+	•	brak rozdziału warstw (ETL / model / storage / orchestracja)
+	•	logika biznesowa i techniczna wymieszana
+
+Sterowanie:
+	•	interaktywność (input()) → brak automatyzacji
+	•	brak jednoznacznego entrypointu
+
+Baza danych:
+	•	SQLite (lokalne pliki)
+	•	dynamiczne tworzenie schematu
+	•	brak migracji i wersjonowania
+
+Deployment:
+	•	brak konteneryzacji
+	•	brak środowiska chmurowego
+	•	brak pipeline CI/CD
+
+Storage:
+	•	lokalne pliki:
+	•	Excel
+	•	modele .pt
+	•	bazy .db
+
+⸻
+
+4. Docelowa architektura (GCP)
+
+Aplikacja ma zostać przeniesiona na architekturę zgodną z GCP:
+
+Compute:
+	•	GKE (Google Kubernetes Engine)
+
+Baza danych:
+	•	Cloud SQL (PostgreSQL)
+
+Storage:
+	•	Cloud Storage (GCS):
+	•	dane wejściowe,
+	•	modele,
+	•	eksporty
+
+Sekrety:
+	•	Secret Manager
+
+Komunikacja z DB:
+	•	przez Cloud SQL Proxy (sidecar w GKE)
+
+Deployment:
+	•	kontenery Docker
+	•	pipeline (Azure Pipeline / OnePipeline)
+
+Model działania:
+	•	batch job (Kubernetes Job)
+	•	brak API na start
+
+⸻
+
+5. Założenia projektowe
+
+Projekt realizowany jest etapowo:
+
+MVP (pierwszy etap):
+	•	tylko:
+	•	CreateDatabase (opcjonalnie)
+	•	first_model
+	•	bez:
+	•	second_model
+	•	wizualizacji
+	•	agregacji cash flow
+
+Kolejność:
+	1.	uproszczenie aplikacji (first_model only)
+	2.	usunięcie interaktywności
+	3.	stabilizacja lokalna
+	4.	migracja SQLite → PostgreSQL (lokalnie)
+	5.	uporządkowanie schematu (SQLAlchemy + Alembic)
+	6.	konteneryzacja
+	7.	GKE + Cloud SQL (DEV)
+	8.	dalsza rozbudowa
+
+Kluczowa zasada:
+👉 najpierw działa lokalnie → potem przenosimy na GCP
+
+⸻
+
+6. Styl działania aplikacji
+
+Model uruchamiania:
+	•	batch / job
+	•	nie serwis
+
+Mechanizm:
+	•	uruchamiany runner (CLI / parametry)
+	•	wykonuje:
+	•	ETL (opcjonalnie)
+	•	model 1
+	•	zapisuje wyniki
+	•	kończy działanie
+
+Na start:
+	•	brak:
+	•	API
+	•	schedulerów
+	•	stale działającej aplikacji
+
+Docelowo:
+	•	możliwe rozszerzenie o:
+	•	API
+	•	harmonogram
+	•	podział na komponenty
+
+⸻
+
+🔻 PODSUMOWANIE
+
+To jest:
+👉 lokalny pipeline ML (Python + SQLite + Excel)
+który ma zostać przekształcony w:
+👉 batchową aplikację kontenerową działającą w GKE z Cloud SQL
+
+Pierwszy cel:
+👉 wydzielenie i uruchomienie first_model jako niezależnego batch joba
+
+⸻
+
+Poniżej masz gotowy szczegółowy plan etapowy do wklejenia do nowego czata.
+
+⸻
+
+🔵 PLAN ETAPOWY MIGRACJI APLIKACJI
+
+Projekt dotyczy migracji lokalnej aplikacji ML / data pipeline do architektury zgodnej z GCP.
+Założenie: pracujemy etapowo, ograniczamy zakres do MVP = first_model only, a po każdym etapie uruchamiamy aplikację i sprawdzamy, czy nadal działa.
+Docelowo aplikacja ma działać jako batch job, nie jako stale działający serwis.
+
+⸻
+
+ETAP 1 — first_model_only refactor
+
+Cel
+
+Uprościć aplikację do minimalnego, działającego zakresu:
+	•	opcjonalne przygotowanie bazy,
+	•	uruchomienie tylko first_model,
+	•	całkowite wyłączenie drugiego modelu i warstwy cash flow.
+
+To jest etap redukcji złożoności i wydzielenia MVP.
+
+Zakres
+	•	usunięcie zależności od pełnego pipeline’u,
+	•	odcięcie etapów:
+	•	prep_data_for_sec_mod.py
+	•	second_model.py
+	•	cash_flow_visualization.py
+	•	pozostawienie tylko:
+	•	CreateDatabase.py (opcjonalnie)
+	•	first_model.py
+	•	database.py
+	•	config potrzebny do modelu 1
+
+Co zmieniamy w kodzie
+	•	przestajemy używać obecnego main.py jako centralnego sterownika,
+	•	tworzymy nowy prosty entrypoint, np.:
+	•	runner_first_model.py
+	•	nowy runner ma obsługiwać tylko:
+	•	create-db
+	•	run-first-model
+	•	usuwamy z flow wszystkie odniesienia do modelu 2 i wizualizacji,
+	•	upraszczamy config do zakresu first model only,
+	•	porządkujemy parametry wejściowe dla modelu 1.
+
+Jakie pliki są używane
+	•	first_model.py
+	•	database.py
+	•	CreateDatabase.py (jeśli dalej budujemy bazę z Excela)
+	•	config.yaml lub jego uproszczona wersja
+	•	nowy runner_first_model.py
+
+Jakie pliki są wyłączone
+	•	prep_data_for_sec_mod.py
+	•	second_model.py
+	•	cash_flow_visualization.py
+	•	większość logiki obecnego main.py
+	•	ewentualnie clustering_before_first_model.py, jeśli nie jest wymagany do działania MVP
+
+Kryterium zakończenia etapu
+	•	aplikacja uruchamia tylko first model,
+	•	można uruchomić ją bez odwołań do modelu 2,
+	•	nie ma potrzeby korzystania z pełnego main.py,
+	•	wynik first model zapisuje się poprawnie,
+	•	działa powtarzalnie lokalnie.
+
+⸻
+
+ETAP 2 — struktura kodu
+
+Cel
+
+Uporządkować projekt tak, aby był łatwy do dalszej migracji:
+	•	czytelny podział odpowiedzialności,
+	•	prostsze testowanie,
+	•	łatwiejsze późniejsze przejście na PostgreSQL, kontenery i GCP.
+
+Zakres
+	•	wydzielenie warstw:
+	•	runner / entrypoint
+	•	service layer
+	•	repository / storage
+	•	config
+	•	ograniczenie bezpośrednich zależności między modułami,
+	•	odseparowanie logiki wykonania od logiki infrastrukturalnej.
+
+Co zmieniamy w kodzie
+	•	tworzymy nową strukturę katalogów, np.:
+	•	app/
+	•	services/
+	•	repositories/
+	•	config/
+	•	legacy/
+	•	runner_first_model.py ma wywoływać warstwę usług, nie bezpośrednio cały chaos starego kodu,
+	•	tworzymy np.:
+	•	first_model_service.py
+	•	db_build_service.py
+	•	settings.py
+	•	stary kod może zostać tymczasowo w legacy/, jeśli nie chcemy go jeszcze przepisywać w całości,
+	•	zaczynamy wprowadzać jasny model parametrów wejściowych.
+
+Jakie pliki są używane
+	•	nowy runner_first_model.py
+	•	nowe pliki typu:
+	•	first_model_service.py
+	•	db_build_service.py
+	•	settings.py
+	•	nadal:
+	•	first_model.py
+	•	database.py
+	•	CreateDatabase.py
+
+Jakie pliki są wyłączone
+	•	main.py
+	•	main_batch.py jako główny sposób uruchamiania
+	•	nadal wyłączone:
+	•	prep_data_for_sec_mod.py
+	•	second_model.py
+	•	cash_flow_visualization.py
+
+Kryterium zakończenia etapu
+	•	aplikacja ma jeden prosty i czytelny entrypoint,
+	•	wiadomo, gdzie jest:
+	•	logika uruchamiania,
+	•	logika biznesowa,
+	•	logika bazy,
+	•	config,
+	•	można wskazać jednoznacznie, które moduły są aktywne, a które legacy,
+	•	first model nadal działa po zmianie struktury.
+
+⸻
+
+ETAP 3 — konteneryzacja (i test po etapie)
+
+Cel
+
+Spakować aplikację do kontenera i potwierdzić, że działa identycznie jak lokalnie.
+
+To jest etap przygotowania do środowiska docelowego, ale jeszcze bez GKE i bez Cloud SQL.
+
+Zakres
+	•	przygotowanie Dockerfile,
+	•	zdefiniowanie sposobu uruchamiania kontenera,
+	•	zapewnienie, że kontener wykonuje batch job,
+	•	sprawdzenie działania w kontenerze po każdej większej zmianie.
+
+Co zmieniamy w kodzie
+	•	eliminujemy wszystko, co zależy od lokalnego, niestabilnego środowiska,
+	•	porządkujemy ścieżki do plików,
+	•	przygotowujemy aplikację do pracy przez:
+	•	CLI args
+	•	env vars
+	•	config file
+	•	upewniamy się, że nie ma ukrytych zależności od środowiska lokalnego użytkownika,
+	•	dodajemy pliki:
+	•	Dockerfile
+	•	.dockerignore
+	•	ewentualny prosty skrypt uruchomieniowy
+
+Jakie pliki są używane
+	•	cała aktywna wersja MVP z etapu 2
+	•	Dockerfile
+	•	.dockerignore
+	•	ewentualny entrypoint.sh / run.sh
+
+Jakie pliki są wyłączone
+	•	nadal nie używamy:
+	•	second_model.py
+	•	prep_data_for_sec_mod.py
+	•	cash_flow_visualization.py
+	•	nadal nie używamy starego interaktywnego main.py
+
+Kryterium zakończenia etapu
+	•	aplikacja buduje się w Dockerze,
+	•	można uruchomić kontener lokalnie i wykonać batch run,
+	•	wyniki są zgodne z uruchomieniem bez Dockera,
+	•	po każdej zmianie można sprawdzić działanie przez uruchomienie kontenera.
+
+⸻
+
+ETAP 4 — schema + Alembic
+
+Cel
+
+Wprowadzić kontrolowany, wersjonowany schemat trwałej bazy danych.
+
+To etap przygotowania warstwy danych do migracji z SQLite na PostgreSQL.
+
+Zakres
+	•	identyfikacja tabel trwałych,
+	•	zaprojektowanie schematu danych dla MVP,
+	•	przygotowanie migracji,
+	•	oddzielenie trwałego schematu od stagingu i tabel tymczasowych.
+
+Co zmieniamy w kodzie
+	•	definiujemy, które tabele są:
+	•	trwałe,
+	•	techniczne,
+	•	stagingowe,
+	•	wynikowe,
+	•	dodajemy:
+	•	SQLAlchemy
+	•	Alembic
+	•	tworzymy modele lub definicje tabel dla części trwałej,
+	•	przygotowujemy pierwszą migrację schematu,
+	•	nie przenosimy na ORM całej logiki ETL, tylko trwały schemat.
+
+Jakie pliki są używane
+	•	nowa warstwa DB:
+	•	np. models.py
+	•	alembic/
+	•	db.py / repositories/
+	•	nadal:
+	•	runner_first_model.py
+	•	first_model.py
+	•	ewentualnie CreateDatabase.py w ograniczonym zakresie
+
+Jakie pliki są wyłączone
+	•	nadal:
+	•	second_model.py
+	•	prep_data_for_sec_mod.py
+	•	cash_flow_visualization.py
+	•	stare, w pełni dynamiczne podejście do tworzenia wszystkich tabel powinno być stopniowo wygaszane
+
+Kryterium zakończenia etapu
+	•	istnieje jawnie opisany schemat trwałej bazy,
+	•	migracje są wersjonowane,
+	•	wiadomo, które elementy są zarządzane przez Alembic, a które nie,
+	•	first model da się nadal uruchomić na dotychczasowym środowisku.
+
+⸻
+
+ETAP 5 — PostgreSQL lokalnie
+
+Cel
+
+Przenieść aktywną wersję MVP ze SQLite na lokalny PostgreSQL.
+
+To etap oddzielający migrację bazy od migracji infrastruktury chmurowej.
+
+Zakres
+	•	zamiana warstwy połączenia do DB,
+	•	przepięcie odczytu i zapisu,
+	•	dostosowanie SQL,
+	•	weryfikacja zgodności danych i wyników.
+
+Co zmieniamy w kodzie
+	•	odchodzimy od:
+	•	sqlite3
+	•	PRAGMA
+	•	sqlite-specific SQL
+	•	wprowadzamy połączenie do PostgreSQL,
+	•	przepinamy repository / DB access layer,
+	•	dostosowujemy zapytania SQL i transformacje,
+	•	weryfikujemy sposób tworzenia tabel, indeksów, zapisów wyników,
+	•	staging może jeszcze tymczasowo działać bardziej technicznie, ale trwała część ma już być kontrolowana.
+
+Jakie pliki są używane
+	•	aktywny runner i service layer
+	•	nowa warstwa PostgreSQL
+	•	Alembic / schema
+	•	first_model.py
+	•	ograniczony zakres CreateDatabase.py lub jego refaktor
+
+Jakie pliki są wyłączone
+	•	nadal nie używamy:
+	•	second_model.py
+	•	prep_data_for_sec_mod.py
+	•	cash_flow_visualization.py
+	•	przestajemy używać bezpośrednio sqlite-specific warstwy jako aktywnej implementacji
+
+Kryterium zakończenia etapu
+	•	aplikacja działa lokalnie na PostgreSQL,
+	•	dane są poprawnie wczytywane i zapisywane,
+	•	first model wykonuje się poprawnie,
+	•	wynik jest porównywalny z wersją sqlite,
+	•	uruchomienie przez kontener również działa z PostgreSQL lokalnym.
+
+⸻
+
+ETAP 6 — GKE DEV
+
+Cel
+
+Uruchomić uproszczoną aplikację w środowisku DEV na GCP zgodnie z docelowym modelem działania.
+
+Zakres
+	•	wdrożenie kontenera do GKE DEV,
+	•	podłączenie do Cloud SQL,
+	•	wykorzystanie Secret Manager / config / storage,
+	•	uruchomienie jako batch job.
+
+Co zmieniamy w kodzie
+	•	minimalne zmiany w samym kodzie aplikacji,
+	•	głównie dostosowanie konfiguracji do środowiska chmurowego:
+	•	env vars
+	•	secrets
+	•	connection strings / proxy
+	•	bucket paths
+	•	usuwamy pozostałe zależności od lokalnych ścieżek i lokalnego storage.
+
+Jakie pliki są używane
+	•	kontener aplikacji z MVP
+	•	manifesty / Helm / deployment descriptors
+	•	konfiguracja środowiskowa
+	•	Secret Manager integration
+	•	Cloud SQL integration
+
+Jakie pliki są wyłączone
+	•	nadal wyłączone:
+	•	second_model.py
+	•	prep_data_for_sec_mod.py
+	•	cash_flow_visualization.py
+	•	nadal nie budujemy API ani stale działającego serwisu
+
+Kryterium zakończenia etapu
+	•	aplikacja działa jako batch job na GKE DEV,
+	•	łączy się z Cloud SQL,
+	•	pobiera / zapisuje dane zgodnie z założeniami,
+	•	można uruchomić pełny run first model only w DEV,
+	•	logi i statusy są dostępne.
+
+⸻
+
+ETAP 7 — pipeline
+
+Cel
+
+Zautomatyzować build, walidację i deployment zgodnie ze standardem platformowym.
+
+Zakres
+	•	CI/CD dla obrazu aplikacji,
+	•	walidacja kodu i artefaktów,
+	•	deployment do DEV,
+	•	kontrola migracji schematu,
+	•	przygotowanie pod kolejne środowiska.
+
+Co zmieniamy w kodzie
+	•	raczej niewiele w samej logice aplikacji,
+	•	dodajemy pliki i konfiguracje pipeline:
+	•	Azure Pipeline / OnePipeline
+	•	build image
+	•	testy
+	•	publish artefacts
+	•	deploy
+	•	integrujemy migracje DB z procesem deploymentu,
+	•	przygotowujemy wersjonowanie release’ów.
+
+Jakie pliki są używane
+	•	aktywna aplikacja MVP
+	•	Dockerfile
+	•	konfiguracja pipeline
+	•	manifesty / Helm
+	•	migracje Alembic
+
+Jakie pliki są wyłączone
+	•	nadal nie używamy:
+	•	second_model.py
+	•	prep_data_for_sec_mod.py
+	•	cash_flow_visualization.py
+	•	nadal nie wprowadzamy jeszcze pełnego API, jeśli nie jest potrzebne
+
+Kryterium zakończenia etapu
+	•	istnieje działający pipeline build + deploy,
+	•	obraz jest budowany automatycznie,
+	•	deployment do DEV jest powtarzalny,
+	•	migracje są wykonywane kontrolowanie,
+	•	można wdrożyć i uruchomić MVP bez ręcznej konfiguracji.
+
+⸻
+
+ETAP 8 — dalsza rozbudowa
+
+Cel
+
+Rozszerzyć MVP do docelowej, pełniejszej wersji systemu.
+
+Zakres
+
+Możliwe rozszerzenia:
+	•	przywrócenie:
+	•	prep_data_for_sec_mod.py
+	•	second_model.py
+	•	cash_flow_visualization.py
+	•	rozdzielenie CPU/GPU,
+	•	scheduler / harmonogram,
+	•	API / warstwa sterowania,
+	•	monitoring i observability,
+	•	lepsza obsługa danych wejściowych,
+	•	pełna organizacja storage i model registry.
+
+Co zmieniamy w kodzie
+	•	stopniowo włączamy kolejne moduły,
+	•	projektujemy dodatkowe entrypointy / joby / komponenty,
+	•	rozbudowujemy warstwę danych i deploymentu,
+	•	ewentualnie wprowadzamy osobne procesy:
+	•	train
+	•	inference
+	•	reporting
+
+Jakie pliki są używane
+	•	wszystkie aktywne pliki MVP
+	•	plus stopniowo:
+	•	prep_data_for_sec_mod.py
+	•	second_model.py
+	•	cash_flow_visualization.py
+
+Jakie pliki są wyłączone
+	•	brak stałego wyłączenia; zależnie od kierunku rozbudowy
+	•	stare legacy elementy powinny być stopniowo usuwane, nie tylko omijane
+
+Kryterium zakończenia etapu
+	•	system obsługuje więcej niż first model,
+	•	architektura pozostaje spójna mimo rozbudowy,
+	•	każdy nowy komponent ma własny, czytelny sposób uruchamiania,
+	•	nie wracamy do monolitycznego, interaktywnego stylu z main.py.
+
+⸻
+
+🔻 ZASADA WSPÓLNA DLA WSZYSTKICH ETAPÓW
+
+Po każdym etapie:
+	1.	uruchamiamy aplikację,
+	2.	najlepiej uruchamiamy ją także w kontenerze,
+	3.	sprawdzamy, czy:
+	•	działa,
+	•	wynik się zapisuje,
+	•	flow jest powtarzalny,
+	•	nie zepsuliśmy MVP.
+
+⸻
+
+🔻 PODSUMOWANIE KOLEJNOŚCI
+	1.	first_model_only refactor
+	2.	struktura kodu
+	3.	konteneryzacja
+	4.	schema + Alembic
+	5.	PostgreSQL lokalnie
+	6.	GKE DEV
+	7.	pipeline
+	8.	dalsza rozbudowa
+
+⸻
+
+🔻 DEFINICJA MVP
+
+MVP tego projektu to:
+	•	brak interaktywnego main.py,
+	•	prosty runner batchowy,
+	•	obsługa tylko first model,
+	•	możliwość działania lokalnie,
+	•	możliwość uruchomienia w kontenerze,
+	•	później migracja na PostgreSQL i GCP.
+
+⸻
+stan aplikacji przed realizacją etapu pośredniego 1.5  – kontekst techniczny 
+
+1. Lista plików i ich rola
+
+main.py
+Obecny główny orchestrator aplikacji. Jest interaktywny: wybiera tryb działania z listy trybów, pyta użytkownika, czy tworzyć bazę, czy uruchamiać first_model, prep_data_for_sec_mod, second_model i cash_flow_visualization, a także potrafi wybierać alternatywny plik modelu .pt i bazę .db. Następnie wylicza zakresy train/test przez first_model.get_train_test_params(...) i uruchamia kolejne etapy pipeline’u.  ￼  ￼
+
+main_batch.py
+Wsadowy wariant uruchamiania, znacznie prostszy niż main.py. Ładuje config.yaml, ustawia t0, iteruje po liście klientów, przygotowuje config dla konkretnego klienta, ustawia ścieżkę do właściwej bazy SQLite i modelu .pt, wylicza zakresy train/test i wywołuje first_model.first_model(...). Na końcu zapisuje wynik uruchomienia do pliku Excel model_runs.xlsx. Importuje też pozostałe moduły pełnego pipeline’u, ale w samym run_batch() realnie wykorzystuje tylko first_model.  ￼  ￼
+
+first_model.py
+Główny aktywny moduł ML w MVP. Odpowiada za pobranie danych z bazy, sprawdzenie liczby wierszy, ewentualne ograniczenie wolumenu danych przez warunek modulo, preprocessing, konwersje typów, usuwanie kolumn nienumerycznych i dalszy trening/test/inference modelu 1. Wyrzuca NoDataError, jeśli dla danego zakresu nie ma danych. Opiera się na konfiguracji z config.yaml, w tym na sql_query_train, sql_query_test, model_path, rows_limit, return_columns, non_numeric_cols, trybach działania i parametrach modelu.  ￼  ￼  ￼
+
+database.py
+Warstwa dostępu do danych, napisana wprost pod SQLite. Zawiera połączenie sqlite3, adaptery i konwertery dat, PRAGMA journal_mode=WAL, PRAGMA busy_timeout, odczyt przez read_data_from_db(...) i read_data_from_all_db(...), a także zapis DataFrame do tabel przez dynamiczne tworzenie tabel i batch insert. To jest dziś centralna warstwa I/O dla modelu i ETL.  ￼  ￼
+
+CreateDatabase.py
+Moduł ETL do budowy lokalnej bazy z Excela. Ładuje dane do tabel invo, debc, clhs, dcmo, zakłada indeksy, importuje tabelę świąt, buduje widoki (invo_view, clhs_view, DEBC_view, dcmo_view) oraz dalsze warstwy pochodne i dataset. W nowszej wersji ma już przełączniki typu skip_raw_tables oraz build_derived, dzięki którym można zakończyć proces wcześniej, np. tylko po imporcie RAW, co jest przydatne dla etapu 1. Nadal zawiera jednak lokalne założenia i nawet twardą ścieżkę Windows do pliku ze świętami.  ￼  ￼
+
+config.yaml
+Główne źródło konfiguracji aplikacji. Definiuje ścieżki do baz SQLite, template nazw baz per klient, ścieżki do modeli .pt, parametry first_model, tryby działania (train, test_today, acceptance_test, retrain_periods itd.), SQL-e do treningu/testu i bardzo dużą część logiki ETL/CreateDatabase. To nie jest tylko prosty config środowiskowy – to de facto centrum sterowania logiką danych.  ￼  ￼  ￼
+
+clustering_before_first_model.py
+Moduł pomocniczy / eksperymentalny do klasteryzacji przed modelem 1. Używa KMeans, liczy statystyki klastrów, potrafi zapisywać model klasteryzacji przez joblib, przewidywać klastry dla nowych danych i generować cechy klastrowe. Z punktu widzenia obecnego MVP nie wygląda na obowiązkowy element głównego flow first model only.  ￼  ￼
+
+Inne pliki obecne w projekcie, ale poza MVP
+prep_data_for_sec_mod.py, second_model.py, cash_flow_visualization.py są częścią pełnego pipeline’u i są importowane przez main.py oraz main_batch.py, ale nie są potrzebne do uproszczonego wariantu first-model-only.  ￼  ￼
+
+biblioteki.txt
+Plik pomocniczy z listą bibliotek do instalacji. Potwierdza, że projekt używa m.in. PyTorch, scikit-learn, scipy, matplotlib, pandas, numpy, pyodbc, yaml, joblib, Captum i openpyxl.  ￼
+
+⸻
+
+2. Które pliki są używane w MVP (first_model only)
+
+W MVP powinny być aktywne tylko:
+	•	first_model.py – właściwa logika modelu 1.  ￼
+	•	database.py – odczyt/zapis danych do lokalnej SQLite.  ￼
+	•	CreateDatabase.py – tylko jeśli nadal potrzebujemy budować lokalną bazę z Excela przed uruchomieniem modelu. Dzięki build_derived=False można już kończyć etap po RAW tables, co daje możliwość uproszczenia flow.  ￼
+	•	config.yaml – ale tylko część dotycząca first_model_params i tych SQL-i / tabel, które są naprawdę potrzebne modelowi 1.  ￼
+	•	nowy runner, który trzeba dodać, np. runner_first_model.py, zamiast obecnego main.py. Obecnie takiego pliku jeszcze nie ma – to element planowanego refaktoru. Obecny najbliższy temu wzorzec to main_batch.py.  ￼
+
+⸻
+
+3. Które pliki są wyłączone w MVP
+
+W MVP należy traktować jako wyłączone:
+	•	prep_data_for_sec_mod.py
+	•	second_model.py
+	•	cash_flow_visualization.py
+	•	większość logiki main.py, bo obsługuje cały pełny pipeline i interaktywne decyzje użytkownika.  ￼
+	•	clustering_before_first_model.py, chyba że podczas refaktoru wyjdzie, że aktualny first_model.py ma od niego ukrytą zależność. Na obecnym poziomie analizy traktuję go jako nieobowiązkowy dla MVP.  ￼
+
+⸻
+
+4. Jak wygląda flow wykonania aplikacji
+
+Pełny obecny flow (stan aktualny):
+	1.	main.py ładuje config.yaml.
+	2.	Użytkownik wybiera tryb pracy i kolejne kroki przez input().
+	3.	main.py może zmienić ścieżkę do modelu .pt i do bazy .db.
+	4.	Jeśli wybrano budowę bazy, uruchamia CreateDatabase.CreateDatabase(...) lub CreateOneDbForAll(...).
+	5.	Wylicza zakresy train/test przez first_model.get_train_test_params(...).
+	6.	Uruchamia first_model.
+	7.	Opcjonalnie uruchamia przygotowanie danych do modelu 2, model 2 i wizualizację cash flow.  ￼  ￼
+
+Uproszczony flow, który już częściowo istnieje w main_batch.py:
+	1.	Załaduj config.yaml.
+	2.	Dla klienta ustaw database, test_database, train_client_id, test_client_id, model_path.
+	3.	Wylicz train_start, train_end, test_start, test_end.
+	4.	Uruchom first_model.first_model(...).
+	5.	Zapisz metadane runu do Excela.  ￼  ￼
+
+Flow docelowy dla MVP powinien być jeszcze prostszy:
+	•	runner_first_model.py
+	•	opcjonalnie: CreateDatabase
+	•	potem: first_model
+	•	zapis wyniku
+	•	koniec procesu
+
+Czyli jeden batch run bez dialogu z użytkownikiem.
+
+⸻
+
+5. Jakie są zależności między plikami
+
+main.py zależy od:
+	•	CreateDatabase
+	•	database
+	•	first_model
+	•	prep_data_for_sec_mod
+	•	second_model
+	•	cash_flow_visualization
+	•	yaml
+	•	torch
+i zarządza przepływem między nimi.  ￼
+
+main_batch.py też importuje cały ten zestaw modułów, ale w praktyce jego główny aktywny przepływ kończy się na first_model.first_model(...); reszta importów to raczej pozostałość po pełnym orchestratorze.  ￼
+
+first_model.py zależy od:
+	•	database.py do odczytu danych (read_data_from_db, read_data_from_all_db),
+	•	config.yaml do SQL-i, zakresów, list kolumn, trybów i ścieżki modelu.  ￼  ￼
+
+CreateDatabase.py zależy od:
+	•	Excela wejściowego,
+	•	config.yaml dla SQL-i tworzących widoki, tabele i dataset,
+	•	lokalnej SQLite jako storage docelowego.  ￼  ￼
+
+database.py jest wspólną warstwą dla ETL i modeli – obecnie bardzo silnie sprzęgającą całą aplikację wokół SQLite.  ￼
+
+⸻
+
+6. Największe problemy techniczne w kodzie
+
+1. Interaktywny main.py
+Obecne sterowanie jest oparte o input(), wybory użytkownika i warunkowe przechodzenie przez pipeline. To blokuje automatyzację, konteneryzację jako batch job i uruchamianie w GKE.  ￼
+
+2. Silne związanie z SQLite
+database.py używa sqlite3, adapterów SQLite, PRAGMA journal_mode=WAL, PRAGMA busy_timeout, mapowania typów pod SQLite i dynamicznego tworzenia tabel z DataFrame. To jest główna przeszkoda przed PostgreSQL / Cloud SQL.  ￼  ￼
+
+3. ETL i logika danych zaszyte w configu i SQLite-specific SQL
+config.yaml zawiera ogromną liczbę zapytań SQL, widoków i tabel pochodnych, mocno zależnych od składni SQLite. To oznacza, że migracja bazy to nie tylko podmiana connectora, ale też przepisywanie SQL-i i warstwy tworzenia datasetu.  ￼
+
+4. Dynamiczne DROP TABLE / CREATE TABLE
+CreateDatabase.py oraz database.py pracują w stylu prototypowo-notebookowym: przebudowują tabele i widoki dynamicznie, zapisują DataFrame-y bez trwałego, wersjonowanego schematu. To jest wygodne lokalnie, ale słabe jako punkt wyjścia do PostgreSQL i migracji kontrolowanych.  ￼  ￼
+
+5. Lokalny filesystem jako centralny storage
+Bazy .db, modele .pt, pliki Excel i pomocnicze outputy są obsługiwane przez lokalne ścieżki. main.py i main_batch.py operują bezpośrednio na plikach z katalogów databases/ i model/. To wymaga późniejszego rozdziału na DB + object storage.  ￼  ￼
+
+6. Brak rozdziału warstw
+Orchestracja, logika biznesowa, logika ETL, logika DB i konfiguracja są wymieszane. main.py steruje wszystkim, config.yaml zawiera logikę danych, database.py tworzy schemat dynamicznie, a CreateDatabase.py robi jednocześnie import, transformację i feature engineering.  ￼  ￼
+
+7. Zbędne importy i ślady pełnego pipeline’u w plikach, które chcemy wykorzystać do MVP
+main_batch.py nadal importuje prep_data_for_sec_mod, second_model, cash_flow_visualization, mimo że batchowy przepływ kończy się praktycznie na modelu 1. To zwiększa chaos i ryzyko przy refaktorze.  ￼
+
+8. Ukryte założenia środowiskowe
+W ETL są twarde ścieżki lokalne Windows, np. do pliku świąt, co utrudnia przenoszalność i konteneryzację.  ￼
+
+⸻
+
+Krótki wniosek operacyjny
+
+Obecnie aplikacja jest lokalnym, wsadowym pipeline’em ML z interaktywnym orchestratoriem, opartym o:
+	•	Excel jako źródło,
+	•	SQLite jako storage,
+	•	CreateDatabase.py jako ETL,
+	•	first_model.py jako główny aktywny model,
+	•	oraz dodatkowe etapy poza MVP.  ￼  ￼
+
+Dla MVP należy przyjąć, że aktywne są tylko:
+	•	CreateDatabase.py (opcjonalnie),
+	•	database.py,
+	•	first_model.py,
+	•	config.yaml,
+	•	i nowy prosty runner batchowy do dodania.
+Wszystko inne należy tymczasowo wyłączyć lub traktować jako legacy.  ￼  ￼
+
+Poniżej masz gotowy opis docelowej architektury aplikacji do wklejenia do nowego czata.
+
+⸻
+
+Docelowa architektura aplikacji zgodna z GCP
+
+1. Główne komponenty
+
+GKE
+Aplikacja ma działać w GKE jako uruchamiany wsadowo batch job, a nie jako stale działający serwis. To wynika też z obecnego charakteru kodu: dziś pipeline uruchamia się sekwencyjnie, wykonuje obliczenia i kończy, zamiast wystawiać API. Obecny main.py i main_batch.py są orchestratorami wsadowymi, a nie aplikacją request/response.  ￼  ￼
+
+Cloud SQL
+Docelową relacyjną bazą danych ma być Cloud SQL for PostgreSQL. Obecnie aplikacja jest silnie związana z lokalnym SQLite przez sqlite3, PRAGMA journal_mode=WAL, PRAGMA busy_timeout i dynamiczne tworzenie tabel, co trzeba zastąpić warstwą zgodną z PostgreSQL.  ￼
+
+Cloud Storage
+Cloud Storage ma przejąć rolę lokalnego filesystemu dla:
+	•	plików wejściowych,
+	•	artefaktów modeli,
+	•	eksportów,
+	•	ewentualnych raportów lub plików pośrednich.
+
+To jest konieczne, bo obecny kod pracuje na lokalnych plikach .db, .pt i Excelach oraz buduje ścieżki plikowe lokalnie. main_batch.py ustawia bazę jako lokalny plik databases/...db, a config.yaml trzyma lokalne ścieżki i template’y do modeli i baz.  ￼  ￼
+
+Secret Manager
+Secret Manager powinien przechowywać:
+	•	dane dostępowe do bazy,
+	•	hasła / connection settings,
+	•	ewentualne inne sekrety środowiskowe.
+
+To pozwoli wyeliminować trzymanie wrażliwych danych w configach i plikach deploymentowych.
+
+Pipeline
+Build i deployment powinny być realizowane przez pipeline zgodny z docelowym standardem wdrożeniowym. Pipeline ma budować obraz kontenera, publikować artefakty, uruchamiać wdrożenie na środowisko DEV i spinać migracje oraz konfigurację środowiskową.
+
+⸻
+
+2. Jak działa aplikacja w architekturze docelowej
+
+Model działania
+Aplikacja ma działać jako batch job, nie jako API.
+Na start ma istnieć jeden prosty runner, który:
+	1.	przyjmuje parametry uruchomienia,
+	2.	opcjonalnie uruchamia przygotowanie danych,
+	3.	uruchamia first_model,
+	4.	zapisuje wyniki,
+	5.	kończy pracę.
+
+To jest zgodne z faktycznym charakterem obecnego kodu:
+	•	main.py uruchamia kolejne etapy sekwencyjnie po decyzjach użytkownika,
+	•	main_batch.py już dziś uruchamia model 1 wsadowo dla kolejnych klientów i zapisuje wynik uruchomienia.  ￼  ￼
+
+Brak API na start
+Na etapie MVP nie ma potrzeby budowania stale działającego serwisu.
+Docelowy wzorzec startowy to:
+	•	jeden run = jedno uruchomienie joba,
+	•	brak oczekiwania „w standby”,
+	•	brak endpointów HTTP na początku.
+
+To jest prostsze i lepiej dopasowane do obecnej aplikacji niż deployment typu web service.
+
+⸻
+
+3. Przepływ danych
+
+Wejście
+Dane wejściowe trafiają do systemu jako pliki źródłowe. Obecnie są to pliki Excel, z których CreateDatabase.py ładuje arkusze INVO, DEBC, CLHS, DCMO, tworzy tabele surowe, widoki i warstwy pochodne. Docelowo te pliki powinny być przechowywane w Cloud Storage, a nie na lokalnym dysku.  ￼
+
+Przetwarzanie
+Przepływ danych w wersji docelowej MVP:
+	1.	runner pobiera parametry runu,
+	2.	jeśli trzeba, odczytuje pliki źródłowe z Cloud Storage,
+	3.	uruchamia etap ETL / prepare data,
+	4.	zapisuje lub aktualizuje dane w PostgreSQL,
+	5.	uruchamia first_model,
+	6.	zapisuje wyniki modelu w PostgreSQL,
+	7.	zapisuje model lub inne artefakty do Cloud Storage.
+
+Wyjście
+Wynikami są:
+	•	dane wynikowe i metadane runu w Cloud SQL,
+	•	artefakty modelu i ewentualne eksporty w Cloud Storage,
+	•	logi joba w logach środowiska uruchomieniowego.
+
+⸻
+
+4. Przepływ uruchomienia
+
+Wersja docelowa MVP
+	1.	Pipeline buduje obraz kontenera.
+	2.	Obraz trafia do rejestru artefaktów.
+	3.	GKE uruchamia Job z tym obrazem.
+	4.	Job startuje runner aplikacji.
+	5.	Runner dostaje parametry przez argumenty lub zmienne środowiskowe.
+	6.	Runner wykonuje flow first-model-only.
+	7.	Job kończy się po zapisaniu wyników.
+
+Co zastępujemy względem stanu obecnego
+Obecnie:
+	•	main.py pyta użytkownika o parametry przez input(),
+	•	wybiera bazę, klienta, tryb, model i dalsze kroki,
+	•	może uruchamiać pełny pipeline.  ￼  ￼
+
+Docelowo:
+	•	nie ma input(),
+	•	nie ma ręcznego wybierania lokalnych plików,
+	•	wszystko jest parametryzowane przez runner,
+	•	uruchomienie jest powtarzalne i automatyzowalne.
+
+⸻
+
+5. Gdzie są dane
+
+Dane relacyjne
+W Cloud SQL (PostgreSQL) powinny trafić:
+	•	dane aplikacyjne potrzebne do modelu,
+	•	tabele trwałe,
+	•	wyniki modelu,
+	•	metadane runów,
+	•	ewentualne tabele stagingowe i pochodne, jeśli nadal będą potrzebne.
+
+To zastępuje obecną SQLite, która dziś pełni rolę jednocześnie:
+	•	storage’u operacyjnego,
+	•	stagingu,
+	•	miejsca trzymania wyników.  ￼  ￼
+
+Dane plikowe
+W Cloud Storage powinny trafić:
+	•	pliki wejściowe,
+	•	modele .pt,
+	•	eksporty .xlsx / .csv,
+	•	ewentualne snapshoty pośrednie.
+
+To zastępuje lokalne katalogi databases/, model/ i lokalne ścieżki Excela używane dziś przez main_batch.py, main.py i CreateDatabase.py.  ￼  ￼
+
+⸻
+
+6. Gdzie są modele
+
+Modele powinny być przechowywane poza bazą, w Cloud Storage.
+
+Obecnie ścieżka do modelu jest przekazywana przez config i ustawiana dynamicznie per klient; main_batch.py ustawia model_path, a config.yaml zawiera konfigurację ścieżek modelu dla modelu 1.  ￼  ￼
+
+Docelowo:
+	•	runner dostaje informację o lokalizacji modelu,
+	•	pobiera / zapisuje model do bucketu,
+	•	baza trzyma tylko metadane: wersję modelu, datę treningu, status runu, identyfikatory.
+
+⸻
+
+7. Jak aplikacja komunikuje się z bazą
+
+Warstwa aplikacyjna
+Aplikacja uruchomiona w GKE ma łączyć się z PostgreSQL, a nie z lokalnym SQLite.
+To oznacza konieczność wymiany obecnej warstwy database.py, która dziś jest napisana bezpośrednio pod sqlite3, ma adaptery SQLite i PRAGMA-y.  ￼
+
+Model komunikacji
+Docelowo aplikacja:
+	•	dostaje connection settings przez środowisko / sekret,
+	•	używa warstwy repository / DB access dla PostgreSQL,
+	•	wykonuje odczyt i zapis do Cloud SQL.
+
+Rozdzielenie odpowiedzialności
+W docelowej architekturze:
+	•	baza relacyjna służy do danych tabelarycznych i wyników,
+	•	storage obiektowy do plików i modeli,
+	•	runner tylko orkiestruje wykonanie.
+
+⸻
+
+Schemat logiczny opisowy
+
+Komponenty
+	•	Pipeline buduje i publikuje obraz aplikacji.
+	•	GKE Job uruchamia kontener z runnerem.
+	•	Runner wykonuje uproszczony pipeline first-model-only.
+	•	Cloud SQL PostgreSQL przechowuje dane relacyjne i wyniki.
+	•	Cloud Storage przechowuje pliki wejściowe, modele i eksporty.
+	•	Secret Manager przechowuje sekrety dostępu.
+
+Logika działania
+	•	aplikacja nie działa stale,
+	•	nie wystawia API na start,
+	•	jest uruchamiana wsadowo,
+	•	wykonuje jedno zadanie i kończy pracę.
+
+Przepływ
+	1.	Dane wejściowe trafiają do Cloud Storage.
+	2.	Job w GKE uruchamia runner.
+	3.	Runner czyta parametry i dane.
+	4.	Runner uruchamia ETL / prepare data.
+	5.	Runner uruchamia first_model.
+	6.	Wyniki zapisuje do Cloud SQL.
+	7.	Model i pliki wyjściowe zapisuje do Cloud Storage.
+	8.	Job kończy się.
+
+⸻
+
+Krótki wniosek
+
+Docelowa architektura to nie „aplikacja webowa”, tylko batchowy system uruchamiany w GKE, w którym:
+	•	GKE wykonuje job,
+	•	Cloud SQL PostgreSQL zastępuje SQLite,
+	•	Cloud Storage zastępuje lokalny filesystem,
+	•	Secret Manager zarządza sekretami,
+	•	pipeline automatyzuje build i deployment.
+
+Najważniejsza zasada:
+jeden runner, jedno uruchomienie, jeden batch flow – bez API na starcie.
+
+
+Poniżej gotowy tekst do wklejenia do nowego czata.
+
+⸻
+
+Kontekst etapu: refaktor first_model_only
+
+1. Cel etapu
+
+Celem tego etapu jest wycięcie z obecnego projektu minimalnego, działającego MVP, które obsługuje tylko:
+	•	opcjonalne przygotowanie bazy,
+	•	uruchomienie first_model,
+	•	zapis wyniku,
+	•	zakończenie procesu.
+
+Na tym etapie nie rozwijamy jeszcze architektury GCP, tylko upraszczamy lokalny kod tak, aby:
+	•	przestał zależeć od interaktywnego main.py,
+	•	przestał wymagać pełnego pipeline’u,
+	•	miał jeden prosty entrypoint batchowy,
+	•	nadawał się do dalszej konteneryzacji i migracji.
+Obecny main.py steruje całym pipeline’em przez input(), uruchamia CreateDatabase, first_model, prep_data_for_sec_mod, second_model i cash_flow_visualization, więc jest zbyt szeroki jak na MVP.  ￼  ￼
+
+⸻
+
+2. Co już mamy
+
+Mamy działający lokalny pipeline oparty o:
+	•	CreateDatabase.py — budowa lokalnej bazy z Excela, z opcją RAW only / DERIVED only / pełny przebieg. Funkcja CreateDatabase(..., skip_raw_tables=False, build_derived=True) już ma komentarze i przełączniki wskazujące tryby etapowe, w tym wariant ETAP 1 = build_derived=False.  ￼  ￼
+	•	first_model.py — właściwy model 1, którego pełna logika już istnieje i jest uruchamiana zarówno przez main.py, jak i przez main_batch.py.  ￼
+	•	database.py — aktywna warstwa odczytu/zapisu danych do SQLite.  ￼
+	•	config.yaml — centralna konfiguracja z parametrami modelu 1, ścieżkami do baz, modeli i SQL-ami.  ￼
+	•	main_batch.py — prostszy niż main.py wzorzec wsadowego uruchamiania tylko first_model; przygotowuje config dla klienta, wylicza zakresy train/test i wywołuje first_model.first_model(...). To jest najbliższy istniejący punkt wyjścia do MVP.  ￼
+
+⸻
+
+3. Co chcemy osiągnąć
+
+Na końcu etapu chcemy mieć:
+	•	jeden prosty runner, np. runner_first_model.py,
+	•	brak input() i brak ręcznego dialogu z użytkownikiem,
+	•	uruchomienie przez parametry wejściowe, np.:
+	•	tryb (train, test_today, itp.),
+	•	t0,
+	•	klient / baza / model,
+	•	opcja create_db,
+	•	flow ograniczony do:
+	1.	załaduj config,
+	2.	opcjonalnie uruchom CreateDatabase,
+	3.	wylicz parametry train/test,
+	4.	uruchom first_model,
+	5.	zapisz wynik,
+	6.	zakończ proces.
+
+Czyli chcemy zastąpić obecny, szeroki orchestrator prostym batch runnerem, bez etapów 2 i 3 pełnego pipeline’u. Obecne main.py pyta użytkownika o uruchomienie prep_data_for_sec_mod, second_model i cash_flow_visualization, co w tym etapie ma całkowicie zniknąć.  ￼  ￼
+
+⸻
+
+4. Jakie pliki będą zmieniane
+
+main.py
+Nie powinien już być dalej rozwijany jako główny entrypoint. Na tym etapie trzeba go praktycznie zastąpić nowym runnerem. Obecnie zawiera dużo logiki interaktywnej:
+	•	pytania o create_db,
+	•	pytania o listy klientów,
+	•	wybór modelu .pt,
+	•	wybór bazy .db,
+	•	pytania o uruchamianie kolejnych etapów.  ￼  ￼
+
+Nowy plik do dodania: runner_first_model.py
+To ma być nowy, prosty entrypoint dla MVP. Powinien przejąć tylko potrzebną część logiki z main.py / main_batch.py:
+	•	wczytanie configu,
+	•	ustawienie parametrów,
+	•	ewentualne uruchomienie CreateDatabase,
+	•	wywołanie get_train_test_params(...),
+	•	wywołanie first_model.first_model(...),
+	•	zapis statusu / wyniku.
+
+main_batch.py
+Najlepszy kandydat na punkt odniesienia przy budowie nowego runnera. Jego przepływ jest już znacznie prostszy: ustawia config klienta, wylicza zakresy train/test i uruchamia first_model. W tym etapie można:
+	•	albo go uprościć i przerobić na docelowy runner,
+	•	albo tylko wykorzystać jako wzorzec i stworzyć nowy plik.  ￼
+
+CreateDatabase.py
+Jeśli chcemy zachować budowę bazy w MVP, to ten plik będzie używany, ale w ograniczonym zakresie. Trzeba wykorzystać istniejący podział:
+	•	RAW only,
+	•	DERIVED only,
+	•	full.
+Dla etapu first-model-only warto dążyć do najprostszego wariantu, który daje dane potrzebne modelowi 1.  ￼
+
+config.yaml
+Wymaga odchudzenia logicznego dla MVP:
+	•	skupienia na first_model_params,
+	•	odcięcia zależności od etapów modelu 2 i cash flow,
+	•	uproszczenia ścieżek i parametrów startowych.  ￼
+
+⸻
+
+5. Jakie pliki nie będą ruszane
+
+Na tym etapie nie rozwijamy i nie podłączamy:
+	•	prep_data_for_sec_mod.py — to etap przygotowania danych do modelu 2, poza MVP.  ￼
+	•	second_model.py — całkowicie poza zakresem etapu.
+	•	cash_flow_visualization.py — końcowa warstwa raportowa zależna od modelu 2, poza zakresem. Sam kod wprost czyta output modelu 2 i dopiero potem scala go z danymi modelu 1.  ￼
+	•	clustering_before_first_model.py — chyba że podczas prac wyjdzie jawna zależność z first_model.py; na dziś nie traktujemy go jako aktywnego elementu MVP.
+	•	pełnej migracji bazy, Postgresa, Alembic, GKE i pipeline — to nie jest jeszcze ten etap.
+
+⸻
+
+6. Jakie są ryzyka
+
+Ryzyko 1: ukryte zależności first_model.py od pełnego flow
+first_model działa dziś w kontekście configu i istniejącej bazy/datasetu. Jeśli uprościmy CreateDatabase za mocno albo nie ustawimy poprawnie configu, model może nie dostać oczekiwanych tabel lub kolumn. main_batch.py pokazuje, że przed uruchomieniem modelu trzeba poprawnie ustawić:
+	•	database,
+	•	test_database,
+	•	train_client_id,
+	•	test_client_id,
+	•	model_path,
+	•	zakresy train/test.  ￼
+
+Ryzyko 2: pozostawienie interaktywności w kodzie pomocniczym
+Jeśli nowy runner będzie nadal polegał na funkcjach z main.py, które pytają przez input(), to nie osiągniemy celu. main.py ma wiele takich punktów, m.in. przy wyborze klienta, bazy, modelu i decyzji o tworzeniu DB.  ￼  ￼
+
+Ryzyko 3: zbyt szerokie użycie CreateDatabase.py
+CreateDatabase.py nadal zawiera silne lokalne założenia, w tym wzorce plików lokalnych i twarde ścieżki Windows, np. przy szukaniu plików Excela i importowaniu świąt. To oznacza, że nawet w MVP trzeba uważać, żeby nie zabetonować tych zależności w nowym runnerze.  ￼  ￼
+
+Ryzyko 4: chaos w configu
+config.yaml nie jest dziś lekkim configiem tylko centralnym miejscem logiki. Przy MVP łatwo zostawić w nim za dużo odwołań do etapów, których już nie uruchamiamy.
+
+Ryzyko 5: dwa konkurencyjne entrypointy
+Jeśli zostawimy aktywne jednocześnie main.py, main_batch.py i nowy runner bez jasnego rozdziału, projekt będzie jeszcze bardziej nieczytelny. Na tym etapie trzeba jasno ustalić:
+	•	co jest aktywnym entrypointem,
+	•	co jest legacy,
+	•	czego już nie używamy.
+
+⸻
+
+7. Minimalny wynik etapu (Definition of Done)
+
+Etap uznajemy za zakończony, jeśli spełnione są wszystkie poniższe warunki:
+	1.	Istnieje jeden prosty runner dla MVP, np. runner_first_model.py.
+	2.	Runner działa bez input() i bez dialogu z użytkownikiem.
+	3.	Runner obsługuje tylko:
+	•	opcjonalne CreateDatabase,
+	•	first_model.
+	4.	Runner nie importuje ani nie uruchamia:
+	•	prep_data_for_sec_mod,
+	•	second_model,
+	•	cash_flow_visualization.
+	5.	Można wykonać pełny przebieg first-model-only dla jednego klienta / jednego runu.
+	6.	Wynik first_model zapisuje się poprawnie.
+	7.	Jest jasne, że:
+	•	main.py jest legacy,
+	•	main_batch.py jest co najwyżej wzorcem pomocniczym,
+	•	nowy runner jest jedynym obowiązującym entrypointem MVP.
+	8.	Flow jest na tyle proste, że w kolejnym etapie można bezpiecznie porządkować strukturę kodu i przygotowywać konteneryzację.
+
+⸻
+
+Krótki operacyjny wniosek
+
+Ten etap nie polega jeszcze na przepisywaniu modelu 1, tylko na:
+	•	odcięciu go od reszty pipeline’u,
+	•	uproszczeniu sposobu uruchamiania,
+	•	wprowadzeniu jednego batchowego entrypointu,
+	•	wyłączeniu etapów poza MVP.
+
+
+wiedząc że zrobiłem już pierwszy etap i etap pośredni, poniżej masz kod:
+#CreateDatabase.py
+import os
+import importlib
 import sqlite3
 import pandas as pd
+from datetime import datetime, timedelta, date
+import time
 import numpy as np
-from pathlib import Path
-# =========================
-# PARAMETRY
-# =========================
-CLIENT_LIST = [10069]
-BASE_DIR_OLD = Path(r"C:\Users\OE00SG\CashPredictor\dev3\databases\2026-03-02\2026-03-02")
-BASE_DIR_NEW = Path(r"C:\Users\OE00SG\CashPredictor\dev3\databases\2026-03-02\2026-03-02")
-OLD_DB_NAME_TEMPLATE = "CashPredictorT_{client_id}.db"   # stara baza per klient
-NEW_DB_NAME = "CashPredictor2.db"                        # nowa wspólna baza
-TABLE_NAME = "dataset"
-DZIEN_FILTER = None   # np. "2025-09-15" albo None dla całego datasetu
-KEY_INVO_COL = "INVO_NO"
-KEY_DAY_COL = "DZIEN"
-KEY_CLIENT_COL = "__CLIENT_ID"
-OUT_REPORT_XLSX = Path("dataset_compare_report.xlsx")
-# =========================
-# LOAD
-# =========================
-def load_old_dataset_from_client_dbs(base_dir: Path, clients, dzien: str | None) -> pd.DataFrame:
-    frames = []
-    for cid in clients:
-        db_path = base_dir / OLD_DB_NAME_TEMPLATE.format(client_id=cid)
-        if not db_path.exists():
-            print(f"[WARN] Brak starej bazy: {db_path}")
-            continue
-        conn = sqlite3.connect(db_path)
-        try:
-            if dzien:
-                query = f"""
-                    SELECT *
-                    FROM {TABLE_NAME}
-                    WHERE DATE(DZIEN) = DATE(?)
-                """
-                df = pd.read_sql_query(query, conn, params=[dzien])
-            else:
-                query = f"SELECT * FROM {TABLE_NAME}"
-                df = pd.read_sql_query(query, conn)
-            df[KEY_CLIENT_COL] = cid
-            frames.append(df)
-        finally:
-            conn.close()
-    if not frames:
-        raise RuntimeError("Nie wczytano żadnych danych ze starych baz.")
-    return pd.concat(frames, ignore_index=True)
-def load_new_dataset_from_shared_db(base_dir: Path, db_name: str, clients, dzien: str | None) -> pd.DataFrame:
-    db_path = base_dir / db_name
-    if not db_path.exists():
-        raise FileNotFoundError(f"Brak nowej bazy: {db_path}")
+import yaml
+import glob
+import logging
+import re
+from first_model import get_modulo_condition
+import sys
+
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message="The behavior of DataFrame concatenation with empty or all-NA entries is deprecated"
+)
+
+EXCEL_ORIGIN = "1899-12-30"  # standard dla pandas (Excel 1900 system)
+
+def sqlite_object_exists(cursor, obj_type: str, name: str) -> bool:
+    cursor.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = ? AND name = ?
+        LIMIT 1
+        """,
+        (obj_type, name),
+    )
+    return cursor.fetchone() is not None
+
+
+def validate_required_schema_for_create_database(cursor) -> None:
+    required_tables = [
+        "invo",
+        "debc",
+        "clhs",
+        "dcmo",
+        "group_cust_inv_days",
+        "grouped_client_days",
+        "summary_client_days_tab",
+        "extended_grouped_client_days_tab",
+        "dataset_tab",
+        "dataset",
+        "INVO_CLHS_JOINED_TAB",
+        "swieta",
+        "aggregated_data_temp",
+        "statystyki_faktur",
+    ]
+
+    required_views = [
+        "invo_view",
+        "clhs_view",
+        "DEBC_view",
+        "dcmo_view",
+        "INVO_CLHS_JOINED",
+        "summary_client_days_view",
+        "extended_grouped_client_days",
+    ]
+
+    missing_tables = [
+        name for name in required_tables
+        if not sqlite_object_exists(cursor, "table", name)
+    ]
+    missing_views = [
+        name for name in required_views
+        if not sqlite_object_exists(cursor, "view", name)
+    ]
+
+    if missing_tables or missing_views:
+        parts = []
+        if missing_tables:
+            parts.append(f"brak tabel: {', '.join(missing_tables)}")
+        if missing_views:
+            parts.append(f"brak widoków: {', '.join(missing_views)}")
+
+        raise RuntimeError(
+            "Baza nie ma pełnego schematu wymaganego przez CreateDatabase; "
+            "najpierw uruchom DBInit. " + " | ".join(parts)
+        )
+
+def _coerce_excel_date_series(s: pd.Series) -> pd.Series:
+    """
+    Konwertuje serię, która może zawierać:
+    - excel seriale (float/int lub "45911.25" jako string) -> datetime
+    - normalne stringi dat -> datetime
+    - braki / śmieci -> NaT
+    """
+    if s is None:
+        return s
+
+    # Zrób kopię
+    s2 = s.copy()
+
+    # 1) spróbuj wyciągnąć liczby (seriale)
+    num = pd.to_numeric(s2, errors="coerce")
+
+    # seriale: w tym miejscu nie musimy strzelać widełkami,
+    # bo i tak robimy to TYLKO dla kolumn z konfiguracji.
+    mask_num = num.notna()
+
+    out = pd.Series(pd.NaT, index=s2.index, dtype="datetime64[ns]")
+
+    # Excel serial -> datetime (część dziesiętna to czas)
+    if mask_num.any():
+        out.loc[mask_num] = pd.to_datetime(
+            num.loc[mask_num],
+            unit="D",
+            origin=EXCEL_ORIGIN,
+            errors="coerce"
+        )
+
+    # 2) reszta -> klasyczny parser dat
+    mask_other = ~mask_num
+    if mask_other.any():
+        out.loc[mask_other] = pd.to_datetime(s2.loc[mask_other], errors="coerce")
+
+    return out
+
+
+def normalize_excel_date_columns(
+    df: pd.DataFrame,
+    date_cols: list[str] | None
+) -> pd.DataFrame:
+    """
+    Jeśli date_cols jest puste / None -> nic nie rób.
+    Dla każdej kolumny z listy: konwersja excel serial / string -> datetime.
+    """
+    if df is None or not isinstance(df, pd.DataFrame):
+        return df
+    if not date_cols:  # None lub [] lub ""
+        return df
+
+    for col in date_cols:
+        if col in df.columns:
+            df[col] = _coerce_excel_date_series(df[col])
+
+    return df
+
+
+def apply_excel_date_config(
+    dfs_by_name: dict[str, pd.DataFrame],
+    params: dict
+) -> dict[str, pd.DataFrame]:
+    """
+    Czyta params['excel_date_columns'] (mapa: tabela -> lista kolumn)
+    i stosuje konwersję tylko tam, gdzie jest definicja.
+    Jeśli brak definicji -> pomija.
+    """
+    mapping = (params or {}).get("excel_date_columns")
+    if not mapping or not isinstance(mapping, dict):
+        return dfs_by_name  # brak konfiguracji => nic nie robimy
+
+    for table_name, df in dfs_by_name.items():
+        cols = mapping.get(table_name)
+        if cols:  # tylko jeśli lista niepusta
+            dfs_by_name[table_name] = normalize_excel_date_columns(df, cols)
+
+    return dfs_by_name
+
+def load_excel_sheets(file_path, params=None):
+    sheet_names = ['INVO', 'DEBC', 'CLHS', 'DCMO']
+    dfs = pd.read_excel(file_path, sheet_name=sheet_names)
+
+    # Uporządkuj do dict (żeby łatwo mapować po nazwie tabeli)
+    dfs_by_name = {
+        'INVO': dfs.get('INVO'),
+        'DEBC': dfs.get('DEBC'),
+        'CLHS': dfs.get('CLHS'),
+        'DCMO': dfs.get('DCMO'),
+    }
+
+    # Konwersja dat wg konfiguracji (jeśli brak/ puste -> nic nie robi)
+    dfs_by_name = apply_excel_date_config(dfs_by_name, params or {})
+
+    return dfs_by_name['INVO'], dfs_by_name['DEBC'], dfs_by_name['CLHS'], dfs_by_name['DCMO']
+
+# Funkcja do pobrania definicji tabeli dataset z bazy danych
+def get_table_schema(db_path):
     conn = sqlite3.connect(db_path)
-    try:
-        client_placeholders = ",".join(["?"] * len(clients))
-        if dzien:
-            query = f"""
-                SELECT *
-                FROM {TABLE_NAME}
-                WHERE INVO_CLNTNO IN ({client_placeholders})
-                  AND DATE(DZIEN) = DATE(?)
-            """
-            params = list(clients) + [dzien]
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(dataset);")
+    schema = cursor.fetchall()
+    conn.close()
+    return schema
+
+def migrate_data(data_start, data_end, params, field_types, db_path, conn_new):
+    conn = sqlite3.connect(db_path)
+    print("db_path",db_path)
+    query_template = params['sql_query_test']
+    query = query_template.format(data_start=data_start, data_end=data_end)
+    count_query = query.replace("SELECT *", "SELECT COUNT(*) as row_count")
+
+    count_df = pd.read_sql_query(count_query, conn)
+    row_count = count_df['row_count'].iloc[0]
+
+    divisor, condition_sql = get_modulo_condition(row_count, limit=params['rows_limit'], invo_no_col=params['invoice_id'])
+    if divisor is not None:
+        query = f"SELECT * FROM dataset WHERE 1=1 {condition_sql};"
+        print(f"[INFO] row_count={row_count} > {params['rows_limit']}, divisor={divisor}, dodajemy {condition_sql}")
+
+    # Wczytujemy dane partiami po 500000 rekordów
+    for chunk in pd.read_sql_query(query, conn, chunksize=params['data_limit']):
+        # Konwersja kolumn float64 na float32 (oszczędność pamięci)
+        float_cols = chunk.select_dtypes(include=['float64']).columns
+        if len(float_cols) > 0:
+            chunk[float_cols] = chunk[float_cols].astype('float32')
+        # Uzupełniamy brakujące kolumny zgodnie z field_types
+        for col in field_types.keys():
+            if col not in chunk.columns:
+                chunk[col] = None
+        # Uporządkujemy kolumny zgodnie z kolejnością zadeklarowaną w field_types
+        chunk = chunk[list(field_types.keys())]
+        # Zapisujemy partię do nowej bazy
+        chunk.to_sql('dataset', conn_new, if_exists='append', index=False)
+    conn.close()
+
+def CreateOneDbForAll(train_start, train_end, params, t0):
+    data_end_str = _to_date_str(t0)
+    # Pobranie wszystkich definicji tabel
+    schemas = {}
+    print("params['train_client_id']",params['train_client_id'])
+    for client_id in params['train_client_id']:
+        db_path = fr'databases\2026-03-02\2026-03-02\CashPredictorT_{client_id}.db'
+        if os.path.exists(db_path):
+            schemas[client_id] = get_table_schema(db_path)
         else:
-            query = f"""
-                SELECT *
-                FROM {TABLE_NAME}
-                WHERE INVO_CLNTNO IN ({client_placeholders})
+            print(f"Plik bazy danych {db_path} nie istnieje, pomijam.")
+    
+    # Zbudowanie ujednoliconej definicji tabeli
+    field_types = {}
+    for schema in schemas.values():
+        for col in schema:
+            col_name, col_type = col[1], col[2]  # Nazwa kolumny i jej typ
+            if col_name in field_types:
+                if field_types[col_name] != col_type:  # Jeśli typy się różnią, zamieniamy na NUMBER
+                    field_types[col_name] = "NUMBER"
+            else:
+                field_types[col_name] = col_type
+    
+    # Tworzenie nowej tabeli w nowej bazie
+    # 30122025 START dla 100 klientów nie da się przekazać tak długiej nazwy
+    # conn_new = sqlite3.connect(params['database'])
+    conn_new = sqlite3.connect('C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictorT_ALL.db')
+    # 30122025 STOP
+    logging.debug(f"[CreateOneDbForAll] Newly opened connection id={id(conn_new)} for {params['database']}")
+    conn_new.execute("PRAGMA journal_mode=WAL;")
+    conn_new.execute("PRAGMA busy_timeout=60000;")
+    cursor_new = conn_new.cursor()
+     
+    # Przenoszenie danych z każdej bazy
+    for client_id in params['train_client_id']:
+        db_path = fr'databases\2026-03-02\2026-03-02\CashPredictorT_{client_id}.db'
+        if os.path.exists(db_path):
+            migrate_data(train_start, train_end, params, field_types, db_path, conn_new)
+
+    insert_aggregated_data_temp(conn_new, data_end_str)
+    
+    conn_new.commit()
+    conn_new.close()
+    
+    print(f"Nowa baza danych {params['database']} została utworzona i wypełniona danymi.")
+
+def _to_date_str(d) -> str:
+    """Zwraca 'YYYY-MM-DD' niezależnie czy d to date/datetime/str."""
+    if isinstance(d, datetime):
+        return d.strftime("%Y-%m-%d")
+    if isinstance(d, date):
+        return d.strftime("%Y-%m-%d")
+    # string lub coś innego: spróbuj przyciąć do 10 znaków (YYYY-MM-DD)
+    s = str(d)
+    return s[:10]
+
+# Funkcja generująca wiersze
+def generate_dates(start_date, end_date):
+    rows = []
+    
+    current_date = datetime.strptime(start_date, "%Y-%m-%d")
+    end_date = datetime.strptime(end_date, "%Y-%m-%d")
+
+    while current_date <= end_date:
+        dzien = current_date.strftime("%Y-%m-%d")
+        dzis_dzien_tyg = current_date.isoweekday()  # 1 = poniedziałek, 7 = niedziela
+        dzis_sobota = 1 if dzis_dzien_tyg == 6 else 0
+        dzis_niedziela = 1 if dzis_dzien_tyg == 7 else 0
+
+        rows.append((dzien, dzis_dzien_tyg, dzis_sobota, dzis_niedziela))
+        current_date += timedelta(days=1)
+
+    return rows
+
+# Funkcja do pobrania schematu kolumn z bazy danych
+def get_column_types(cursor, table_name):
+    cursor.execute(f"PRAGMA table_info({table_name});")
+    columns_info = cursor.fetchall()
+    return {col[1]: col[2] for col in columns_info}  # {column_name: data_type}
+
+def remove_case_insensitive_duplicate_columns(df):
+    """
+    Usuwa powielone kolumny w DataFrame, ignorując różnice w wielkości liter, zachowując pierwsze wystąpienie.
+    
+    :param df: Pandas DataFrame
+    :return: DataFrame z unikalnymi kolumnami
+    """
+    # Tworzymy mapę nazw kolumn w małych literach do ich pierwszego wystąpienia
+    lowercase_columns_map = {}
+    columns_to_drop = []
+
+    for col in df.columns:
+        col_lower = col.lower()
+        if col_lower not in lowercase_columns_map:
+            lowercase_columns_map[col_lower] = col
+        else:
+            # Jeśli nazwa już występuje w innej wersji (case-insensitive), dodajemy do usunięcia
+            columns_to_drop.append(col)
+    
+    if columns_to_drop:
+        df = df.drop(columns=columns_to_drop)
+
+    return df
+
+def insert_aggregated_data_temp(conn, data_end, data_start="2023-03-12"):
+    cursor = conn.cursor()
+
+    rows_to_insert = generate_dates(data_start, data_end)
+
+    insert_query = """
+        INSERT OR IGNORE INTO aggregated_data_temp
+        (DZIEN, DZIS_DZIEN_TYG, DZIS_SOBOTA, DZIS_NIEDZIELA)
+        VALUES (?, ?, ?, ?)
+    """
+    cursor.executemany(insert_query, rows_to_insert)
+    conn.commit()
+
+    print(f"Próbowano wstawić {len(rows_to_insert)} wierszy do aggregated_data_temp (duplikaty pominięte).")
+
+def sanitize_column_names(df):
+    """
+    Usuwa niechciane znaki z nazw kolumn w DataFrame, aby były zgodne z wymogami SQLite.
+    Zamienia każdy znak nie-alfanumeryczny (poza _) na znak '_'.
+    """
+    new_columns = []
+    for col in df.columns:
+        # np. re.sub('[^A-Za-z0-9_]+', '', col) – usunąć w ogóle
+        # Lub re.sub('[^A-Za-z0-9_]+', '_', col) – zastąpić znakami podkreślenia
+        safe_col = re.sub(r"[^A-Za-z0-9_]+", "_", col)  
+        new_columns.append(safe_col)
+    
+    df.columns = new_columns
+    return df
+
+def refill_dataset_for_client(
+    conn,
+    client_id,
+    source_table="dataset_tab",
+    target_table="dataset",
+    batch_days=31
+):
+    cursor = conn.cursor()
+
+    cursor.execute(f"DELETE FROM {target_table} WHERE INVO_CLNTNO = ?", (client_id,))
+    conn.commit()
+
+    cursor.execute(f"""
+        SELECT MIN(DATE(DZIEN)), MAX(DATE(DZIEN))
+        FROM {source_table}
+        WHERE INVO_CLNTNO = ?
+    """, (client_id,))
+    min_date, max_date = cursor.fetchone()
+
+    if not min_date or not max_date:
+        print(f"[INFO] Brak danych dla klienta {client_id} w {source_table}.")
+        return
+
+    cursor.execute(f"PRAGMA table_info({source_table});")
+    columns_info_raw = cursor.fetchall()
+    columns_info = [(col[1], col[2] if col[2] else "TEXT") for col in columns_info_raw]
+
+    current_date = pd.to_datetime(min_date)
+    end_date = pd.to_datetime(max_date)
+
+    total_inserted = 0
+
+    while current_date <= end_date:
+        next_date = current_date + pd.Timedelta(days=batch_days - 1)
+
+        chunk_df = pd.read_sql_query(
+            f"""
+            SELECT *
+            FROM {source_table}
+            WHERE INVO_CLNTNO = ?
+              AND DATE(DZIEN) >= DATE(?)
+              AND DATE(DZIEN) <= DATE(?)
+            ORDER BY DZIEN, INVO_NO
+            """,
+            conn,
+            params=(client_id, current_date.strftime("%Y-%m-%d"), next_date.strftime("%Y-%m-%d"))
+        )
+
+        if not chunk_df.empty:
+            processed_df = process_dataset_tab(chunk_df, columns_info)
+            processed_df = remove_case_insensitive_duplicate_columns(processed_df)
+            processed_df = sanitize_column_names(processed_df)
+
+            float_cols = processed_df.select_dtypes(include=[np.float64, np.float32]).columns
+            if len(float_cols) > 0:
+                processed_df[float_cols] = processed_df[float_cols].round(4)
+                for c in float_cols:
+                    processed_df[c] = processed_df[c].astype("float32")
+
+            processed_df = processed_df.where(pd.notna(processed_df), None)
+
+            placeholders = ", ".join(["?" for _ in processed_df.columns])
+            insert_sql = f"INSERT INTO {target_table} VALUES ({placeholders})"
+
+            def _to_sqlite_safe(v):
+                if pd.isna(v):
+                    return None
+                if isinstance(v, np.datetime64):
+                    v = pd.to_datetime(v)
+                if isinstance(v, pd.Timestamp):
+                    return v.to_pydatetime()
+                return v
+
+            rows = [
+                tuple(_to_sqlite_safe(v) for v in row)
+                for row in processed_df.itertuples(index=False, name=None)
+            ]
+
+            cursor.executemany(insert_sql, rows)
+            conn.commit()
+
+            inserted_now = len(rows)
+            total_inserted += inserted_now
+            print(
+                f"[INFO] dataset: client={client_id}, "
+                f"{current_date.strftime('%Y-%m-%d')}..{next_date.strftime('%Y-%m-%d')}, "
+                f"inserted={inserted_now}, total={total_inserted}"
+            )
+
+        current_date = next_date + pd.Timedelta(days=1)
+
+    print(f"[OK] dataset rebuilt for client {client_id}, total rows inserted: {total_inserted}")
+
+def validate_and_convert_dates(df, columns):
+    invalid_values = []
+
+    for col in columns:
+        try:
+            # Próba konwersji na datetime
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+        except Exception as e:
+            # Przechwycenie błędów
+            invalid_values.append((col, df[col].iloc[0], str(e)))
+
+    return invalid_values
+
+def process_dataset_tab(df, columns):
+    # 1. Wyodrębnienie kolumn identyfikujących
+    id_columns = ['INVO_NO', 'INVO_ADMNO', 'INVO_CLNTNO', 'INVO_DEBH_NO', 'INVO_DEBC_NO', 'INVO_INVDATE', 'DZIEN', 'INVO_DUEDATE', 'INVO_FINALPAYMENTDATE']
+
+    # 2. Wybór kolumn liczbowych
+    numeric_columns = [col for col, dtype in columns if dtype in ['NUM', 'REAL', 'INT']]
+    numeric_df = df[numeric_columns]
+
+    # 3. Walidacja kolumn datowych
+    date_columns = [col for col, dtype in columns if dtype == 'DATETIME']
+    invalid_values = validate_and_convert_dates(df, date_columns)
+
+    # Wyświetlenie problematycznych wartości
+    if invalid_values:
+        print("Problematyczne wartości w kolumnach datowych:")
+        for col, value, error in invalid_values:
+            print(f"Kolumna: {col}, Wartość: {value}, Błąd: {error}")    
+
+    # --- cache konwersji dat: raz i korzystamy niżej ---
+    dt = {col: pd.to_datetime(df[col], errors='coerce') for col in date_columns if col in df.columns}
+
+    # 5. „Przycięcie” pól zależnych (bez zmian u Ciebie)
+    df['CLHS_NEXT_CHANGED_DATETIME'] = df['CLHS_NEXT_CHANGED_DATETIME'].where(
+        pd.to_datetime(df['CLHS_NEXT_CHANGED_DATETIME']) > pd.to_datetime(df['DZIEN']),
+        None
+    )    
+    df['INVO_MARKCODESPECDATE'] = df['INVO_MARKCODESPECDATE'].where(
+        pd.to_datetime(df['INVO_MARKCODESPECDATE']) > pd.to_datetime(df['DZIEN']),
+        None
+    )
+    df['INVO_MARKCODESPEC'] = df['INVO_MARKCODESPEC'].where(
+        pd.to_datetime(df['INVO_MARKCODESPECDATE']) > pd.to_datetime(df['DZIEN']),
+        None
+    )
+
+    # 4.1 Różnice dni względem INVO_INVDATE (jak u Ciebie, ale na cache dt)
+    base_cols = [col for col, dtype in columns
+                 if dtype == 'DATETIME' and col not in ('INVO_INVDATE', 'INVO_FINALPAYMENTDATE')]
+    date_diff_df = pd.DataFrame(index=df.index)
+    if 'INVO_INVDATE' in dt:
+        invdate_ser = dt['INVO_INVDATE']
+        for col in base_cols:
+            if col in dt:
+                date_diff_df[f'{col}_DAYS_DIFF'] = (dt[col] - invdate_ser).dt.days
+
+        if 'INVO_FINALPAYMENTDATE' in dt:
+            date_diff_df['INVO_FINALPAYMENTDATE_DAYS_DIFF'] = (dt['INVO_FINALPAYMENTDATE'] - invdate_ser).dt.days
+
+        if 'DZIEN' in dt:
+            date_diff_df['FROM_DZIEN_TO_INVO_INVDATE'] = (dt['DZIEN'] - invdate_ser).dt.days
+
+    date_diff_df = date_diff_df.fillna(0).round(0).astype('int', copy=False)
+
+    # 4.2 NOWE: różnice dni względem INVO_DUEDATE
+    due_date_diff_df = pd.DataFrame(index=df.index)
+    if 'INVO_DUEDATE' in dt:
+        duedate_ser = dt['INVO_DUEDATE']
+        due_cols = [col for col, dtype in columns
+                    if dtype == 'DATETIME' and col not in ('INVO_DUEDATE', 'INVO_FINALPAYMENTDATE')]
+        for col in due_cols:
+            if col in dt:
+                due_date_diff_df[f'{col}_DUE_DAYS_DIFF'] = (dt[col] - duedate_ser).dt.days
+
+        if 'INVO_FINALPAYMENTDATE' in dt:
+            due_date_diff_df['INVO_FINALPAYMENTDATE_DUE_DAYS_DIFF'] = (dt['INVO_FINALPAYMENTDATE'] - duedate_ser).dt.days
+
+        if 'DZIEN' in dt:
+            due_date_diff_df['FROM_DZIEN_TO_INVO_DUEDATE'] = (dt['DZIEN'] - duedate_ser).dt.days
+
+    # jeżeli nie było DUEDATE, to due_date_diff_df zostanie pusty – to OK przy concat
+    if not due_date_diff_df.empty:
+        due_date_diff_df = due_date_diff_df.fillna(0).round(0).astype('int', copy=False)
+
+    # 6. Transformacja wybranych dat (na cache dt, tylko te które mamy)
+    def transform_date_column(date_column):
+        transformed_df = pd.DataFrame(index=df.index)
+        if date_column not in dt:
+            return transformed_df  # brak kolumny – zwracamy pusty DF
+        ser = dt[date_column]
+        transformed_df[f'{date_column}_YEAR'] = ser.dt.year
+        transformed_df[f'{date_column}_MONTH'] = ser.dt.month
+        transformed_df[f'{date_column}_DAY'] = ser.dt.day
+        transformed_df[f'{date_column}_WEEKDAY'] = ser.dt.weekday
+        transformed_df[f'{date_column}_DAYS_FROM_YEAR_START'] = ser.dt.dayofyear
+        transformed_df[f'{date_column}_DAYS_TO_YEAR_END'] = 365 - ser.dt.dayofyear
+        transformed_df[f'{date_column}_DAYS_FROM_MONTH_START'] = ser.dt.day
+        transformed_df[f'{date_column}_DAYS_TO_MONTH_END'] = ser.dt.days_in_month - ser.dt.day
+        if date_column in ('INVO_DUEDATE', 'DZIEN'):
+            transformed_df[f'{date_column}_IS_SATURDAY'] = (ser.dt.weekday == 5).astype(int)
+            transformed_df[f'{date_column}_IS_SUNDAY'] = (ser.dt.weekday == 6).astype(int)
+        return transformed_df
+
+    transformed_dates_df = pd.concat(
+        [transform_date_column(col) for col in
+         ['DZIEN', 'INVO_INVDATE', 'INVO_DUEDATE', 'CLHS_CHANGED_DATETIME', 'CLHS_NEXT_CHANGED_DATETIME']],
+        axis=1
+    ).fillna(0).round(0).astype('int', copy=False)
+
+    # 7. Końcowe kolumny płatności
+    has_final = 'INVO_FINALPAYMENTDATE' in df.columns
+    if has_final:
+        final_payment_date = df['INVO_FINALPAYMENTDATE']
+        final_payment_date_diff = date_diff_df['INVO_FINALPAYMENTDATE_DAYS_DIFF'] if 'INVO_FINALPAYMENTDATE_DAYS_DIFF' in date_diff_df.columns else None
+        if 'INVO_FINALPAYMENTDATE_DAYS_DIFF' in date_diff_df.columns:
+            date_diff_df = date_diff_df.drop(columns=['INVO_FINALPAYMENTDATE_DAYS_DIFF'])
+        final_payment_due_date_diff = (
+            due_date_diff_df['INVO_FINALPAYMENTDATE_DUE_DAYS_DIFF']
+            if 'INVO_FINALPAYMENTDATE_DUE_DAYS_DIFF' in due_date_diff_df.columns else None
+        )
+        if 'INVO_FINALPAYMENTDATE_DUE_DAYS_DIFF' in due_date_diff_df.columns:
+            due_date_diff_df = due_date_diff_df.drop(columns=['INVO_FINALPAYMENTDATE_DUE_DAYS_DIFF'])
+
+    # 8. Sklejenie wszystkiego
+    processed_df = pd.concat(
+        [df[id_columns], transformed_dates_df, date_diff_df, due_date_diff_df, numeric_df],
+        axis=1
+    )
+    if has_final:
+        processed_df['INVO_FINALPAYMENTDATE'] = final_payment_date
+    
+    inv = pd.to_datetime(processed_df['INVO_INVDATE'], errors='coerce') \
+          if 'INVO_INVDATE' in processed_df.columns else pd.Series(pd.NaT, index=processed_df.index)
+    
+    fin = pd.to_datetime(processed_df['INVO_FINALPAYMENTDATE'], errors='coerce') \
+          if 'INVO_FINALPAYMENTDATE' in processed_df.columns else pd.Series(pd.NaT, index=processed_df.index)
+    
+    processed_df['INVO_FINALPAYMENTDATE_DAYS_DIFF'] = (fin - inv).dt.days.astype('float32')
+
+    return processed_df
+
+# Funkcja symulująca najbliższy dzień roboczy
+def get_next_working_day(termin_platnosci, holidays):
+    while termin_platnosci.weekday() >= 5 or termin_platnosci in holidays:
+        termin_platnosci += timedelta(days=1)
+    return termin_platnosci
+
+# Funkcja do wstawienia danych z widoku do tabeli
+def insert_data_from_view(cursor, view_name, table_name):
+    insert_query = f"""
+    INSERT INTO {table_name}
+    SELECT * FROM {view_name};
+    """
+    cursor.execute(insert_query)
+    print(f"Dane zostały skopiowane z widoku '{view_name}' do tabeli '{table_name}'.")
+
+
+def generate_days(start_date, end_date):
+    current_date = datetime.strptime(start_date, '%Y-%m-%d')
+    end_date = datetime.strptime(end_date, '%Y-%m-%d')
+    while current_date <= end_date:
+        yield current_date  # zwracamy datetime
+        current_date += timedelta(days=1)
+        
+# Adapter: datetime → string (dla SQLite)
+def adapt_datetime(ts):
+    return ts.strftime('%Y-%m-%d %H:%M:%S')  # Format akceptowany przez SQLite
+
+# Konwerter: string → datetime (z SQLite)
+def convert_datetime(ts):
+    return datetime.strptime(ts.decode('utf-8'), '%Y-%m-%d %H:%M:%S')
+
+def adapt_pandas_timestamp(ts):
+    return ts.to_pydatetime().strftime('%Y-%m-%d %H:%M:%S')
+
+def convert_pandas_timestamp(ts):
+    return pd.Timestamp(ts.decode('utf-8'))
+
+# Rejestracja adapterów
+sqlite3.register_adapter(datetime, adapt_datetime)
+sqlite3.register_converter('DATETIME', convert_datetime)
+sqlite3.register_adapter(pd.Timestamp, adapt_pandas_timestamp)
+sqlite3.register_converter('DATETIME', convert_pandas_timestamp)
+
+# Funkcja do pobrania listy kolumn z widoku
+def get_columns_from_view(cursor, view_name):
+    cursor.execute(f"PRAGMA table_info({view_name});")
+    columns_info = cursor.fetchall()
+    return [col[1] for col in columns_info]  # Pobieramy nazwy kolumn
+
+# Funkcja do pobierania kolumn z widoku
+def get_columns(cursor, view_name):
+    cursor.execute(f"PRAGMA table_info({view_name});")
+    return [(col[1], col[2]) for col in cursor.fetchall()]
+
+def CreateDatabase(params, t0, create_db_from_one_excel=False, skip_raw_tables=False, build_derived=True):
+    # skip_raw_tables=False, build_derived=True -> NORMAL (RAW+DERIVED)
+    # skip_raw_tables=False, build_derived=False -> ETAP 1 (RAW only)
+    # skip_raw_tables=True,  build_derived=True -> ETAP 2 (DERIVED only)    
+    data_end_str = _to_date_str(t0)
+    if create_db_from_one_excel:
+        # --- jeden plik z wieloma klientami ---
+        file_path = params['multi_client_excel_path']
+        df_invo_all, df_debc_all, df_clhs_all, df_dcmo_all = load_excel_sheets(file_path, params)
+
+        print("przed client_ids = df_invo_all['INVO_CLNTNO'].dropna().unique()")
+        # ------------------------------------------------------------------
+        # 1️⃣ wszyscy klienci z Excela (jak dotychczas)
+        # ------------------------------------------------------------------
+        all_client_ids = (
+            df_invo_all['INVO_CLNTNO']
+            .dropna()
+            .unique()
+            .tolist()
+        )
+        
+        # ------------------------------------------------------------------
+        # 2️⃣ liczenie i sortowanie (TYLKO do logu + kolejności)
+        # ------------------------------------------------------------------
+        _counts = (
+            df_invo_all
+            .dropna(subset=['INVO_CLNTNO'])
+            .groupby('INVO_CLNTNO', as_index=False)
+            .size()
+            .rename(columns={'size': 'cnt'})
+        )
+        
+        _counts_sorted = _counts.sort_values('cnt', ascending=True)
+        
+        print("Kolejność przetwarzania (od najmniejszej liczby wierszy INVO):")
+        for rank, (cid, cnt) in enumerate(
+            zip(_counts_sorted['INVO_CLNTNO'], _counts_sorted['cnt']),
+            start=1
+        ):
+            print(f"{rank:>2}. klient {int(cid)} → {int(cnt)} wierszy INVO")
+        
+        # ------------------------------------------------------------------
+        # 3️⃣ zawężenie listy kategorii (NOWA LOGIKA)
+        # ------------------------------------------------------------------
+        client_ids = all_client_ids
+        
+        # 3a) jeżeli podano klientów (CLI / override config)
+        explicit_clients = params.get("train_client_id")
+        if explicit_clients:
+            explicit_clients = set(explicit_clients)
+            client_ids = [cid for cid in client_ids if cid in explicit_clients]
+        
+        # 3b) usunięcie exclude_ids (jak wcześniej)
+        exclude_ids = set(params.get("exclude_ids", []))
+        client_ids = [cid for cid in client_ids if cid not in exclude_ids]
+        
+        # ------------------------------------------------------------------
+        # 4️⃣ zachowanie kolejności wynikającej z liczby rekordów
+        # ------------------------------------------------------------------
+        client_ids = [
+            cid for cid in _counts_sorted['INVO_CLNTNO']
+            if cid in client_ids
+        ]
+        
+        print(f"[INFO] Finalna lista klientów do przetworzenia: {client_ids}")
+        
+        # czytelny wydruk: kolejność + ile rekordów ma każdy klient
+        print("Kolejność przetwarzania (od najmniejszej liczby wierszy INVO):")
+        for rank, (cid, cnt) in enumerate(zip(_counts_sorted['INVO_CLNTNO'],
+                                              _counts_sorted['cnt']), start=1):
+            print(f"{rank:>2}. klient {int(cid)} → {int(cnt)} wierszy INVO")     
+        print("po client_ids = df_invo_all['INVO_CLNTNO'].dropna().unique() order by _counts.sort_values('cnt', ascending=True)['INVO_CLNTNO']")
+
+        files_for_client = None  # w tym trybie niepotrzebne
+    else:
+        # --- wiele plików: po jednym Excelu na klienta ---
+        suffix = params["train_client_id"]
+
+        # Ujednolicenie do listy
+        if isinstance(suffix, (list, tuple, np.ndarray)):
+            client_ids = list(suffix)
+        else:
+            client_ids = [suffix]
+
+        # znajdź pliki per‑klient
+        files_for_client = {}
+        for cid in client_ids:
+            matches = glob.glob(
+                fr"C:\Users\OE00SG\CashPredictor\dev3\co i jak baza\Bartek_*_{cid}.xlsx"
+            )
+            if not matches:
+                raise FileNotFoundError(
+                    fr"Nie znaleziono pliku dopasowanego do wzorca: 'Bartek_*_{cid}.xlsx'"
+                )
+            files_for_client[cid] = matches[0]
+
+        # jeśli to był tylko jeden klient → możesz od razu wczytać,
+        # ale i tak wczytamy w pętli per‑klient (patrz niżej),
+        # żeby obsłużyć także przypadek wielu klientów.
+        df_invo_all = df_debc_all = df_clhs_all = df_dcmo_all = None
+
+    db_path = params['database']
+    conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+    cursor = conn.cursor()
+    
+    for client_id in client_ids:
+        print("client_id: ", client_id)
+    
+        # wczytujemy dane:
+        if create_db_from_one_excel:
+            # już wczytane wyżej do *_all
+            df_invo = df_invo_all[df_invo_all['INVO_CLNTNO'] == client_id].copy()
+            df_debc = df_debc_all[df_debc_all['DEBC_CLNTNO'] == client_id].copy()
+            df_clhs = df_clhs_all[df_clhs_all['CLHS_CLNTNO'] == client_id].copy()
+            df_dcmo = df_dcmo_all[df_dcmo_all['DEBC_CLNTNO'] == client_id].copy()  # jeśli tak masz w danych
+        else:
+            # osobny plik dla każdego klienta
+            file_path = files_for_client[client_id]
+            df_invo, df_debc, df_clhs, df_dcmo = load_excel_sheets(file_path, params)
+
+        validate_required_schema_for_create_database(cursor)
+    
+        od_dnia = pd.to_datetime(params['od_dnia'])
+        dcmo_year = int(od_dnia.year)
+        dcmo_month = int(od_dnia.month)
+    
+        # Filtrowanie df_invo: INVO_INVDATE >= od_dnia
+        if df_invo is not None and not df_invo.empty and 'INVO_INVDATE' in df_invo.columns:
+            df_invo['INVO_INVDATE'] = pd.to_datetime(df_invo['INVO_INVDATE'], errors='coerce')
+            df_invo = df_invo[df_invo['INVO_INVDATE'].notna() & (df_invo['INVO_INVDATE'] >= od_dnia)]
+    
+        # Filtrowanie df_clhs: CLHS_DATCHANGED >= od_dnia (format YYYYMMDD, np. 20210712)
+        if df_clhs is not None and not df_clhs.empty and 'CLHS_DATCHANGED' in df_clhs.columns:
+            df_clhs['CLHS_DATCHANGED'] = pd.to_datetime(df_clhs['CLHS_DATCHANGED'].astype(str), format='%Y%m%d', errors='coerce')
+            df_clhs = df_clhs[df_clhs['CLHS_DATCHANGED'].notna() & (df_clhs['CLHS_DATCHANGED'] >= od_dnia)]
+    
+        # Filtrowanie df_dcmo: (YEAR, MONTH) >= od_dnia
+        if df_dcmo is not None and not df_dcmo.empty and 'DCMO_YEAR' in df_dcmo.columns and 'DCMO_MONTH' in df_dcmo.columns:
+            df_dcmo['DCMO_YEAR'] = pd.to_numeric(df_dcmo['DCMO_YEAR'], errors='coerce')
+            df_dcmo['DCMO_MONTH'] = pd.to_numeric(df_dcmo['DCMO_MONTH'], errors='coerce')
+        
+            df_dcmo = df_dcmo[
+                (df_dcmo['DCMO_YEAR'] > dcmo_year) |
+                ((df_dcmo['DCMO_YEAR'] == dcmo_year) & (df_dcmo['DCMO_MONTH'] >= dcmo_month))
+            ]
+    
+        # --- RAW tables: invo/debc/clhs/dcmo ---
+        if not skip_raw_tables:
+            cursor.execute("DELETE FROM invo WHERE INVO_CLNTNO = ?", (client_id,))
+            cursor.execute("DELETE FROM debc WHERE DEBC_CLNTNO = ?", (client_id,))
+            cursor.execute("DELETE FROM clhs WHERE CLHS_CLNTNO = ?", (client_id,))
+            cursor.execute("DELETE FROM dcmo WHERE DEBC_CLNTNO = ?", (client_id,))
+            
+            df_invo.to_sql('invo', conn, if_exists='append', index=False)
+            df_debc.to_sql('debc', conn, if_exists='append', index=False)
+            df_clhs.to_sql('clhs', conn, if_exists='append', index=False)
+            df_dcmo.to_sql('dcmo', conn, if_exists='append', index=False)
+        
+            conn.commit()
+        else:
+            logging.info("[CreateDatabase] skip_raw_tables=True -> nie ruszam invo/debc/clhs/dcmo")
+
+        # --- stop after RAW if requested (ETAP 1) ---
+        if not build_derived:
+            logging.info("[CreateDatabase] build_derived=False -> kończę po imporcie RAW (bez widoków/datasetów).")
+            conn.commit()
+            conn.close()
+            continue
+        
+        
+        # Wstawianie danych z widoku do tabeli
+        cursor.execute("DELETE FROM INVO_CLHS_JOINED_TAB WHERE INVO_CLNTNO = ?", (client_id,))
+        insert_query = """
+        INSERT INTO INVO_CLHS_JOINED_TAB
+        SELECT * FROM INVO_CLHS_JOINED
+        WHERE INVO_CLNTNO = ?;
+        """
+        cursor.execute(insert_query, (client_id,))
+        print("Dane zostały skopiowane z widoku do tabeli 'INVO_CLHS_JOINED_TAB'.")
+
+        remove_duplicates_query = """
+            WITH d AS (
+              SELECT
+                rowid AS rid,
+                ROW_NUMBER() OVER (
+                  PARTITION BY
+                    INVO_NO, INVO_CLNTNO, INVO_ADMNO, INVO_DEBH_NO, INVO_DEBC_NO, CLHS_CHANGED_DATETIME
+                  ORDER BY RANDOM()          -- losowy wybór zwycięzcy
+                ) AS rn
+              FROM INVO_CLHS_JOINED_TAB
+              WHERE INVO_CLNTNO = ?
+            )
+            DELETE FROM INVO_CLHS_JOINED_TAB
+            WHERE rowid IN (SELECT rid FROM d WHERE rn > 1);
+        """
+        cursor.execute(remove_duplicates_query, (client_id,))
+
+        # Zatwierdzenie zmian i zamknięcie połączenia
+        conn.commit()
+        
+        print("Operacja zakończona sukcesem.")
+        
+        # Pobranie danych z invo_view
+        query_invo = """
+        SELECT 
+            INVO_NO,
+            INVO_ADMNO,
+            INVO_CLNTNO,
+            INVO_DEBH_NO,
+            INVO_DEBC_NO,
+            INVO_INVDATE,
+            INVO_FINALPAYMENTDATE
+        FROM invo_view
+        WHERE INVO_INVDATE IS NOT NULL
+          AND DATE(INVO_INVDATE) >= DATE(?)
+          AND INVO_CLNTNO = ?
+        """
+        cursor.execute(query_invo, (params['od_dnia'], client_id))
+        rows = cursor.fetchall()
+        
+        # Dynamiczne wstawianie danych do tabeli z obliczeniem ROK i MIESIAC
+        data_to_insert = []
+        for row in rows:
+            (invo_no, invo_admno, invo_clntno, invo_debh_no, invo_debc_no,
+             invo_invdate, invo_finalpaymentdate) = row
+        
+            # 1) Sprowadź wszystko do str 'YYYY-MM-DD' (albo None)
+            invdate_s = pd.to_datetime(invo_invdate, errors='coerce')
+            if pd.isna(invdate_s):
+                # Bez daty wystawienia nie ma sensu generować dni – pomiń rekord
+                continue
+            invdate_s = invdate_s.strftime("%Y-%m-%d")
+        
+            if invo_finalpaymentdate is not None and not pd.isna(invo_finalpaymentdate):
+                finalpay_s = pd.to_datetime(invo_finalpaymentdate, errors='coerce')
+                finalpay_s = None if pd.isna(finalpay_s) else finalpay_s.strftime("%Y-%m-%d")
+            else:
+                finalpay_s = None
+        
+            # 2) Jeśli brak finalnej daty płatności → użyj invdate + 120 dni
+            end_for_days_s = (
+                finalpay_s if finalpay_s
+                else (pd.to_datetime(invdate_s) + pd.Timedelta(days=120)).strftime("%Y-%m-%d")
+            )
+        
+            # 3) generate_days oczekuje STR → OK
+            days = list(generate_days(invdate_s, end_for_days_s))
+        
+            # 4) Przy insertach do SQLite trzymaj typy proste (date/datetime → date)
+            invdate_d  = pd.to_datetime(invdate_s).date()
+            finalpay_d = (pd.to_datetime(finalpay_s).date() if finalpay_s else None)
+        
+            for day in days:
+                # generate_days zwraca datetime → rzutujemy na date
+                day_d = day.date()
+                data_to_insert.append((
+                    invo_no, invo_admno, invo_clntno, invo_debh_no, invo_debc_no,
+                    invdate_d, day_d, day_d.year, day_d.month, finalpay_d
+                ))
+        
+        # Wstawianie danych do tabeli
+        cursor.execute("DELETE FROM group_cust_inv_days WHERE INVO_CLNTNO = ?", (client_id,))
+
+        cursor.executemany("""
+        INSERT INTO group_cust_inv_days (
+            INVO_NO, INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, INVO_INVDATE, DZIEN, ROK, MIESIAC, INVO_FINALPAYMENTDATE
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, data_to_insert)
+
+        # Zatwierdzenie zmian
+        conn.commit()
+        
+        print("Tabela 'group_cust_inv_days' została pomyślnie wypełniona.")
+        print(datetime.now().strftime("%H:%M:%S"))
+    
+        # Pobranie danych z group_cust_inv_days z grupowaniem
+        grouped_query = params['grouped_query']
+        
+        # Wczytanie danych do DataFrame
+        df = pd.read_sql_query(grouped_query, conn, params=(client_id,))
+        
+        # Zapisanie DataFrame do tabeli SQLite (struktura tabeli tworzona automatycznie)
+        cursor.execute("DELETE FROM grouped_client_days WHERE INVO_CLNTNO = ?", (client_id,))
+        df.to_sql("grouped_client_days", conn, if_exists="append", index=False)
+
+        # Zatwierdzenie zmian i zamknięcie połączenia
+        conn.commit()
+    
+        # Definicja kolumn DCMO
+        dcmo_columns = [
+            "DCMO_PAIDAMOUNT", "DCMO_PAIDAMOUNTINVDATE", "DCMO_PAIDAMOUNTDUEDATE",
+            "DCMO_PAIDAMOUNTBEFOREDUEDATE", "DCMO_PAIDAMOUNTAFTDUEDAT30", "DCMO_PAIDAMOUNTAFTDUEDAT60",
+            "DCMO_PAIDAMOUNTAFTDUEDAT90", "DCMO_PAIDAMOUNTAFTDUEDAT120", "DCMO_PAIDAMOUNTAFTDUEDATG120",
+            "DCMO_PAIDNINVBEFDUEDATE", "DCMO_PAIDNINVAFTDUEDATE30", "DCMO_PAIDNINVAFTDUEDATE60",
+            "DCMO_PAIDNINVAFTDUEDATE90", "DCMO_PAIDNINVAFTDUEDATE120", "DCMO_PAIDNINVAFTDUEDATEG120",
+            "DCMO_TOTASALESDEBTNOTES", "DCMO_TOTNDEBTNOTES", "DCMO_TOTASALESCREDNOTES",
+            "DCMO_TOTNCREDNOTES", "DCMO_AVGBALANCEOUTSTANDING", "DCMO_BALANCEHI",
+            "DCMO_NDUNNINGLETTERS", "DCMO_BALANCELO", "DCMO_BALANCE",
+            "DCMO_NINVOICESOUTSTANDING", "DCMO_PAIDAMOUNTDISPUTES", "DCMO_PAIDAMOUNTPARTIALPAYM"
+        ]
+        offsets = [1, 2, 3, 6, 12]
+
+        print("Rozpoczynam partiami wstawianie do 'extended_grouped_client_days_tab'...")
+    
+        # 1. Pobieramy listę (ROK, MIESIAC) występujących w widoku
+        cursor.execute("""
+            SELECT DISTINCT ROK, MIESIAC
+            FROM extended_grouped_client_days
+            WHERE INVO_CLNTNO = ?
+            ORDER BY ROK, MIESIAC
+        """, (client_id,))
+        year_month_rows = cursor.fetchall()
+
+        cursor.execute("DELETE FROM extended_grouped_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
+        
+        # 2. Iterujemy po każdej parze (ROK, MIESIAC)
+        for (year, month) in year_month_rows:
+            insert_sql = f"""
+            INSERT INTO extended_grouped_client_days_tab
+            SELECT *
+            FROM extended_grouped_client_days
+            WHERE ROK = {year}
+              AND MIESIAC = {month}
+              AND date(DZIEN) >= {params['od_dnia']}
+              AND INVO_CLNTNO = {client_id};
             """
-            params = list(clients)
-        df = pd.read_sql_query(query, conn, params=params)
+            cursor.execute(insert_sql)
+            conn.commit()  # commit po każdej partii
+        
+            # Podgląd liczby wstawionych wierszy
+            inserted_count = cursor.rowcount  # w SQLite rowcount czasem bywa -1, zależy od wersji
+            print(f"Wstawiono partię: ROK={year}, MIESIAC={month} (rowcount={inserted_count})")
+        
+        print("Wszystkie partie zostały zaimportowane.")
+        print(datetime.now().strftime("%H:%M:%S"))
+        
+        # Zatwierdzenie zmian
+        conn.commit()
+        print("Proces zakończony.")
+        
+        print("Rozpoczynam partiami wstawianie do 'summary_client_days_tab'...")
+        
+        # 3. Znajdujemy, od którego (ROK, MIESIAC) kontynuować.
+        #    Szukamy w summary_client_days_tab największego ROK,MIESIAC wstawionego
+        #    lub None, jeśli pusto.
+        
+        
+        cursor.execute("DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
+        conn.commit()
+        
+        cursor.execute("""
+            SELECT DISTINCT ROK, MIESIAC
+            FROM extended_grouped_client_days
+            WHERE INVO_CLNTNO = ?
+            ORDER BY ROK, MIESIAC
+        """, (client_id,))
+        all_rows = cursor.fetchall()
+        
+        inserted_count = 0
+
+        for (year, month) in all_rows:
+            insert_sql = """
+                INSERT INTO summary_client_days_tab
+                SELECT *
+                FROM summary_client_days_view
+                WHERE ROK = ?
+                  AND MIESIAC = ?
+                  AND INVO_CLNTNO = ?
+            """
+            cursor.execute(insert_sql, (year, month, client_id))
+            conn.commit()
+        
+            row_count = cursor.rowcount if cursor.rowcount != -1 else 0
+            inserted_count += row_count
+            print(f"Wstawiono ROK={year}, MIESIAC={month} -> {row_count} wierszy (narastająco={inserted_count})")
+        
+        print(f"Wszystkie partie zostały zaimportowane. Łącznie wstawiono (teraz) = {inserted_count}.")
+        print(datetime.now().strftime("%H:%M:%S"))
+
+        cursor.execute(params['idx_invo_debcno_invdate_etc'])
+        cursor.execute(params['idx_invo_debcno_invdate'])
+        cursor.execute(params['idx_summary_days_ids_dzien'])
+        cursor.execute(params['idx_ext_days_ids_dzien'])
+        cursor.execute(params['idx_clhs_joined_keys_datetime'])
+        conn.commit()
+        
+        # Pobranie świąt (jeśli istnieją)
+        cursor.execute("SELECT data FROM swieta")
+        holidays = {pd.Timestamp(row[0]) for row in cursor.fetchall()}
+        
+        # Parametry wejściowe
+        z_ilu_dni_values = [14, 30, 60, 90]
+        maksymalna_data = pd.Timestamp(data_end_str)
+        log_triggered = False
+        inserted_count = 0
+
+        cursor.execute("DELETE FROM statystyki_faktur WHERE INVO_CLNTNO = ?", (client_id,))
+        for z_ilu_dni in z_ilu_dni_values:
+            # Pobranie danych klientów i dni
+            query = """
+                SELECT DISTINCT INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, DZIEN
+                FROM group_cust_inv_days
+                WHERE INVO_CLNTNO = ?
+                  AND DZIEN <= ?
+            """
+            customer_days = pd.read_sql_query(
+                query,
+                conn,
+                params=(client_id, maksymalna_data.strftime('%Y-%m-%d %H:%M:%S'))
+            )
+
+            
+            # Iteracja po klientach i dniach
+            for _, row in customer_days.iterrows():
+                invo_admno = row['INVO_ADMNO']
+                invo_clntno = row['INVO_CLNTNO']
+                invo_debh_no = row['INVO_DEBH_NO']
+                invo_debc_no = row['INVO_DEBC_NO']
+                na_dzien = pd.Timestamp(row['DZIEN'])
+                
+                end_day   = na_dzien.strftime('%Y-%m-%d')
+                start_day = (na_dzien - pd.Timedelta(days=z_ilu_dni)).strftime('%Y-%m-%d')
+
+                # Pobranie faktur dla klienta
+                query_faktury_tpl = """
+                    WITH invo_base AS (
+                      SELECT
+                          INVO_ADMNO,
+                          INVO_CLNTNO,
+                          INVO_DEBH_NO,
+                          INVO_DEBC_NO,
+                          INVO_AINITIALH,
+                          INVO_INVDATE,
+                          CASE
+                            WHEN INVO_FINALPAYMENTDATE IS NOT NULL
+                             AND DATE(INVO_FINALPAYMENTDATE) < DATE('{end_day}')
+                            THEN INVO_FINALPAYMENTDATE
+                            ELSE NULL
+                          END AS INVO_FINALPAYMENTDATE,
+                          INVO_DUEDATE
+                      FROM invo_view
+                      WHERE INVO_ADMNO   = {admno}
+                        AND INVO_CLNTNO  = {clntno}
+                        AND INVO_DEBH_NO = {debh_no}
+                        AND INVO_DEBC_NO = {debc_no}
+                    )
+                    SELECT
+                        INVO_ADMNO,
+                        INVO_CLNTNO,
+                        INVO_DEBH_NO,
+                        INVO_DEBC_NO,
+                        INVO_AINITIALH,
+                        INVO_INVDATE,
+                        INVO_FINALPAYMENTDATE,
+                        INVO_DUEDATE
+                    FROM invo_base
+                    WHERE
+                          (INVO_DUEDATE IS NOT NULL
+                           AND DATE(INVO_DUEDATE) BETWEEN DATE('{start_day}') AND DATE('{end_day}'))
+                       OR (INVO_FINALPAYMENTDATE IS NOT NULL
+                           AND DATE(INVO_FINALPAYMENTDATE) BETWEEN DATE('{start_day}') AND DATE('{end_day}'))
+                """
+
+                query_faktury = query_faktury_tpl.format(
+                    end_day   = end_day,
+                    start_day = start_day,
+                    admno     = int(invo_admno),
+                    clntno    = int(invo_clntno),
+                    debh_no   = int(invo_debh_no),
+                    debc_no   = int(invo_debc_no),
+                )       
+        
+                # Pomiar czasu wczytywania faktur
+                start_read_time = time.time()
+                faktury = pd.read_sql_query(query_faktury, conn)
+                read_duration = time.time() - start_read_time
+        
+                # Symulacja przeliczenia terminów płatności
+                faktury['INVO_DUEDATE'] = faktury['INVO_DUEDATE'].apply(
+                    lambda x: get_next_working_day(pd.Timestamp(x), holidays) if pd.notna(x) else x
+                )
+        
+                faktury['INVO_FINALPAYMENTDATE'] = pd.to_datetime(faktury['INVO_FINALPAYMENTDATE'], errors='coerce')
+                faktury['INVO_DUEDATE'] = pd.to_datetime(faktury['INVO_DUEDATE'], errors='coerce')
+                faktury['INVO_INVDATE'] = pd.to_datetime(faktury['INVO_INVDATE'], errors='coerce')
+                
+                paid = faktury['INVO_FINALPAYMENTDATE'].notna()
+                unpaid = faktury['INVO_FINALPAYMENTDATE'].isna()        
+                
+                # Definicje scenariuszy
+                scenariusze = {
+                    'zapłacone_przed_terminem': faktury[
+                        (faktury['INVO_FINALPAYMENTDATE'].notna()) & 
+                        (faktury['INVO_FINALPAYMENTDATE'] <= faktury['INVO_DUEDATE']) & 
+                        (faktury['INVO_FINALPAYMENTDATE'] < na_dzien)
+                    ],
+                    'zapłacone_po_terminie': faktury[
+                        (faktury['INVO_FINALPAYMENTDATE'].notna()) & 
+                        (faktury['INVO_FINALPAYMENTDATE'] > faktury['INVO_DUEDATE']) &
+                        (faktury['INVO_FINALPAYMENTDATE'] < na_dzien) 
+                    ],
+                    'niezapłacone_po_terminie': faktury[
+                        unpaid &
+                        (na_dzien > faktury['INVO_DUEDATE'])
+                    ],
+                    'niezapłacone_przed_terminem': faktury[
+                        unpaid &
+                        (na_dzien <= faktury['INVO_DUEDATE'])
+                    ],
+                    'wszystkie_faktury': faktury
+                }
+        
+                # Obliczanie statystyk dla każdego scenariusza
+                for scenariusz, df in scenariusze.items():
+                    if df.empty:
+                        continue
+                
+                    # Kopia, żeby uniknąć SettingWithCopyWarning
+                    dfc = df.copy()
+                
+                    # Kwoty (bezpieczne)
+                    dfc['INVO_AINITIALH'] = pd.to_numeric(dfc['INVO_AINITIALH'], errors='coerce')
+                    sum_invo_ainitialh = float(dfc['INVO_AINITIALH'].sum(skipna=True))
+                    avg_invo_ainitialh = float(dfc['INVO_AINITIALH'].mean(skipna=True))
+                    stdev_invo_ainitialh = float(dfc['INVO_AINITIALH'].std(skipna=True))
+                    ile_faktur = int(len(dfc))
+                
+                    # Maski płatności znanych na na_dzien
+                    paid_mask = dfc['INVO_FINALPAYMENTDATE'].notna()
+                    unpaid_mask = ~paid_mask
+                
+                    # Domyślnie ustawiamy NULL-e (NaN -> SQLite zapisze jako NULL)
+                    avg_dni_do_zaplaty = np.nan
+                    stdev_dni_do_zaplaty = np.nan
+                    avg_dni_opoznienia = np.nan
+                    stdev_dni_opoznienia = np.nan
+                
+                    if scenariusz.startswith('zapłacone'):
+                        # Prawdziwe metryki, legalne (bo FINALPAYMENTDATE <= na_dzien)
+                        days_to_pay = (dfc.loc[paid_mask, 'INVO_FINALPAYMENTDATE'] - dfc.loc[paid_mask, 'INVO_INVDATE']).dt.days
+                        days_late = (dfc.loc[paid_mask, 'INVO_FINALPAYMENTDATE'] - dfc.loc[paid_mask, 'INVO_DUEDATE']).dt.days
+                
+                        avg_dni_do_zaplaty = float(days_to_pay.mean()) if not days_to_pay.empty else np.nan
+                        stdev_dni_do_zaplaty = float(days_to_pay.std()) if len(days_to_pay) > 1 else np.nan
+                
+                        avg_dni_opoznienia = float(days_late.mean()) if not days_late.empty else np.nan
+                        stdev_dni_opoznienia = float(days_late.std()) if len(days_late) > 1 else np.nan
+                
+                    elif scenariusz.startswith('niezapłacone'):
+                        # PROXY metryki "as-of" dla niezapłaconych (bez leak'u)
+                        # "dni do zapłaty" -> wiek faktury do na_dzien
+                        age_today = (na_dzien - dfc.loc[unpaid_mask, 'INVO_INVDATE']).dt.days
+                
+                        # "dni opóźnienia" -> ile dni po terminie na na_dzien, obcięte do >=0
+                        late_today = (na_dzien - dfc.loc[unpaid_mask, 'INVO_DUEDATE']).dt.days
+                        late_today = late_today.clip(lower=0)
+                
+                        avg_dni_do_zaplaty = float(age_today.mean()) if not age_today.empty else np.nan
+                        stdev_dni_do_zaplaty = float(age_today.std()) if len(age_today) > 1 else np.nan
+                
+                        avg_dni_opoznienia = float(late_today.mean()) if not late_today.empty else np.nan
+                        stdev_dni_opoznienia = float(late_today.std()) if len(late_today) > 1 else np.nan
+                
+                    else:  # 'wszystkie_faktury'
+                        # Mieszany wariant: dla zapłaconych prawdziwe, dla niezapłaconych proxy as-of
+                        days_to_pay_paid = (dfc.loc[paid_mask, 'INVO_FINALPAYMENTDATE'] - dfc.loc[paid_mask, 'INVO_INVDATE']).dt.days
+                        days_to_pay_unpaid = (na_dzien - dfc.loc[unpaid_mask, 'INVO_INVDATE']).dt.days
+                        days_to_pay = pd.concat([days_to_pay_paid, days_to_pay_unpaid], ignore_index=True)
+                
+                        days_late_paid = (dfc.loc[paid_mask, 'INVO_FINALPAYMENTDATE'] - dfc.loc[paid_mask, 'INVO_DUEDATE']).dt.days
+                        days_late_unpaid = (na_dzien - dfc.loc[unpaid_mask, 'INVO_DUEDATE']).dt.days
+                        days_late_unpaid = days_late_unpaid.clip(lower=0)
+                        days_late = pd.concat([days_late_paid, days_late_unpaid], ignore_index=True)
+                
+                        avg_dni_do_zaplaty = float(days_to_pay.mean()) if not days_to_pay.empty else np.nan
+                        stdev_dni_do_zaplaty = float(days_to_pay.std()) if len(days_to_pay) > 1 else np.nan
+                
+                        avg_dni_opoznienia = float(days_late.mean()) if not days_late.empty else np.nan
+                        stdev_dni_opoznienia = float(days_late.std()) if len(days_late) > 1 else np.nan
+
+                    # Wstawianie wyników do tabeli
+                    cursor.execute("""
+                        INSERT INTO statystyki_faktur (
+                            INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, DZIEN,
+                            SCENARIUSZ, AVG_DNI_DO_ZAPLATY, STDEV_DNI_DO_ZAPLATY,
+                            AVG_DNI_OPOZNIENIA, STDEV_DNI_OPOZNIENIA,
+                            SUM_INVO_AINITIALH, AVG_INVO_AINITIALH, STDEV_INVO_AINITIALH,
+                            ILE_FAKTUR, PARAM_Z_ILU_DNI, INSERT_TIMESTAMP
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        invo_admno, invo_clntno, invo_debh_no, invo_debc_no,
+                        na_dzien.strftime('%Y-%m-%d %H:%M:%S'),
+                        scenariusz,
+                        avg_dni_do_zaplaty, stdev_dni_do_zaplaty,
+                        avg_dni_opoznienia, stdev_dni_opoznienia,
+                        sum_invo_ainitialh, avg_invo_ainitialh, stdev_invo_ainitialh,
+                        ile_faktur, z_ilu_dni, datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    ))
+                
+                    # Aktualizacja licznika i logowanie co 10 minut
+                    inserted_count += 1
+                    current_time = datetime.now()
+                    if current_time.minute % 10 == 0 and not log_triggered:
+                        log_triggered = True
+                        cursor.execute("SELECT * FROM statystyki_faktur ORDER BY INSERT_TIMESTAMP DESC LIMIT 1")
+                        recent_rows = cursor.fetchall()
+                        print(f"[{current_time}] Inserted rows so far: {inserted_count}")
+                        print(f"[{current_time}] Remaining rows to insert: {len(customer_days) * len(z_ilu_dni_values) - inserted_count}")
+                        print(f"[{current_time}] Last row in statystyki_faktur: {recent_rows}")
+                    elif current_time.minute % 10 != 0:
+                        log_triggered = False
+        
+            # Zapis do bazy na końcu pętli
+            # conn.commit()
+        conn.commit()
+        print("Statystyki faktur zostały obliczone i zapisane.")
+        print(datetime.now().strftime("%H:%M:%S"))
+
+        # Pobranie minimalnej i maksymalnej daty z widoku
+        cursor.execute(
+            "SELECT MIN(dzien), MAX(dzien) FROM group_cust_inv_days WHERE INVO_CLNTNO = ?;",
+            (client_id,)
+        )
+        min_date, max_date = cursor.fetchone()
+        
+        
+        if not min_date or not max_date:
+            print("Brak danych w widoku, wychodzę.")
+            conn.close()
+            continue
+        else:
+            print(f"Zakres dat w widoku: {min_date} - {max_date}")
+        
+        
+        NUM_SHARDS = params['NUM_SHARDS']
+        batch_size = 1000
+        total_inserted_all = 0
+
+        cursor.execute("DELETE FROM dataset_tab WHERE INVO_CLNTNO = ?", (client_id,))
+        conn.commit()
+
+        for shard in range(NUM_SHARDS + 1):
+            if shard < NUM_SHARDS:
+                shard_condition = f"""
+                    (
+                        g.INVO_DEBC_NO IS NOT NULL
+                        AND g.INVO_DEBC_NO NOT GLOB '*[^0-9]*'
+                        AND (CAST(g.INVO_DEBC_NO AS INTEGER) % {NUM_SHARDS}) = {shard}
+                    )
+                """
+            else:
+                shard_condition = """
+                    (
+                        g.INVO_DEBC_NO IS NULL
+                        OR g.INVO_DEBC_NO GLOB '*[^0-9]*'
+                    )
+                """
+
+            client_filter = """
+                AND g.INVO_CLNTNO = ?
+                AND DATE(g.DZIEN) >= DATE(?)
+                AND DATE(g.DZIEN) <= DATE(?)
+            """
+
+            stats_pivot_sql = params['query_stats_pivot_select'] \
+                .replace("{shard_condition}", shard_condition) \
+                .replace("{client_filter}", client_filter)
+
+            dataset_raw_sql = params['query_dataset_raw_select'] \
+                .replace("{stats_pivot_select}", stats_pivot_sql) \
+                .replace("{shard_condition}", shard_condition) \
+                .replace("{client_filter}", client_filter)
+
+            current_date = pd.to_datetime(min_date)
+            total_inserted_shard = 0
+
+            while current_date <= pd.to_datetime(data_end_str):
+                next_date = current_date + pd.Timedelta(days=batch_size - 1)
+
+                query_batch_insert = f"""
+                INSERT INTO dataset_tab
+                {dataset_raw_sql}
+                """
+
+                cursor.execute(
+                    query_batch_insert,
+                    (
+                        client_id,
+                        current_date.strftime('%Y-%m-%d'),
+                        next_date.strftime('%Y-%m-%d'),
+                        client_id,
+                        current_date.strftime('%Y-%m-%d'),
+                        next_date.strftime('%Y-%m-%d'),
+                    )
+                )
+                conn.commit()
+
+                batch_inserted = cursor.rowcount if cursor.rowcount != -1 else 0
+                total_inserted_shard += batch_inserted
+                total_inserted_all += batch_inserted
+
+                print(
+                    f"Dla client={client_id}, shard={shard} zaimportowano "
+                    f"{batch_inserted} rekordów dla dni "
+                    f"{current_date.strftime('%Y-%m-%d')} - {next_date.strftime('%Y-%m-%d')}."
+                )
+                print(datetime.now().strftime("%H:%M:%S"))
+
+                current_date = next_date + pd.Timedelta(days=1)
+
+            print(
+                f"[INFO] Client={client_id}, shard={shard} zakończony. "
+                f"Łącznie w shardzie: {total_inserted_shard}"
+            )
+
+        cursor.execute("DELETE FROM dataset WHERE INVO_CLNTNO = ?", (client_id,))
+        conn.commit()
+
+        refill_dataset_for_client(
+            conn,
+            client_id=client_id,
+            source_table="dataset_tab",
+            target_table="dataset",
+            batch_days=params.get("dataset_batch_days", 31)
+        )
+        print(datetime.now().strftime("%H:%M:%S"))
+        
+    
+        insert_aggregated_data_temp(conn, data_end_str)
+    
+    # (na końcu)
+    conn.commit()
+    conn.close()
+
+# db_init.py
+import argparse
+import os
+import sqlite3
+import sys
+import yaml
+
+
+def load_config(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def exec_sql(conn: sqlite3.Connection, sql: str | None, label: str = "") -> None:
+    if not sql:
+        return
+    try:
+        conn.executescript(sql)
+    except sqlite3.Error as e:
+        raise RuntimeError(f"Błąd podczas wykonywania SQL [{label}]: {e}") from e
+
+
+def table_exists(cursor: sqlite3.Cursor, table_name: str) -> bool:
+    cursor.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table' AND name = ?
+        LIMIT 1
+        """,
+        (table_name,),
+    )
+    return cursor.fetchone() is not None
+
+def create_indexes(index_definitions: dict[str, list[str]], conn: sqlite3.Connection) -> None:
+    cursor = conn.cursor()
+
+    for table_name, columns in index_definitions.items():
+        if not table_exists(cursor, table_name):
+            print(f"[WARN] Pomijam indeksy dla '{table_name}' – tabela jeszcze nie istnieje.")
+            continue
+
+        for column in columns:
+            index_name = f"{table_name}_{column}_idx"
+            sql_query = f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} ({column});"
+            cursor.execute(sql_query)
+
+    conn.commit()
+
+
+def create_aggregated_data_temp_schema(cursor: sqlite3.Cursor, params: dict) -> None:
+    cursor.execute(params.get("query_aggregated_data_temp"))
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ag_day
+        ON aggregated_data_temp (DZIEN);
+    """)
+
+def seed_swieta(cursor: sqlite3.Cursor, params: dict) -> None:
+    columns = params.get("swieta_columns")
+    rows = params.get("swieta_rows")
+
+    if not columns or not rows:
+        print("[WARN] Brak definicji świąt w configu, pomijam seed tabeli swieta.")
+        return
+
+    placeholders = ", ".join(["?"] * len(columns))
+    columns_sql = ", ".join(columns)
+
+    # wstawiamy tylko jeśli identyczny rekord jeszcze nie istnieje
+    where_clause = " AND ".join([f"{col} = ?" for col in columns])
+
+    inserted = 0
+    for row in rows:
+        if len(row) != len(columns):
+            raise RuntimeError(
+                f"Nieprawidłowy rekord swieta. Oczekiwano {len(columns)} pól, "
+                f"otrzymano {len(row)}: {row}"
+            )
+
+        cursor.execute(
+            f"SELECT 1 FROM swieta WHERE {where_clause} LIMIT 1",
+            tuple(row),
+        )
+        exists = cursor.fetchone() is not None
+
+        if not exists:
+            cursor.execute(
+                f"INSERT INTO swieta ({columns_sql}) VALUES ({placeholders})",
+                tuple(row),
+            )
+            inserted += 1
+
+    print(f"[OK] Seed swieta zakończony. Dodano {inserted} nowych rekordów.")
+
+def main():
+    parser = argparse.ArgumentParser(description="SQLite DB schema initialization")
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--db-path", required=True)
+    args = parser.parse_args()
+
+    # 1. Fail, jeśli DB już istnieje
+    if os.path.exists(args.db_path):
+        print(f"[ERROR] Baza już istnieje: {args.db_path}")
+        sys.exit(1)
+
+    os.makedirs(os.path.dirname(args.db_path), exist_ok=True)
+
+    cfg = load_config(args.config)
+    params = cfg["first_model_params"]
+
+    conn = sqlite3.connect(args.db_path)
+    cursor = conn.cursor()
+
+    try:
+        # ============================================================
+        # 2. Tabele statyczne / deterministyczne
+        # ============================================================
+        create_aggregated_data_temp_schema(cursor, params)
+
+        exec_sql(conn, params.get("query_swieta"), "query_swieta")
+        seed_swieta(cursor, params)
+        conn.commit()
+        
+        exec_sql(conn, params.get("query_create_group_cust_inv_days"), "query_create_group_cust_inv_days")
+        exec_sql(conn, params.get("query_create_summary_client_days_tab2"), "query_create_summary_client_days_tab2")
+        exec_sql(conn, params.get("query_create_dataset_tab"), "query_create_dataset_tab")
+        exec_sql(conn, params.get("statystyki_faktur"), "statystyki_faktur")
+
+        exec_sql(conn, params.get("query_create_invo_table"), "query_create_invo_table")
+        exec_sql(conn, params.get("query_create_debc_table"), "query_create_debc_table")
+        exec_sql(conn, params.get("query_create_clhs_table"), "query_create_clhs_table")
+        exec_sql(conn, params.get("query_create_dcmo_table"), "query_create_dcmo_table")
+        
+        exec_sql(conn, params.get("query_create_grouped_client_days_table"), "query_create_grouped_client_days_table")
+        exec_sql(conn, params.get("query_create_dataset"), "query_create_dataset")
+        exec_sql(conn, params.get("query_create_invo_clhs_joined_tab_table"), "query_create_invo_clhs_joined_tab_table")
+        exec_sql(conn, params.get("query_create_extended_grouped_client_days_tab_table"), "query_create_extended_grouped_client_days_tab_table")
+
+        conn.commit()
+
+        exec_sql(conn, params.get("query_create_invo_view"), "query_create_invo_view")
+        exec_sql(conn, params.get("query_create_clhs_view"), "query_create_clhs_view")
+        exec_sql(conn, params.get("query_create_DEBC_view"), "query_create_DEBC_view")
+        exec_sql(conn, params.get("query_create_dcmo_view"), "query_create_dcmo_view")
+        exec_sql(conn, params.get("query_create_INVO_CLHS_JOINED"), "query_create_INVO_CLHS_JOINED")
+        exec_sql(conn, params.get("query_create_summary_client_days_view"), "query_create_summary_client_days_view")
+        exec_sql(conn, params.get("query_create_extended_grouped_client_days_view"), "query_create_extended_grouped_client_days_view")
+        exec_sql(conn, params.get("query_create_stats_pivot_view"), "query_create_stats_pivot_view")
+        exec_sql(conn, params.get("query_create_dataset_raw_view"), "query_create_dataset_raw_view")
+        conn.commit()
+
+        # ============================================================
+        # 5. Indeksy na znanych tabelach
+        # ============================================================
+        index_definitions = {
+            "invo": ["INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO"],
+            "debc": ["DEBC_NO", "DEBC_DEBH", "DEBC_ADMNO", "DEBC_CLNTNO", "DEBC_REINSURANCENUMBER"],
+            "clhs": ["CLHS_NO", "CLHS_DEBC_NO", "CLHS_DEBH_NO", "CLHS_ADMNO", "CLHS_CLNTNO", "CLHS_DATCHANGED", "CLHS_TIMCHANGED"],
+            "dcmo": ["DCMO_DEBC_NO", "DCMO_YEAR", "DCMO_MONTH"],
+            "group_cust_inv_days": ["INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "INVO_DEBC_NO", "DZIEN", "MIESIAC", "ROK"],
+            "grouped_client_days": ["INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "INVO_DEBC_NO", "DZIEN", "MIESIAC", "ROK"],
+            "INVO_CLHS_JOINED_TAB": ["INVO_NO", "INVO_ADMNO", "INVO_CLNTNO", "INVO_DEBH_NO", "INVO_DEBC_NO", "CLHS_NEXT_CHANGED_DATETIME", "CLHS_CHANGED_DATETIME", "CLHS_LIMITOLD", "CLHS_LIMITNEW"],
+        }
+        create_indexes(index_definitions, conn)
+
+        cursor.execute(params['idx_invo_debcno_invdate_etc'])
+        cursor.execute(params['idx_invo_debcno_invdate'])
+        cursor.execute(params['idx_summary_days_ids_dzien'])
+        cursor.execute(params['idx_ext_days_ids_dzien'])
+        cursor.execute(params['idx_clhs_joined_keys_datetime'])
+        cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_aggregated_data_temp_all ON aggregated_data_temp (DZIEN, DZIS_DZIEN_TYG, DZIS_SOBOTA, DZIS_NIEDZIELA);')
+        conn.commit()
+        
+        # indeksy jawnie z configu: idx_*
+        for key, sql in params.items():
+            if not key.startswith("idx_"):
+                continue
+            try:
+                exec_sql(conn, sql, key)
+            except RuntimeError as e:
+                print(f"[WARN] Pomijam {key}: {e}")
+
+        # kilka jawnych indeksów, jeśli tabele istnieją
+        if table_exists(cursor, "dataset"):
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dataset_inv_day ON dataset (INVO_NO, INVO_CLNTNO, DZIEN DESC);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dataset_clear ON dataset (INVO_CLNTNO, INVO_FINALPAYMENTDATE);")
+
+        if table_exists(cursor, "summary_client_days_tab"):
+            cursor.execute("CREATE INDEX IF NOT EXISTS summary_client_days_tab_idx_one_for_all ON summary_client_days_tab (ROK, MIESIAC);")
+
+        if table_exists(cursor, "group_cust_inv_days"):
+            cursor.execute("CREATE INDEX IF NOT EXISTS group_cust_inv_days_idx_year_month ON group_cust_inv_days (ROK, MIESIAC);")
+
+        if table_exists(cursor, "invo"):
+            cursor.execute("CREATE INDEX IF NOT EXISTS invo_idx_one_for_all ON invo (INVO_ADMNO, INVO_DEBH_NO, INVO_DEBC_NO, INVO_INVDATE);")
+
+        conn.commit()
+
+        print(f"[OK] Database schema initialized: {args.db_path}")
+
     finally:
         conn.close()
-    # Ujednolicamy klienta do tej samej kolumny technicznej,
-    # żeby merge działał identycznie dla starej i nowej bazy
-    df[KEY_CLIENT_COL] = pd.to_numeric(df["INVO_CLNTNO"], errors="coerce").astype("Int64")
-    return df
-# =========================
-# NORMALIZACJA
-# =========================
-def normalize_frames(df_old: pd.DataFrame, df_new: pd.DataFrame):
-    df_old.columns = [c.strip() for c in df_old.columns]
-    df_new.columns = [c.strip() for c in df_new.columns]
-    # wspólne kolumny
-    common_cols = [c for c in df_old.columns if c in df_new.columns]
-    df_old = df_old[common_cols].copy()
-    df_new = df_new[common_cols].copy()
-    # klucze
-    df_old[KEY_INVO_COL] = pd.to_numeric(df_old[KEY_INVO_COL], errors="coerce").astype("Int64")
-    df_new[KEY_INVO_COL] = pd.to_numeric(df_new[KEY_INVO_COL], errors="coerce").astype("Int64")
-    df_old[KEY_DAY_COL] = pd.to_datetime(df_old[KEY_DAY_COL], errors="coerce").dt.date
-    df_new[KEY_DAY_COL] = pd.to_datetime(df_new[KEY_DAY_COL], errors="coerce").dt.date
-    df_old[KEY_CLIENT_COL] = pd.to_numeric(df_old[KEY_CLIENT_COL], errors="coerce").astype("Int64")
-    df_new[KEY_CLIENT_COL] = pd.to_numeric(df_new[KEY_CLIENT_COL], errors="coerce").astype("Int64")
-    return df_old, df_new, common_cols
-# =========================
-# MAIN
-# =========================
-df_old = load_old_dataset_from_client_dbs(BASE_DIR_OLD, CLIENT_LIST, DZIEN_FILTER)
-df_new = load_new_dataset_from_shared_db(BASE_DIR_NEW, NEW_DB_NAME, CLIENT_LIST, DZIEN_FILTER)
-print("OLD shape:", df_old.shape)
-print("NEW shape:", df_new.shape)
-df_old, df_new, common_cols = normalize_frames(df_old, df_new)
-key_cols = [KEY_CLIENT_COL, KEY_INVO_COL, KEY_DAY_COL]
-# =========================
-# MERGE
-# =========================
-df_merged = df_new.merge(
-    df_old,
-    on=key_cols,
-    how="outer",
-    suffixes=("__NEW", "__OLD"),
-    indicator=True
+
+
+if __name__ == "__main__":
+    main()
+
+
+# build_client_db.py
+import argparse
+from datetime import datetime
+import yaml
+import CreateDatabase
+
+def load_config(path="config.yaml"):
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+def parse_client_ids(raw):
+    if raw is None:
+        return None
+    return [int(x.strip()) for x in raw.split(",") if x.strip()]
+
+def main():
+    parser = argparse.ArgumentParser(description="Build per-client SQLite DBs from single Excel file")
+
+    parser.add_argument(
+        "--t0",
+        required=True,
+        help="Current date in YYYY-MM-DD"
+    )
+    parser.add_argument(
+        "--config",
+        default="config.yaml",
+        help="Path to config.yaml"
+    )
+    parser.add_argument(
+        "--build-clients",
+        help="Comma-separated list of client IDs to build DBs for (overrides config)"
+    )
+
+    parser.add_argument(
+        "--db-path",
+        required=True,
+        help="Ścieżka do wspólnej bazy SQLite"
+    )
+
+
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    t0 = datetime.strptime(args.t0, "%Y-%m-%d").date()
+
+    config["first_model_params"]["database"] = args.db_path
+    cli_clients = parse_client_ids(args.build_clients)
+
+    if cli_clients:
+        # NADPISUJEMY tylko na potrzeby tego wywołania
+        config["first_model_params"]["train_client_id"] = cli_clients
+        print(f"[INFO] Using client list from CLI: {cli_clients}")
+    else:
+        print(
+            "[INFO] Using client list from config.yaml:",
+            config["first_model_params"].get("train_client_id")
+        )
+
+    # CORE: dalej zostaje EXACTLY ten sam mechanizm
+    CreateDatabase.CreateDatabase(
+        config["first_model_params"],
+        t0,
+        create_db_from_one_excel=True
+    )
+
+if __name__ == "__main__":
+    main()
+
+# runner_batch.py
+import argparse
+import copy
+import logging
+import os
+from datetime import datetime
+
+import pandas as pd
+import yaml
+
+import first_model
+from first_model import get_train_test_params
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
-both = df_merged[df_merged["_merge"] == "both"].copy()
-print("Rows only in NEW:", (df_merged["_merge"] == "left_only").sum())
-print("Rows only in OLD:", (df_merged["_merge"] == "right_only").sum())
-print("Rows in BOTH:", len(both))
-# =========================
-# FEATURE COLS
-# =========================
-# NIE porównujemy kluczy ani kolumny klienta technicznej
-feature_cols = [
-    c for c in common_cols
-    if c not in key_cols and not c.startswith("__")
-]
-# jeśli chcesz wykluczyć jakieś kolumny techniczne, dodaj tutaj:
-exclude_feature_cols = {
-    # "INSERT_TIMESTAMP",
-}
-feature_cols = [c for c in feature_cols if c not in exclude_feature_cols]
-# konwersja do numerycznych tam, gdzie się da
-for c in feature_cols:
-    both[f"{c}__NEW"] = pd.to_numeric(both[f"{c}__NEW"], errors="coerce")
-    both[f"{c}__OLD"] = pd.to_numeric(both[f"{c}__OLD"], errors="coerce")
-# =========================
-# ANALIZA RÓŻNIC KOLUMN
-# =========================
-results = []
-n = len(both)
-for c in feature_cols:
-    a = both[f"{c}__NEW"]
-    b = both[f"{c}__OLD"]
-    both_na = a.isna() & b.isna()
-    absdiff = (a - b).abs()
-    is_diff = (~both_na) & (absdiff.fillna(np.inf) > 0)
-    results.append({
-        "column": c,
-        "n_rows": n,
-        "n_diff": int(is_diff.sum()),
-        "pct_diff": float(is_diff.mean()) if n else 0.0,
-        "max_abs_diff": float(absdiff[~both_na].max()) if (~both_na).any() else 0.0,
-        "mean_abs_diff": float(absdiff[~both_na].mean()) if (~both_na).any() else 0.0,
-        "median_abs_diff": float(absdiff[~both_na].median()) if (~both_na).any() else 0.0,
-        "n_na_new": int(a.isna().sum()),
-        "n_na_old": int(b.isna().sum()),
-    })
-df_col_diff = pd.DataFrame(results).sort_values(
-    by=["pct_diff", "max_abs_diff", "mean_abs_diff"],
-    ascending=[False, False, False]
-)
-# =========================
-# ANALIZA RÓŻNIC WIERSZY
-# =========================
-A = both[[f"{c}__NEW" for c in feature_cols]].to_numpy(dtype=float)
-B = both[[f"{c}__OLD" for c in feature_cols]].to_numpy(dtype=float)
-eq = (A == B) | (np.isnan(A) & np.isnan(B))
-n_diffs_per_row = (~eq).sum(axis=1)
-df_row_diff = both[key_cols].copy()
-df_row_diff["n_feature_diffs"] = n_diffs_per_row
-df_row_diff = df_row_diff.sort_values("n_feature_diffs", ascending=False)
-# =========================
-# DETAIL TOP N
-# =========================
-TOP_N = 30
-top_cols = df_col_diff.head(TOP_N)["column"].tolist()
-detail_cols = key_cols[:]
-for c in top_cols:
-    detail_cols += [f"{c}__NEW", f"{c}__OLD"]
-df_detail = both[detail_cols].copy()
-# =========================
-# PODSUMOWANIE RÓŻNIC W KLUCZACH
-# =========================
-df_only_new = df_merged[df_merged["_merge"] == "left_only"][key_cols].copy()
-df_only_old = df_merged[df_merged["_merge"] == "right_only"][key_cols].copy()
-# =========================
-# EXPORT
-# =========================
-with pd.ExcelWriter(OUT_REPORT_XLSX, engine="openpyxl") as writer:
-    df_col_diff.to_excel(writer, sheet_name="column_diff_rank", index=False)
-    df_row_diff.to_excel(writer, sheet_name="row_diff_rank", index=False)
-    df_detail.to_excel(writer, sheet_name="top_feature_detail", index=False)
-    df_only_new.to_excel(writer, sheet_name="rows_only_in_new", index=False)
-    df_only_old.to_excel(writer, sheet_name="rows_only_in_old", index=False)
-    df_merged.to_excel(writer, sheet_name="merged_raw", index=False)
-print("✅ Zapisano raport:", OUT_REPORT_XLSX.resolve())
 
-Najważniejsze różnice względem poprzedniej wersji:
 
-* __CLIENT_ID jest częścią key_cols,
-* feature_cols wykluczają __CLIENT_ID,
-* stara baza dostaje __CLIENT_ID = cid,
-* nowa baza bierze INVO_CLNTNO i kopiuje do __CLIENT_ID,
-* porównanie dotyczy tylko dataset.
+def load_config(config_path="config.yaml"):
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
-Jeżeli chcesz, mogę Ci od razu dać jeszcze wersję rozszerzoną, która:
 
-* porównuje także kolumny tekstowe, a nie tylko numeryczne,
-* robi tolerancję dla floatów, np. 1e-6,
-* i pokazuje tylko realne różnice biznesowe zamiast wszystkich minimalnych odchyleń.
+def save_model_run(results_file, config, operation_mode, avg_accuracy):
+    row_data = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "train_client_id": config["first_model_params"]["train_client_id"],
+        "test_client_id": config["first_model_params"]["test_client_id"],
+        "model_path": config["first_model_params"]["model_path"],
+        "database": config["first_model_params"]["database"],
+        "test_database": config["first_model_params"].get("test_database"),
+        "operation_mode": operation_mode,
+        "avg_accuracy": avg_accuracy,
+    }
+
+    df_new = pd.DataFrame([row_data])
+
+    if not os.path.exists(results_file):
+        df_new.to_excel(results_file, index=False, sheet_name="runs")
+        logging.info("Created results file: %s", results_file)
+    else:
+        existing_df = pd.read_excel(results_file, sheet_name="runs")
+        combined_df = pd.concat([existing_df, df_new], ignore_index=True)
+        combined_df.to_excel(results_file, index=False, sheet_name="runs")
+        logging.info("Appended run to results file: %s", results_file)
+
+
+def build_db_path(db_root, t0_str, client_id):
+    return os.path.join(db_root, t0_str, t0_str, f"CashPredictorT_{client_id}.db")
+
+def build_db_path_from_template(db_template, client_id):
+    """
+    Przykład template:
+    C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictorT_{client_id}.db
+    """
+    return db_template.format(client_id=client_id)
+
+def parse_client_ids(raw_value):
+    if raw_value is None:
+        return None
+
+    parts = [x.strip() for x in str(raw_value).split(",") if x.strip()]
+    ids = [int(x) for x in parts]
+
+    if len(ids) == 1:
+        return ids[0]
+    return ids
+
+def ensure_list(client_ids):
+    if client_ids is None:
+        return []
+    if isinstance(client_ids, list):
+        return client_ids
+    return [client_ids]
+
+
+def resolve_db_path(db_root, t0, client_ids, explicit_db_path=None):
+    if explicit_db_path:
+        if not os.path.exists(explicit_db_path):
+            raise FileNotFoundError(f"Baza nie istnieje: {explicit_db_path}")
+        return explicit_db_path
+
+    if isinstance(client_ids, list):
+        raise ValueError(
+            "Dla wielu client IDs musisz podać jawnie --train-db-path albo --test-db-path"
+        )
+
+    t0_str = t0.strftime("%Y-%m-%d")
+    db_path = build_db_path(db_root, t0_str, client_ids)
+
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"Baza nie istnieje: {db_path}")
+
+    return db_path
+
+
+def prepare_config_for_run(
+    config,
+    train_client_ids,
+    test_client_ids,
+    model_path,
+    train_db_path,
+    test_db_path,
+):
+    cfg = copy.deepcopy(config)
+
+    cfg["first_model_params"]["train_client_id"] = train_client_ids
+    cfg["first_model_params"]["test_client_id"] = test_client_ids
+    cfg["first_model_params"]["database"] = train_db_path
+    cfg["first_model_params"]["test_database"] = test_db_path
+    cfg["first_model_params"]["model_path"] = model_path
+
+    # jeśli te pola istnieją/mają znaczenie w first_model
+    cfg["first_model_params"]["client_ids_to_train_on_one_db"] = train_client_ids
+    cfg["first_model_params"]["client_ids_to_test_on_one_db"] = test_client_ids
+
+    return cfg
+
+
+def run_phase(
+    config,
+    t0,
+    operation_mode,
+    train_client_ids,
+    test_client_ids,
+    model_path,
+    train_db_path,
+    test_db_path,
+    results_file,
+):
+    cfg = prepare_config_for_run(
+        config=config,
+        train_client_ids=train_client_ids,
+        test_client_ids=test_client_ids,
+        model_path=model_path,
+        train_db_path=train_db_path,
+        test_db_path=test_db_path,
+    )
+
+    acceptance_period = cfg["first_model_params"]["acceptance_period"]
+    retrain_period = cfg["first_model_params"]["retrain_period"]
+
+    actual_model_path, test_start, test_end, train_start, train_end = get_train_test_params(
+        cfg["first_model_params"],
+        operation_mode,
+        t0,
+        acceptance_period,
+        retrain_period,
+    )
+
+    logging.info("=== START phase %s ===", operation_mode)
+    logging.info("train_client_id=%s", cfg["first_model_params"]["train_client_id"])
+    logging.info("test_client_id=%s", cfg["first_model_params"]["test_client_id"])
+    logging.info("database=%s", cfg["first_model_params"]["database"])
+    logging.info("test_database=%s", cfg["first_model_params"]["test_database"])
+    logging.info("model_path=%s", cfg["first_model_params"]["model_path"])
+
+    avg_acc = first_model.first_model(
+        actual_model_path,
+        test_start,
+        test_end,
+        train_start,
+        train_end,
+        cfg["first_model_params"],
+        operation_mode,
+        t0,
+        acceptance_period,
+        retrain_period,
+    )
+
+    save_model_run(results_file, cfg, operation_mode, avg_acc)
+
+    logging.info("=== END phase %s ===", operation_mode)
+    return avg_acc
+
+def run_test_for_each_client(
+    config,
+    t0,
+    test_mode,
+    train_client_ids,
+    test_client_ids,
+    model_path,
+    test_db_template,
+    results_file,
+):
+    failures = []
+
+    for test_client_id in ensure_list(test_client_ids):
+        logging.info("=== START single-client test: %s ===", test_client_id)
+
+        try:
+            test_db_path = build_db_path_from_template(test_db_template, test_client_id)
+
+            if not os.path.exists(test_db_path):
+                raise FileNotFoundError(f"Baza nie istnieje: {test_db_path}")
+
+            # w trybie pomostowym test ma czytać i zapisywać do pojedynczej bazy klienta
+            run_phase(
+                config=config,
+                t0=t0,
+                operation_mode=test_mode,
+                train_client_ids=train_client_ids,
+                test_client_ids=test_client_id,
+                model_path=model_path,
+                train_db_path=test_db_path,
+                test_db_path=test_db_path,
+                results_file=results_file,
+            )
+
+        except first_model.NoDataError as e:
+            logging.warning("[SKIP TEST] client %s: %s", test_client_id, e)
+        except Exception as e:
+            logging.exception("Test failed for client %s: %s", test_client_id, e)
+            failures.append(test_client_id)
+
+        logging.info("=== END single-client test: %s ===", test_client_id)
+
+    return failures
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Batch runner for first_model")
+
+    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+    parser.add_argument("--t0", required=True, help="Current date in YYYY-MM-DD")
+    parser.add_argument("--model-path", required=True, help="Base path to .pt model")
+    parser.add_argument("--db-root", default="databases", help="Root directory for per-client databases")
+    parser.add_argument("--results-file", default="model_runs.xlsx", help="Excel file for run results")
+
+    parser.add_argument("--run-train", action="store_true", help="Run training phase")
+    parser.add_argument("--run-test", action="store_true", help="Run test phase")
+
+    parser.add_argument("--train-mode", default="train", help="Operation mode for training")
+    parser.add_argument("--test-mode", default="test_today", help="Operation mode for testing")
+
+    parser.add_argument("--train-client-ids", help="Single client id or comma-separated list for training")
+    parser.add_argument("--test-client-ids", help="Single client id or comma-separated list for testing")
+
+    parser.add_argument("--train-db-path", help="Explicit DB path for training")
+    parser.add_argument("--test-db-path", help="Explicit DB path for testing")
+
+    parser.add_argument("--test-db-template", help="Template path for per-client test DB, e.g. C:/.../CashPredictorT_{client_id}.db")    
+
+    # opcjonalnie dla zgodności wstecznej z Twoim starym test runnerem
+    parser.add_argument("--client-id", type=int, help="Single client id shortcut for test")
+    parser.add_argument("--client-list", help="Comma separated client ids shortcut for test")
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    config = load_config(args.config)
+    t0 = datetime.strptime(args.t0, "%Y-%m-%d").date()
+
+    if not args.run_train and not args.run_test:
+        raise SystemExit("Podaj przynajmniej --run-train albo --run-test")
+
+    # zgodność wsteczna: stary test runner
+    fallback_test_client_ids = None
+    if args.client_id is not None:
+        fallback_test_client_ids = args.client_id
+    elif args.client_list:
+        fallback_test_client_ids = [int(x.strip()) for x in args.client_list.split(",") if x.strip()]
+
+    train_client_ids = parse_client_ids(args.train_client_ids)
+    test_client_ids = parse_client_ids(args.test_client_ids)
+
+    if test_client_ids is None and fallback_test_client_ids is not None:
+        test_client_ids = fallback_test_client_ids
+
+    if args.run_train and train_client_ids is None:
+        raise SystemExit("Dla --run-train musisz podać --train-client-ids")
+
+    if args.run_test and test_client_ids is None:
+        raise SystemExit("Dla --run-test musisz podać --test-client-ids albo --client-id/--client-list")
+
+    failures = []
+
+    trained_model_path = args.model_path
+
+    # TRAIN
+    if args.run_train:
+        try:
+            train_db_path = resolve_db_path(
+                db_root=args.db_root,
+                t0=t0,
+                client_ids=train_client_ids,
+                explicit_db_path=args.train_db_path,
+            )
+
+            # przy samym train test_client_ids może być takie samo jak train_client_ids
+            effective_test_ids_for_train = test_client_ids if test_client_ids is not None else train_client_ids
+
+            run_phase(
+                config=config,
+                t0=t0,
+                operation_mode=args.train_mode,
+                train_client_ids=train_client_ids,
+                test_client_ids=effective_test_ids_for_train,
+                model_path=trained_model_path,
+                train_db_path=train_db_path,
+                test_db_path=train_db_path,
+                results_file=args.results_file,
+            )
+        except first_model.NoDataError as e:
+            logging.warning("[SKIP TRAIN] %s", e)
+        except Exception as e:
+            logging.exception("Train failed: %s", e)
+            failures.append("train")
+
+    # TEST
+    if args.run_test:
+        try:
+            effective_train_ids_for_test = train_client_ids if train_client_ids is not None else test_client_ids
+
+            # TRYB POMOSTOWY:
+            # test wielu klientów przez pętlę po pojedynczych bazach
+            if isinstance(test_client_ids, list):
+                if not args.test_db_template:
+                    raise SystemExit(
+                        "Dla testu wielu klientów w rozwiązaniu pomostowym musisz podać --test-db-template"
+                    )
+
+                test_failures = run_test_for_each_client(
+                    config=config,
+                    t0=t0,
+                    test_mode=args.test_mode,
+                    train_client_ids=effective_train_ids_for_test,
+                    test_client_ids=test_client_ids,
+                    model_path=trained_model_path,
+                    test_db_template=args.test_db_template,
+                    results_file=args.results_file,
+                )
+
+                if test_failures:
+                    failures.extend([f"test:{client_id}" for client_id in test_failures])
+
+            else:
+                # stary wariant: test jednego klienta
+                test_db_path = resolve_db_path(
+                    db_root=args.db_root,
+                    t0=t0,
+                    client_ids=test_client_ids,
+                    explicit_db_path=args.test_db_path,
+                )
+
+                run_phase(
+                    config=config,
+                    t0=t0,
+                    operation_mode=args.test_mode,
+                    train_client_ids=effective_train_ids_for_test,
+                    test_client_ids=test_client_ids,
+                    model_path=trained_model_path,
+                    train_db_path=test_db_path,
+                    test_db_path=test_db_path,
+                    results_file=args.results_file,
+                )
+
+        except first_model.NoDataError as e:
+            logging.warning("[SKIP TEST] %s", e)
+        except Exception as e:
+            logging.exception("Test failed: %s", e)
+            failures.append("test")
+
+    if failures:
+        raise SystemExit(f"Run finished with failures in phases: {failures}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+wywołania:
+
+cd C:\Users\OE00SG\CashPredictor\dev3\gcp batch
+test
+python runner_batch.py ^
+  --t0 2026-01-01 ^
+  --run-test ^
+  --test-client-ids 13581,10095,6089,8964,8989 ^
+  --test-db-template C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictorT_{client_id}.db ^
+  --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+  
+
+train
+python runner_batch.py ^
+  --t0 2026-01-01 ^
+  --run-train ^
+  --train-client-ids 10069,9320,13581 ^
+  --train-db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictorT_ALL.db ^
+  --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+
+train and test
+python runner_batch.py ^
+  --t0 2026-01-01 ^
+  --run-train ^
+  --run-test ^
+  --train-client-ids 10069,9320,13581 ^
+  --test-client-ids 10069,9320,13581 ^
+  --train-db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictorT_ALL.db ^
+  --test-db-template C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictorT_{client_id}.db ^
+  --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+
+conda activate cpdev50
+cd C:\Users\OE00SG\CashPredictor\dev3\gcp batch
+python db_init.py ^
+  --config config.yaml ^
+  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+
+conda activate cpdev50
+cd C:\Users\OE00SG\CashPredictor\dev3\gcp batch
+python build_client_db.py ^
+  --t0 2026-03-02 ^
+  --build-clients 13581,10095,6089,8964,8989 ^
+  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+  
+  
+zastanów się, co zostało zrobione, jak. jaką mamy aktualny stan projektu, jakie pliki, jaką logikę, gdzie jesteśmy, jakie sa kolejne etapy.
