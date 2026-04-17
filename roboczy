@@ -1,368 +1,42 @@
-Błąd wynika z tego, że po podstawieniach Twój finalny SQL ma tylko 3 placeholdery ?, a Ty przekazujesz 6 parametrów.
+createdatabase -> zmiana nazwy
+wyrzucić z createdatabase niepotrzebny kod
+przerzucić selecty do configa z createdatabase
+ujednolicić przekazywanie parametrów w createdatabase
+runner_batch.py -> jedna baza
+co i jak jeszcze trzeba odchudzać z CreateDatabase.py i dlaczego?
+co jest nie tak z logiką bazodanową w config.yaml? dlaczego trzeba to wydzielić, jak i gdzie?
 
-To widać po komunikacie:
+to co zostało w etapie 1.5 daj do nowego etapu 1.6 i daj tam jeszcze to co po wyżej, całość powinna rozpocząć się testem procesu:
+db_init, i build_client_db, a następnie runner_batch
+czyli mamy już db_init, i build_client_db teraz skończmy ten 1.5 na przystosowaniu build_client_db do jednej bazy
+i to samo na końcu 1.6 + test datasetu ASOF vs FULL
+czyli rozpisz plan działań
 
-sqlite3.ProgrammingError: Incorrect number of bindings supplied.
-The current statement uses 3, and there are 6 supplied.
+a następnie daj popraw pozostały plan ale już na bardziej koncepcyjnym poziomie niż powyższe dla zmian:
+to tajmy:
+Etap 4 — schema + Alembic
 
-Skąd się to bierze
+Po uporządkowaniu aplikacji:
 
-W Pythonie robisz:
+* jawny schemat trwały,
+* migracje,
+* rozdział staging / durable schema.
 
-stats_pivot_sql = params['query_stats_pivot_select'] \
-    .replace("{shard_condition}", shard_condition) \
-    .replace("{client_filter}", client_filter)
+Etap 5 — PostgreSQL lokalnie
 
-dataset_raw_sql = params['query_dataset_raw_select'] \
-    .replace("{stats_pivot_select}", stats_pivot_sql) \
-    .replace("{shard_condition}", shard_condition) \
-    .replace("{client_filter}", client_filter)
+Dopiero wtedy ma sens przejście:
 
-a potem:
+* ze sqlite3,
+* na PostgreSQL,
+* z przepisaniem SQL-i i dostępu do bazy.
 
-cursor.execute(
-    query_batch_insert,
-    (
-        client_id,
-        current_date.strftime('%Y-%m-%d'),
-        next_date.strftime('%Y-%m-%d'),
-        client_id,
-        current_date.strftime('%Y-%m-%d'),
-        next_date.strftime('%Y-%m-%d'),
-    )
-)
+przed Etap 3 — konteneryzacja
 
-czyli zakładasz, że:
-	•	3 ? są w stats_pivot_select
-	•	3 ? są w zewnętrznym query_dataset_raw_select
+Dopiero jak etap 2 trochę uporządkuje strukturę:
 
-Ale z błędu wynika, że finalnie SQL ma tylko te wewnętrzne 3, a zewnętrzne {client_filter} w query_dataset_raw_select najpewniej w ogóle nie występuje albo nie jest już użyte w końcowej części zapytania.
+* Dockerfile,
+* uruchomienie batchowe w kontenerze,
+* parametry przez CLI / env,
+* bez zależności od lokalnych ścieżek.
 
-⸻
-
-Najważniejsza diagnoza
-
-Masz niespójność między Pythonem a configiem:
-	•	Python przekazuje 6 parametrów
-	•	config finalnie używa tylko 3 placeholderów
-
-Czyli trzeba zrobić jedno z dwóch:
-
-wariant A — szybka naprawa błędu
-
-przekazać tylko 3 parametry
-
-albo
-
-wariant B — poprawna naprawa logiczna
-
-dopisać {client_filter} także do zewnętrznego query_dataset_raw_select, tak aby faktycznie były łącznie 6 placeholderów.
-
-W Twoim przypadku poprawny jest wariant B, bo on zachowuje starą optymalizację: filtrowanie shardem i klientem ma działać nie tylko w pivot, ale też na głównym group_cust_inv_days g.
-
-⸻
-
-Co trzeba poprawić
-
-1. W query_dataset_raw_select dodaj końcowy filtr zewnętrzny
-
-Na końcu tego SQL-a, po joinie do pivota, musi być jeszcze normalny ON ... dla pivota, a potem WHERE.
-
-Teraz w pokazanym fragmencie urywa się na:
-
-LEFT JOIN (
-{stats_pivot_select}
-) pivot
-
-czyli brakuje dalszej części.
-
-Powinno być mniej więcej tak:
-
-query_dataset_raw_select: |
-  SELECT 
-      ...
-  FROM 
-      group_cust_inv_days g
-      LEFT JOIN invo i
-        ON ...
-      LEFT JOIN (...) c
-        ON ...
-      LEFT JOIN extended_grouped_client_days_tab e
-        ON ...
-      LEFT JOIN summary_client_days_tab s
-        ON ...
-      LEFT JOIN (
-      {stats_pivot_select}
-      ) pivot
-        ON g.INVO_ADMNO = pivot.INVO_ADMNO
-       AND g.INVO_CLNTNO = pivot.INVO_CLNTNO
-       AND g.INVO_DEBH_NO = pivot.INVO_DEBH_NO
-       AND g.INVO_DEBC_NO = pivot.INVO_DEBC_NO
-       AND DATE(g.DZIEN) = DATE(pivot.DZIEN)
-  WHERE 1=1
-  {client_filter}
-  AND {shard_condition}
-
-To jest kluczowe.
-
-Dzięki temu:
-	•	wewnętrzny subquery pivot ma swoje 3 ?
-	•	zewnętrzny select ma kolejne 3 ?
-
-I wtedy Twoje 6 parametrów będzie poprawne.
-
-⸻
-
-2. Jeśli nie chcesz jeszcze ruszać configa, to tymczasowo zmień execute na 3 parametry
-
-Tylko to będzie obejście, nie docelowe rozwiązanie:
-
-cursor.execute(
-    query_batch_insert,
-    (
-        client_id,
-        current_date.strftime('%Y-%m-%d'),
-        next_date.strftime('%Y-%m-%d'),
-    )
-)
-
-Ale tego nie polecam jako finalnej wersji, bo wtedy outer query nie ma filtrowania klienta/date i wydajność może siąść albo logika może brać za szeroki zakres.
-
-⸻
-
-Drugi realny problem, który już widać w logach
-
-To jest bardzo ważne:
-
-Rozpoczynam partiami wstawianie do 'summary_client_days_tab'...
-Ostatnio wstawiony miesiąc: ROK=2026, MIESIAC=6
-Wszystkie partie zostały zaimportowane. Łącznie wstawiono (teraz) = 0.
-
-To jest błąd logiki.
-
-Dlaczego
-
-W aktualnym kodzie robisz:
-	1.	odczytujesz last_row z summary_client_days_tab
-	2.	potem robisz:
-
-DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?
-
-
-	3.	ale dalej nadal używasz starego last_inserted_year/month
-	4.	więc wszystko uznajesz za „już było” i nic nie wstawiasz
-
-To trzeba uprościć
-
-Skoro teraz przebudowujesz dane klienta od zera, to nie potrzebujesz już logiki “kontynuuj od ostatniego miesiąca”.
-
-Zrób tak:
-	•	usuń cały blok z last_row
-	•	usuń porównywanie last_val / cur_val
-	•	najpierw wyczyść klienta
-	•	potem wstaw wszystkie miesiące od nowa
-
-Czyli zamiast tego:
-
-cursor.execute("""
-    SELECT ROK, MIESIAC
-    FROM summary_client_days_tab
-    WHERE INVO_CLNTNO = ?
-    ORDER BY ROK DESC, MIESIAC DESC
-    LIMIT 1
-""", (client_id,))
-last_row = cursor.fetchone()
-...
-cursor.execute("DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
-...
-if cur_val <= last_val:
-    continue
-
-zrób po prostu:
-
-cursor.execute("DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
-conn.commit()
-
-cursor.execute("""
-    SELECT DISTINCT ROK, MIESIAC
-    FROM extended_grouped_client_days
-    WHERE INVO_CLNTNO = ?
-    ORDER BY ROK, MIESIAC
-""", (client_id,))
-all_rows = cursor.fetchall()
-
-inserted_count = 0
-
-for (year, month) in all_rows:
-    insert_sql = """
-        INSERT INTO summary_client_days_tab
-        SELECT *
-        FROM summary_client_days_view
-        WHERE ROK = ?
-          AND MIESIAC = ?
-          AND INVO_CLNTNO = ?
-    """
-    cursor.execute(insert_sql, (year, month, client_id))
-    conn.commit()
-
-    row_count = cursor.rowcount if cursor.rowcount != -1 else 0
-    inserted_count += row_count
-    print(f"Wstawiono ROK={year}, MIESIAC={month} -> {row_count} wierszy (narastająco={inserted_count})")
-
-To jest dużo bardziej zgodne z nową logiką „delete + refill”.
-
-⸻
-
-Trzeci problem: masz jeszcze trochę SQL-i jako f-stringi
-
-Na przykład:
-
-query_invo = f"""
-SELECT ...
-FROM invo_view
-WHERE INVO_INVDATE IS NOT NULL
-and date(INVO_INVDATE) >= {params['od_dnia']}
-AND INVO_CLNTNO = {client_id};
-"""
-
-To powinno być parametryzowane:
-
-query_invo = """
-SELECT 
-    INVO_NO,
-    INVO_ADMNO,
-    INVO_CLNTNO,
-    INVO_DEBH_NO,
-    INVO_DEBC_NO,
-    INVO_INVDATE,
-    INVO_FINALPAYMENTDATE
-FROM invo_view
-WHERE INVO_INVDATE IS NOT NULL
-  AND DATE(INVO_INVDATE) >= DATE(?)
-  AND INVO_CLNTNO = ?
-"""
-cursor.execute(query_invo, (params['od_dnia'], client_id))
-
-Tak samo dla:
-	•	insert do extended_grouped_client_days_tab
-	•	insert do summary_client_days_tab
-	•	wszędzie gdzie dziś wstrzykujesz year, month, client_id jako tekst
-
-To nie jest źródło obecnego błędu, ale warto od razu posprzątać.
-
-⸻
-
-Czwarty problem: insert_aggregated_data_temp
-
-Masz teraz:
-
-INSERT INTO aggregated_data_temp
-
-a opisujesz to jakby ignorowało duplikaty.
-
-Jeśli to ma dopisywać tylko brakujące dni, to musi być:
-
-insert_query = """
-    INSERT OR IGNORE INTO aggregated_data_temp
-    (DZIEN, DZIS_DZIEN_TYG, DZIS_SOBOTA, DZIS_NIEDZIELA)
-    VALUES (?, ?, ?, ?)
-"""
-
-i tabela musi mieć unikalność po DZIEN.
-
-⸻
-
-Co bym poprawił teraz krok po kroku
-
-Poprawka 1 — config query_dataset_raw_select
-
-Dodaj brakujący zewnętrzny filtr i pełny join do pivota.
-
-Poprawka 2 — zostaw 6 parametrów w cursor.execute(...)
-
-ale dopiero po poprawce configa.
-
-Poprawka 3 — uprość summary_client_days_tab
-
-usuń logikę „last inserted month”, bo teraz robisz pełny refill klienta.
-
-Poprawka 4 — parametryzuj SQL zamiast f-stringów
-
-zwłaszcza query_invo i inserty po (year, month, client_id).
-
-⸻
-
-Gotowa poprawka dla problematycznego fragmentu summary
-
-Wklej zamiast obecnego bloku summary_client_days_tab:
-
-print("Rozpoczynam partiami wstawianie do 'summary_client_days_tab'...")
-
-cursor.execute("DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
-conn.commit()
-
-cursor.execute("""
-    SELECT DISTINCT ROK, MIESIAC
-    FROM extended_grouped_client_days
-    WHERE INVO_CLNTNO = ?
-    ORDER BY ROK, MIESIAC
-""", (client_id,))
-all_rows = cursor.fetchall()
-
-inserted_count = 0
-
-for (year, month) in all_rows:
-    insert_sql = """
-        INSERT INTO summary_client_days_tab
-        SELECT *
-        FROM summary_client_days_view
-        WHERE ROK = ?
-          AND MIESIAC = ?
-          AND INVO_CLNTNO = ?
-    """
-    cursor.execute(insert_sql, (year, month, client_id))
-    conn.commit()
-
-    row_count = cursor.rowcount if cursor.rowcount != -1 else 0
-    inserted_count += row_count
-    print(f"Wstawiono ROK={year}, MIESIAC={month} -> {row_count} wierszy (narastająco={inserted_count})")
-
-print(f"Wszystkie partie zostały zaimportowane. Łącznie wstawiono = {inserted_count}.")
-print(datetime.now().strftime("%H:%M:%S"))
-
-
-⸻
-
-Gotowa poprawka dla query_invo
-
-query_invo = """
-SELECT 
-    INVO_NO,
-    INVO_ADMNO,
-    INVO_CLNTNO,
-    INVO_DEBH_NO,
-    INVO_DEBC_NO,
-    INVO_INVDATE,
-    INVO_FINALPAYMENTDATE
-FROM invo_view
-WHERE INVO_INVDATE IS NOT NULL
-  AND DATE(INVO_INVDATE) >= DATE(?)
-  AND INVO_CLNTNO = ?
-"""
-cursor.execute(query_invo, (params['od_dnia'], client_id))
-rows = cursor.fetchall()
-
-
-⸻
-
-Wniosek
-
-Na teraz masz dwa realne błędy:
-	1.	binding mismatch 3 vs 6
-bo query_dataset_raw_select nie ma jeszcze aktywnego zewnętrznego {client_filter}
-	2.	summary_client_days_tab wstawia 0
-bo mieszasz starą logikę incremental z nową logiką delete+refill
-
-To są relikty po starej architekturze i właśnie one teraz wychodzą.
-
-Jeżeli chcesz, w następnym kroku mogę Ci rozpisać już gotowy finalny fragment query_dataset_raw_select końcówki, dokładnie w formie do wklejenia do configa.
+czyli rozpisz mi etapy 1.5,1.6 dokładnie z planem działań i już trochę mniej dokładnie ale nadal dosć szczegółowo etapy 2-5
