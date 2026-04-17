@@ -1,42 +1,551 @@
-createdatabase -> zmiana nazwy
-wyrzucić z createdatabase niepotrzebny kod
-przerzucić selecty do configa z createdatabase
-ujednolicić przekazywanie parametrów w createdatabase
-runner_batch.py -> jedna baza
-co i jak jeszcze trzeba odchudzać z CreateDatabase.py i dlaczego?
-co jest nie tak z logiką bazodanową w config.yaml? dlaczego trzeba to wydzielić, jak i gdzie?
+Tak bym to ułożył.
 
-to co zostało w etapie 1.5 daj do nowego etapu 1.6 i daj tam jeszcze to co po wyżej, całość powinna rozpocząć się testem procesu:
-db_init, i build_client_db, a następnie runner_batch
-czyli mamy już db_init, i build_client_db teraz skończmy ten 1.5 na przystosowaniu build_client_db do jednej bazy
-i to samo na końcu 1.6 + test datasetu ASOF vs FULL
-czyli rozpisz plan działań
+Najpierw: co jest do zrobienia teraz
 
-a następnie daj popraw pozostały plan ale już na bardziej koncepcyjnym poziomie niż powyższe dla zmian:
-to tajmy:
-Etap 4 — schema + Alembic
+Masz rację, że obecne „1.5” warto domknąć i rozdzielić na dwa etapy:
 
-Po uporządkowaniu aplikacji:
+* 1.5 — domknięcie nowej logiki wspólnej bazy i procesu build
+* 1.6 — odchudzenie CreateDatabase.py, porządek parametrów, SQL-i i test zgodności ASOF vs FULL
 
-* jawny schemat trwały,
-* migracje,
-* rozdział staging / durable schema.
+To jest sensowne, bo:
 
-Etap 5 — PostgreSQL lokalnie
+* db_init.py i build_client_db.py już istnieją,
+* logika jednej bazy już działa częściowo,
+* ale CreateDatabase.py nadal jest zbyt ciężki i przejściowy,
+* runner_batch.py jeszcze nie jest konsekwentnie ustawiony pod model „jedna baza trainowa”.
 
-Dopiero wtedy ma sens przejście:
+⸻
 
-* ze sqlite3,
-* na PostgreSQL,
-* z przepisaniem SQL-i i dostępu do bazy.
+Co trzeba jeszcze odchudzać z CreateDatabase.py i dlaczego
 
-przed Etap 3 — konteneryzacja
+1. Zmiana nazwy CreateDatabase.py
 
-Dopiero jak etap 2 trochę uporządkuje strukturę:
+Ta nazwa jest już myląca.
 
-* Dockerfile,
-* uruchomienie batchowe w kontenerze,
-* parametry przez CLI / env,
-* bez zależności od lokalnych ścieżek.
+Ten plik:
 
-czyli rozpisz mi etapy 1.5,1.6 dokładnie z planem działań i już trochę mniej dokładnie ale nadal dosć szczegółowo etapy 2-5
+* nie tworzy już pełnej bazy od zera,
+* tylko:
+    * ładuje dane,
+    * buduje warstwy pochodne,
+    * zasila istniejący schemat,
+    * przebudowuje dataset.
+
+Lepsza nazwa to np.:
+
+* build_dataset_db.py
+* load_client_data.py
+* populate_database.py
+* build_training_db.py
+
+Najbardziej neutralna i trafna:
+build_training_db.py
+
+Bo ten plik robi dziś realnie:
+
+* zasilenie wspólnej bazy danymi klientów,
+* przygotowanie danych pod trening/test.
+
+⸻
+
+2. Wyrzucić z tego pliku niepotrzebny kod
+
+W CreateDatabase.py nadal siedzą rzeczy z poprzedniej epoki projektu.
+
+Do usunięcia albo przeniesienia:
+
+a) CreateOneDbForAll(...)
+
+To jest stary osobny tryb.
+Dziś robicie:
+
+* jedną wspólną bazę,
+* przez db_init.py + build_client_db.py
+
+więc ten stary tryb scalań datasetów z wielu baz jest osobnym, historycznym rozwiązaniem. Jeśli nie jest już używany, powinien wylecieć.
+
+b) migrate_data(...)
+
+Jeśli to służy tylko temu staremu flow, też do usunięcia razem z nim.
+
+c) get_table_schema(...)
+
+Jeżeli jest używane tylko przez stare scalanie baz, też do usunięcia.
+
+d) kod dla trybu „wiele osobnych plików Excel per klient”
+
+Jeżeli docelowy aktywny flow to:
+
+* jeden Excel wieloklientowy
+* jedna wspólna baza
+
+to gałąź:
+
+if create_db_from_one_excel:
+    ...
+else:
+    ...
+
+jest kandydatem do uproszczenia.
+
+Jeśli nadal chcesz zostawić tryb awaryjny, to ok, ale jeśli nie — usuń go. Obecnie komplikuje API i czytelność.
+
+e) helpery nieużywane albo historyczne
+
+Do przeglądu:
+
+* insert_data_from_view
+* get_columns_from_view
+* get_columns
+* część adapterów/converterów, jeśli nie są realnie potrzebne
+* dcmo_columns, offsets jeśli nigdzie nie są używane dalej
+
+To są klasyczne relikty, które zwiększają rozmiar pliku i utrudniają zrozumienie flow.
+
+⸻
+
+3. Przerzucić SELECT-y z CreateDatabase.py do configa
+
+To jest dobry ruch, ale z umiarem.
+
+Co warto przenieść
+
+Te zapytania, które są:
+
+* duże,
+* biznesowe,
+* tabelaryczne,
+* dotyczą logiki danych, a nie sterowania procesem.
+
+Przykłady:
+
+* query_invo
+* query_faktury_tpl
+* selecty do grouped_client_days
+* selecty do extended_grouped_client_days_tab
+* selecty do summary_client_days_tab
+* selecty używane do budowy dataset_tab
+
+Czego nie warto przenosić
+
+Bardzo prostych, technicznych zapytań typu:
+
+* DELETE FROM ... WHERE INVO_CLNTNO = ?
+* SELECT MIN(DZIEN), MAX(DZIEN) ...
+* PRAGMA table_info(...)
+
+To nie jest logika biznesowa, tylko techniczna obsługa procesu. Tego nie warto pchać do configa.
+
+⸻
+
+4. Ujednolicić przekazywanie parametrów do CreateDatabase.py
+
+To dziś jest niespójne.
+
+Masz miks:
+
+* params
+* t0
+* boole typu create_db_from_one_excel
+* różne ścieżki przekazywane przez params
+* część trybów historycznych
+
+Docelowo CreateDatabase powinien przyjmować jedną zwartą konfigurację runtime, np.:
+
+def build_training_db(params, runtime):
+    ...
+
+albo nawet jedną strukturę:
+
+def build_training_db(settings):
+    ...
+
+gdzie settings zawiera:
+
+* database
+* multi_client_excel_path
+* train_client_id
+* od_dnia
+* t0
+* skip_raw_tables
+* build_derived
+
+Czyli zamiast mieszać:
+
+* część parametrów w params,
+* część jako argumenty funkcji,
+* część jako warunki historyczne,
+
+masz jeden spójny obiekt wejściowy.
+
+⸻
+
+Co jest nie tak z logiką bazodanową w config.yaml
+
+Problem nie polega na tym, że w configu są SQL-e. Problem polega na tym, jakiego typu SQL-e tam siedzą.
+
+Obecny problem
+
+config.yaml nie jest tylko konfiguracją środowiska, tylko:
+
+* trzyma definicje tabel,
+* definicje widoków,
+* definicje indeksów,
+* logikę budowy datasetu,
+* logikę shardowania,
+* logikę agregacji biznesowej.
+
+Czyli jest jednocześnie:
+
+* configiem,
+* storage warstwą definicji SQL,
+* pół-kodem aplikacji.
+
+To jest problem, bo:
+
+1. Trudno to wersjonować logicznie
+
+Zmiana biznesowej logiki danych siedzi w YAML-u, a nie w normalnym module .sql albo .py.
+
+2. Trudno to testować
+
+Nie odpalasz łatwo testu pojedynczego zapytania, nie masz sensownego podziału, nie masz nazwanych modułów odpowiedzialności.
+
+3. Trudno migrować na PostgreSQL
+
+Bo te SQL-e nie są wydzielone jako osobna warstwa DB/staging, tylko są porozrzucane w configu.
+
+4. Config robi się zbyt ciężki
+
+Config powinien głównie mówić:
+
+* gdzie są pliki,
+* jakie są parametry,
+* jakie są limity,
+* jakie tryby są aktywne.
+
+Nie powinien być głównym miejscem życia logiki danych.
+
+⸻
+
+Co z tym zrobić
+
+Najlepszy etap przejściowy:
+
+Teraz
+
+Zostawić jeszcze SQL-e poza kodem, ale wydzielić je z config.yaml do osobnych plików, np.:
+
+* sql/sqlite/schema/*.sql
+* sql/sqlite/views/*.sql
+* sql/sqlite/selects/*.sql
+* sql/sqlite/indexes/*.sql
+
+a w configu trzymać tylko referencje lub ścieżki.
+
+Potem
+
+W etapie PostgreSQL:
+
+* mieć osobne definicje dla sqlite i postgres,
+* albo docelowo przestawić trwały schemat na Alembic,
+* a staging/query layer utrzymać jako pliki SQL lub query buildery.
+
+⸻
+
+Etap 1.5 — dokładny plan działań
+
+Cel
+
+Domknąć działający proces wspólnej bazy dla wielu klientów:
+
+db_init -> build_client_db -> runner_batch
+
+i ustabilizować flow jednej wspólnej bazy.
+
+Zakres
+
+1. db_init.py
+
+* potwierdzić, że tworzy pełny wymagany schemat,
+* potwierdzić, że seeduje swieta,
+* potwierdzić, że zakłada wszystkie indeksy potrzebne do build_client_db.
+
+2. build_client_db.py
+
+* domknąć logikę jednej wspólnej bazy,
+* usunąć mylące nazewnictwo „per-client dbs”,
+* upewnić się, że:
+    * przyjmuje jedną wspólną bazę przez --db-path,
+    * listę klientów przez --build-clients,
+    * przekazuje to poprawnie do loadera.
+
+3. CreateDatabase.py
+
+* domknąć logikę ładowania do jednej bazy,
+* upewnić się, że wszystkie DELETE są robione per client,
+* upewnić się, że wszystkie etapy pochodne są robione per client,
+* upewnić się, że dataset_tab i dataset są odbudowywane poprawnie per client.
+
+4. Test procesu
+
+Uruchomić pełny test:
+
+1. db_init
+2. build_client_db
+3. runner_batch
+
+5. Kryterium końca 1.5
+
+* jedna wspólna baza jest tworzona i uzupełniana poprawnie,
+* wielu klientów może być załadowanych do jednej bazy,
+* train działa na jednej wspólnej bazie,
+* test działa w obecnym trybie pomostowym,
+* nie ma już błędów wynikających z reliktów po per-client DB w build flow.
+
+⸻
+
+Etap 1.6 — dokładny plan działań
+
+Cel
+
+Odchudzić i uporządkować warstwę build/ETL po stabilizacji jednej bazy.
+
+Zakres
+
+1. Zmiana nazwy CreateDatabase.py
+
+Zmienić na coś zgodnego z obecną rolą, np.:
+
+* build_training_db.py
+
+i odpowiednio poprawić importy w:
+
+* build_client_db.py
+* ewentualnie innych plikach.
+
+2. Usunąć martwy / historyczny kod
+
+Usunąć lub wydzielić:
+
+* CreateOneDbForAll
+* migrate_data
+* get_table_schema
+* nieużywane helpery
+* nieaktywny branch trybów, jeśli nie są już potrzebne
+
+3. Ujednolicić wejście do buildera
+
+Zamiast mieszaniny parametrów:
+
+* uprościć interfejs funkcji buildującej,
+* jasno rozdzielić:
+    * parametry runtime,
+    * parametry danych,
+    * parametry procesu.
+
+4. Wyciągnąć duże SELECT-y z kodu
+
+Przenieść z pliku buildującego:
+
+* duże selecty biznesowe
+* templaty SQL budujące warstwy pochodne
+
+do wydzielonej warstwy SQL.
+
+Na tym etapie jeszcze nie trzeba robić pełnego systemu SQL loaderów, ale już warto:
+
+* wynieść duże query do configa albo lepiej do osobnych plików .sql.
+
+5. Oczyścić runner_batch.py pod jedną bazę
+
+Dziś runner ma jeszcze logikę pomostową.
+
+W 1.6 trzeba:
+
+* jasno zdecydować, że train używa jednej wspólnej bazy,
+* doprowadzić runner do spójnego modelu parametrów,
+* ograniczyć historyczne ścieżki i warianty.
+
+6. Test zgodności dataset ASOF vs FULL
+
+Po zmianach trzeba wykonać kontrolę:
+
+* porównać dataset ze starej poprawnej bazy
+* z dataset nowej bazy po refaktorze
+* uwzględniając INVO_CLNTNO w kluczu porównania
+
+To jest idealny test końca 1.6, bo sprawdza efekt całego ETL.
+
+Kryterium końca 1.6
+
+* plik buildujący bazę jest krótszy, czytelniejszy i ma jedną odpowiedzialność,
+* stare tryby nie zaśmiecają aktywnego flow,
+* duże SQL-e są wyciągnięte z kodu,
+* runner_batch.py jest spójniejszy z modelem jednej wspólnej bazy,
+* test dataset ASOF vs FULL przechodzi albo daje wyjaśnione różnice.
+
+⸻
+
+Etap 2 — struktura kodu
+
+Cel
+
+Ustawić projekt w sensowną strukturę modułów, żeby dało się go dalej rozwijać i migrować.
+
+Główne działania
+
+* rozdzielić:
+    * entrypointy,
+    * build/ETL,
+    * model execution,
+    * storage/db helpers,
+    * query layer,
+    * config/runtime settings
+* wydzielić np.:
+    * app/build/
+    * app/model/
+    * app/db/
+    * app/sql/
+    * app/config/
+    * legacy/
+* przenieść stare pliki do legacy, jeśli nie są już aktywne
+* ustalić jeden aktywny flow uruchamiania
+
+Efekt
+
+Projekt przestaje być zbiorem ciężkich skryptów, a zaczyna być podzieloną aplikacją batchową.
+
+⸻
+
+Etap 3 — schema + Alembic
+
+Tak, ten etap warto dać przed konteneryzacją, bo wtedy konteneryzujesz już coś architektonicznie czystszego.
+
+Cel
+
+Wprowadzić jawny, wersjonowany schemat trwałej bazy.
+
+Główne działania
+
+* zidentyfikować tabele trwałe vs stagingowe
+* zdecydować, które obiekty:
+    * są tylko techniczne,
+    * są runtime build artifacts,
+    * są trwałym modelem danych
+* przygotować definicje trwałego schematu
+* wprowadzić:
+    * SQLAlchemy dla warstwy schematu
+    * Alembic dla migracji
+* ustalić rozdział:
+    * staging / transient
+    * durable schema
+
+Efekt
+
+Masz już:
+
+* wersjonowany schemat,
+* kontrolowane zmiany,
+* fundament pod PostgreSQL.
+
+⸻
+
+Etap 4 — PostgreSQL lokalnie
+
+Cel
+
+Przenieść aktywny MVP flow ze SQLite na PostgreSQL lokalnie.
+
+Główne działania
+
+* zastąpić sqlite3 warstwą zgodną z PostgreSQL
+* usunąć zależności od:
+    * PRAGMA
+    * SQLite-specific SQL
+    * SQLite-specific typów i adapterów
+* przepisać problematyczne query
+* potwierdzić, że:
+    * build działa,
+    * first_model działa,
+    * wyniki są zgodne funkcjonalnie
+
+Efekt
+
+Aplikacja nadal działa lokalnie, ale już na bazie zgodnej z docelowym kierunkiem.
+
+⸻
+
+Etap 5 — konteneryzacja
+
+Dopiero teraz ma to większy sens.
+
+Cel
+
+Spakować już uporządkowaną aplikację do kontenera.
+
+Główne działania
+
+* przygotować Dockerfile
+* usunąć zależności od lokalnych ścieżek
+* wystawić parametry przez:
+    * CLI
+    * env vars
+* upewnić się, że:
+    * db_init
+    * build_client_db
+    * runner_batch
+        mogą działać jako kontenerowe joby
+* przygotować minimalny obraz uruchomieniowy
+
+Efekt
+
+Masz batchową aplikację możliwą do lokalnego uruchamiania w Dockerze i gotową pod późniejszy deployment.
+
+⸻
+
+Podsumowanie kolejności
+
+Ja bym to widział tak:
+
+1.5
+
+Domknąć flow wspólnej bazy:
+
+* db_init
+* build_client_db
+* runner_batch
+
+1.6
+
+Odchudzić build layer:
+
+* rename CreateDatabase.py
+* wyrzucić stare tryby
+* przenieść duże SQL-e
+* ujednolicić parametry
+* test dataset ASOF vs FULL
+
+2
+
+Refaktor struktury projektu:
+
+* moduły
+* odpowiedzialności
+* active vs legacy
+
+3
+
+Schema + Alembic
+
+4
+
+PostgreSQL lokalnie
+
+5
+
+Konteneryzacja
+
+⸻
+
+Jeśli chcesz, mogę od razu rozpisać Ci to jeszcze w drugiej formie: jako checklistę z zadaniami “plik po pliku” dla etapów 1.5 i 1.6.
