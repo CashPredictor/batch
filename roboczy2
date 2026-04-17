@@ -1,233 +1,173 @@
+Tak — najprościej zrobić to tak:
+
+1. zostawić obecny sposób ładowania z baz, bo działa,
+2. porównywać tylko dataset,
+3. przed porównaniem usunąć z analizy techniczną kolumnę __CLIENT_ID,
+4. dodatkowo ograniczyć nową bazę do tego samego klienta,
+5. porównywać tylko wspólne kolumny,
+6. klucz porównania zrobić jako:
+    * INVO_NO
+    * DZIEN
+    * __CLIENT_ID
+
+Dzięki temu:
+
+* nie dostaniesz fałszywych różnic tylko dlatego, że w jednej bazie klient jest “w nazwie pliku”, a w drugiej “w kolumnie”,
+* zachowasz dokładnie logikę porównywania feature’ów z Twojego działającego kodu,
+* skupisz się na dataset, czyli finalnym wyniku całego pipeline.
+
+Najważniejsza zmiana względem Twojego kodu jest taka, że:
+
+* __CLIENT_ID ma wejść do klucza merge,
+* ale nie ma wejść do feature_cols.
+
+Poniżej gotowy kod.
+
 import sqlite3
 import pandas as pd
 import numpy as np
 from pathlib import Path
-
 # =========================
 # PARAMETRY
 # =========================
 CLIENT_LIST = [10069]
-
-BASE_DIR_ASOF = Path(r"C:\Users\OE00SG\CashPredictor\dev3\databases\2026-01-22\2025-09-15")
-BASE_DIR_FULL = Path(r"C:\Users\OE00SG\CashPredictor\dev3\databases\2026-01-22\2026-01-22")
-
+BASE_DIR_OLD = Path(r"C:\Users\OE00SG\CashPredictor\dev3\databases\2026-03-02\2026-03-02")
+BASE_DIR_NEW = Path(r"C:\Users\OE00SG\CashPredictor\dev3\databases\2026-03-02\2026-03-02")
+OLD_DB_NAME_TEMPLATE = "CashPredictorT_{client_id}.db"   # stara baza per klient
+NEW_DB_NAME = "CashPredictor2.db"                        # nowa wspólna baza
 TABLE_NAME = "dataset"
-DZIEN_FILTER = "2025-09-15"   # dzień, który porównujemy
-
+DZIEN_FILTER = None   # np. "2025-09-15" albo None dla całego datasetu
 KEY_INVO_COL = "INVO_NO"
-KEY_DAY_COL  = "DZIEN"
-
-OUT_REPORT_XLSX = Path("feature_diff_report_FROM_SQLITE1.xlsx")
-def load_dataset_from_dbs(base_dir: Path, clients, dzien: str) -> pd.DataFrame:
-    frames = []
-
-    for cid in clients:
-        db_path = base_dir / f"CashPredictorT_{cid}.db"
-        if not db_path.exists():
-            print(f"[WARN] Brak bazy: {db_path}")
-            continue
-
-        conn = sqlite3.connect(db_path)
-        try:
-            query = f"""
-                SELECT *
-                FROM {TABLE_NAME}
-                WHERE DATE(DZIEN) = DATE(?)
-            """
-            print(cid,"cid")
-            df = pd.read_sql_query(query, conn, params=[dzien])
-            df["__CLIENT_ID"] = cid
-            frames.append(df)
-        finally:
-            conn.close()
-
-    if not frames:
-        raise RuntimeError("Nie wczytano żadnych danych z baz.")
-
-    return pd.concat(frames, ignore_index=True)
-
-df_asof = load_dataset_from_dbs(BASE_DIR_ASOF, CLIENT_LIST, DZIEN_FILTER)
-df_full = load_dataset_from_dbs(BASE_DIR_FULL, CLIENT_LIST, DZIEN_FILTER)
-
-print("ASOF shape:", df_asof.shape)
-print("FULL shape:", df_full.shape)
-# Ujednolicenie nazw
-df_asof.columns = [c.strip() for c in df_asof.columns]
-df_full.columns = [c.strip() for c in df_full.columns]
-
-# Wspólne kolumny
-common_cols = [c for c in df_asof.columns if c in df_full.columns]
-df_asof = df_asof[common_cols].copy()
-df_full = df_full[common_cols].copy()
-
-# Klucze
-df_asof[KEY_INVO_COL] = pd.to_numeric(df_asof[KEY_INVO_COL], errors="coerce").astype("Int64")
-df_full[KEY_INVO_COL] = pd.to_numeric(df_full[KEY_INVO_COL], errors="coerce").astype("Int64")
-
-df_asof[KEY_DAY_COL] = pd.to_datetime(df_asof[KEY_DAY_COL], errors="coerce").dt.date
-df_full[KEY_DAY_COL] = pd.to_datetime(df_full[KEY_DAY_COL], errors="coerce").dt.date
-
-key_cols = [KEY_INVO_COL, KEY_DAY_COL]
-
-
-# 5️⃣ MERGE (ŹRÓDŁO PRAWDY O DATA-LEAK)
-
-df_merged = df_full.merge(
-    df_asof,
-    on=key_cols,
-    how="outer",
-    suffixes=("__FULL", "__ASOF"),
-    indicator=True
-)
-
-both = df_merged[df_merged["_merge"] == "both"].copy()
-
-
-# 6️⃣ ANALIZA RÓŻNIC KOLUMN (IDENTYCZNA JAK U CIEBIE)
-
-feature_cols = [c for c in common_cols if c not in key_cols and not c.startswith("__")]
-
-for c in feature_cols:
-    both[f"{c}__FULL"] = pd.to_numeric(both[f"{c}__FULL"], errors="coerce")
-    both[f"{c}__ASOF"] = pd.to_numeric(both[f"{c}__ASOF"], errors="coerce")
-
-results = []
-n = len(both)
-
-for c in feature_cols:
-    a = both[f"{c}__FULL"]
-    b = both[f"{c}__ASOF"]
-
-    both_na = a.isna() & b.isna()
-    absdiff = (a - b).abs()
-    is_diff = (~both_na) & (absdiff.fillna(np.inf) > 0)
-
-    results.append({
-        "column": c,
-        "n_rows": n,
-        "n_diff": int(is_diff.sum()),
-        "pct_diff": float(is_diff.mean()) if n else 0.0,
-        "max_abs_diff": float(absdiff[~both_na].max()) if (~both_na).any() else 0.0,
-        "mean_abs_diff": float(absdiff[~both_na].mean()) if (~both_na).any() else 0.0,
-        "median_abs_diff": float(absdiff[~both_na].median()) if (~both_na).any() else 0.0,
-        "n_na_full": int(a.isna().sum()),
-        "n_na_asof": int(b.isna().sum()),
-    })
-
-df_col_diff = pd.DataFrame(results).sort_values(
-    by=["pct_diff", "max_abs_diff", "mean_abs_diff"],
-    ascending=[False, False, False]
-)
-
-
-# 7️⃣ ANALIZA RÓŻNIC WIERSZY
-
-A = both[[f"{c}__FULL" for c in feature_cols]].to_numpy()
-B = both[[f"{c}__ASOF" for c in feature_cols]].to_numpy()
-
-eq = (A == B) | (np.isnan(A) & np.isnan(B))
-n_diffs_per_row = (~eq).sum(axis=1)
-
-df_row_diff = both[key_cols].copy()
-df_row_diff["n_feature_diffs"] = n_diffs_per_row
-df_row_diff = df_row_diff.sort_values("n_feature_diffs", ascending=False)
-
-
-# 8️⃣ EKSPORT DO EXCELA
-
-TOP_N = 30
-top_cols = df_col_diff.head(TOP_N)["column"].tolist()
-
-detail_cols = key_cols[:]
-for c in top_cols:
-    detail_cols += [f"{c}__FULL", f"{c}__ASOF"]
-
-df_detail = both[detail_cols].copy()
-
-with pd.ExcelWriter(OUT_REPORT_XLSX, engine="openpyxl") as writer:
-    df_col_diff.to_excel(writer, sheet_name="column_diff_rank", index=False)
-    df_row_diff.to_excel(writer, sheet_name="row_diff_rank", index=False)
-    df_detail.to_excel(writer, sheet_name="top_feature_detail", index=False)
-    df_merged.to_excel(writer, sheet_name="merged_raw", index=False)
-
-print("✅ Zapisano raport:", OUT_REPORT_XLSX.resolve())
-import pandas as pd
-import numpy as np
-from pathlib import Path
-
-# =========================
-# PARAMETRY
-# =========================
-XLSX_ASOF = Path("TRAIN_MERGE_READY_ASOF.xlsx")   # <- podmień nazwę
-XLSX_FULL = Path("TRAIN_MERGE_READY_FULL.xlsx")   # <- podmień nazwę
-
-KEY_INVO_COL = "INVO_NO"
-KEY_DAY_COL  = "DZIEN"
-
-OUT_REPORT_XLSX = Path("feature_diff_report_FROM_EXCEL.xlsx")
-
+KEY_DAY_COL = "DZIEN"
+KEY_CLIENT_COL = "__CLIENT_ID"
+OUT_REPORT_XLSX = Path("dataset_compare_report.xlsx")
 # =========================
 # LOAD
 # =========================
-df_asof = pd.read_excel(XLSX_ASOF)
-df_full = pd.read_excel(XLSX_FULL)
-
-print("ASOF shape:", df_asof.shape)
-print("FULL shape:", df_full.shape)
-
-# Ujednolicenie nazw kolumn
-df_asof.columns = [c.strip() for c in df_asof.columns]
-df_full.columns = [c.strip() for c in df_full.columns]
-
-# Wspólne kolumny
-common_cols = [c for c in df_asof.columns if c in df_full.columns]
-df_asof = df_asof[common_cols].copy()
-df_full = df_full[common_cols].copy()
-
-# Klucze (typy)
-df_asof[KEY_INVO_COL] = pd.to_numeric(df_asof[KEY_INVO_COL], errors="coerce").astype("Int64")
-df_full[KEY_INVO_COL] = pd.to_numeric(df_full[KEY_INVO_COL], errors="coerce").astype("Int64")
-
-# DZIEN może być datą lub datetime – normalizujemy do date
-df_asof[KEY_DAY_COL] = pd.to_datetime(df_asof[KEY_DAY_COL], errors="coerce").dt.date
-df_full[KEY_DAY_COL] = pd.to_datetime(df_full[KEY_DAY_COL], errors="coerce").dt.date
-
-key_cols = [KEY_INVO_COL, KEY_DAY_COL]
-
+def load_old_dataset_from_client_dbs(base_dir: Path, clients, dzien: str | None) -> pd.DataFrame:
+    frames = []
+    for cid in clients:
+        db_path = base_dir / OLD_DB_NAME_TEMPLATE.format(client_id=cid)
+        if not db_path.exists():
+            print(f"[WARN] Brak starej bazy: {db_path}")
+            continue
+        conn = sqlite3.connect(db_path)
+        try:
+            if dzien:
+                query = f"""
+                    SELECT *
+                    FROM {TABLE_NAME}
+                    WHERE DATE(DZIEN) = DATE(?)
+                """
+                df = pd.read_sql_query(query, conn, params=[dzien])
+            else:
+                query = f"SELECT * FROM {TABLE_NAME}"
+                df = pd.read_sql_query(query, conn)
+            df[KEY_CLIENT_COL] = cid
+            frames.append(df)
+        finally:
+            conn.close()
+    if not frames:
+        raise RuntimeError("Nie wczytano żadnych danych ze starych baz.")
+    return pd.concat(frames, ignore_index=True)
+def load_new_dataset_from_shared_db(base_dir: Path, db_name: str, clients, dzien: str | None) -> pd.DataFrame:
+    db_path = base_dir / db_name
+    if not db_path.exists():
+        raise FileNotFoundError(f"Brak nowej bazy: {db_path}")
+    conn = sqlite3.connect(db_path)
+    try:
+        client_placeholders = ",".join(["?"] * len(clients))
+        if dzien:
+            query = f"""
+                SELECT *
+                FROM {TABLE_NAME}
+                WHERE INVO_CLNTNO IN ({client_placeholders})
+                  AND DATE(DZIEN) = DATE(?)
+            """
+            params = list(clients) + [dzien]
+        else:
+            query = f"""
+                SELECT *
+                FROM {TABLE_NAME}
+                WHERE INVO_CLNTNO IN ({client_placeholders})
+            """
+            params = list(clients)
+        df = pd.read_sql_query(query, conn, params=params)
+    finally:
+        conn.close()
+    # Ujednolicamy klienta do tej samej kolumny technicznej,
+    # żeby merge działał identycznie dla starej i nowej bazy
+    df[KEY_CLIENT_COL] = pd.to_numeric(df["INVO_CLNTNO"], errors="coerce").astype("Int64")
+    return df
+# =========================
+# NORMALIZACJA
+# =========================
+def normalize_frames(df_old: pd.DataFrame, df_new: pd.DataFrame):
+    df_old.columns = [c.strip() for c in df_old.columns]
+    df_new.columns = [c.strip() for c in df_new.columns]
+    # wspólne kolumny
+    common_cols = [c for c in df_old.columns if c in df_new.columns]
+    df_old = df_old[common_cols].copy()
+    df_new = df_new[common_cols].copy()
+    # klucze
+    df_old[KEY_INVO_COL] = pd.to_numeric(df_old[KEY_INVO_COL], errors="coerce").astype("Int64")
+    df_new[KEY_INVO_COL] = pd.to_numeric(df_new[KEY_INVO_COL], errors="coerce").astype("Int64")
+    df_old[KEY_DAY_COL] = pd.to_datetime(df_old[KEY_DAY_COL], errors="coerce").dt.date
+    df_new[KEY_DAY_COL] = pd.to_datetime(df_new[KEY_DAY_COL], errors="coerce").dt.date
+    df_old[KEY_CLIENT_COL] = pd.to_numeric(df_old[KEY_CLIENT_COL], errors="coerce").astype("Int64")
+    df_new[KEY_CLIENT_COL] = pd.to_numeric(df_new[KEY_CLIENT_COL], errors="coerce").astype("Int64")
+    return df_old, df_new, common_cols
+# =========================
+# MAIN
+# =========================
+df_old = load_old_dataset_from_client_dbs(BASE_DIR_OLD, CLIENT_LIST, DZIEN_FILTER)
+df_new = load_new_dataset_from_shared_db(BASE_DIR_NEW, NEW_DB_NAME, CLIENT_LIST, DZIEN_FILTER)
+print("OLD shape:", df_old.shape)
+print("NEW shape:", df_new.shape)
+df_old, df_new, common_cols = normalize_frames(df_old, df_new)
+key_cols = [KEY_CLIENT_COL, KEY_INVO_COL, KEY_DAY_COL]
 # =========================
 # MERGE
 # =========================
-df_merged = df_full.merge(
-    df_asof,
+df_merged = df_new.merge(
+    df_old,
     on=key_cols,
     how="outer",
-    suffixes=("__FULL", "__ASOF"),
+    suffixes=("__NEW", "__OLD"),
     indicator=True
 )
-
 both = df_merged[df_merged["_merge"] == "both"].copy()
-
+print("Rows only in NEW:", (df_merged["_merge"] == "left_only").sum())
+print("Rows only in OLD:", (df_merged["_merge"] == "right_only").sum())
+print("Rows in BOTH:", len(both))
+# =========================
+# FEATURE COLS
+# =========================
+# NIE porównujemy kluczy ani kolumny klienta technicznej
+feature_cols = [
+    c for c in common_cols
+    if c not in key_cols and not c.startswith("__")
+]
+# jeśli chcesz wykluczyć jakieś kolumny techniczne, dodaj tutaj:
+exclude_feature_cols = {
+    # "INSERT_TIMESTAMP",
+}
+feature_cols = [c for c in feature_cols if c not in exclude_feature_cols]
+# konwersja do numerycznych tam, gdzie się da
+for c in feature_cols:
+    both[f"{c}__NEW"] = pd.to_numeric(both[f"{c}__NEW"], errors="coerce")
+    both[f"{c}__OLD"] = pd.to_numeric(both[f"{c}__OLD"], errors="coerce")
 # =========================
 # ANALIZA RÓŻNIC KOLUMN
 # =========================
-feature_cols = [c for c in common_cols if c not in key_cols and not c.startswith("__")]
-
-# Upewniamy się, że porównujemy numerycznie (jak w Twojej wersji)
-for c in feature_cols:
-    both[f"{c}__FULL"] = pd.to_numeric(both[f"{c}__FULL"], errors="coerce")
-    both[f"{c}__ASOF"] = pd.to_numeric(both[f"{c}__ASOF"], errors="coerce")
-
 results = []
 n = len(both)
-
 for c in feature_cols:
-    a = both[f"{c}__FULL"]
-    b = both[f"{c}__ASOF"]
-
+    a = both[f"{c}__NEW"]
+    b = both[f"{c}__OLD"]
     both_na = a.isna() & b.isna()
     absdiff = (a - b).abs()
     is_diff = (~both_na) & (absdiff.fillna(np.inf) > 0)
-
     results.append({
         "column": c,
         "n_rows": n,
@@ -236,40 +176,37 @@ for c in feature_cols:
         "max_abs_diff": float(absdiff[~both_na].max()) if (~both_na).any() else 0.0,
         "mean_abs_diff": float(absdiff[~both_na].mean()) if (~both_na).any() else 0.0,
         "median_abs_diff": float(absdiff[~both_na].median()) if (~both_na).any() else 0.0,
-        "n_na_full": int(a.isna().sum()),
-        "n_na_asof": int(b.isna().sum()),
+        "n_na_new": int(a.isna().sum()),
+        "n_na_old": int(b.isna().sum()),
     })
-
 df_col_diff = pd.DataFrame(results).sort_values(
     by=["pct_diff", "max_abs_diff", "mean_abs_diff"],
     ascending=[False, False, False]
 )
-
 # =========================
 # ANALIZA RÓŻNIC WIERSZY
 # =========================
-A = both[[f"{c}__FULL" for c in feature_cols]].to_numpy()
-B = both[[f"{c}__ASOF" for c in feature_cols]].to_numpy()
-
+A = both[[f"{c}__NEW" for c in feature_cols]].to_numpy(dtype=float)
+B = both[[f"{c}__OLD" for c in feature_cols]].to_numpy(dtype=float)
 eq = (A == B) | (np.isnan(A) & np.isnan(B))
 n_diffs_per_row = (~eq).sum(axis=1)
-
 df_row_diff = both[key_cols].copy()
 df_row_diff["n_feature_diffs"] = n_diffs_per_row
 df_row_diff = df_row_diff.sort_values("n_feature_diffs", ascending=False)
-
 # =========================
 # DETAIL TOP N
 # =========================
 TOP_N = 30
 top_cols = df_col_diff.head(TOP_N)["column"].tolist()
-
 detail_cols = key_cols[:]
 for c in top_cols:
-    detail_cols += [f"{c}__FULL", f"{c}__ASOF"]
-
+    detail_cols += [f"{c}__NEW", f"{c}__OLD"]
 df_detail = both[detail_cols].copy()
-
+# =========================
+# PODSUMOWANIE RÓŻNIC W KLUCZACH
+# =========================
+df_only_new = df_merged[df_merged["_merge"] == "left_only"][key_cols].copy()
+df_only_old = df_merged[df_merged["_merge"] == "right_only"][key_cols].copy()
 # =========================
 # EXPORT
 # =========================
@@ -277,7 +214,21 @@ with pd.ExcelWriter(OUT_REPORT_XLSX, engine="openpyxl") as writer:
     df_col_diff.to_excel(writer, sheet_name="column_diff_rank", index=False)
     df_row_diff.to_excel(writer, sheet_name="row_diff_rank", index=False)
     df_detail.to_excel(writer, sheet_name="top_feature_detail", index=False)
+    df_only_new.to_excel(writer, sheet_name="rows_only_in_new", index=False)
+    df_only_old.to_excel(writer, sheet_name="rows_only_in_old", index=False)
     df_merged.to_excel(writer, sheet_name="merged_raw", index=False)
-
 print("✅ Zapisano raport:", OUT_REPORT_XLSX.resolve())
 
+Najważniejsze różnice względem poprzedniej wersji:
+
+* __CLIENT_ID jest częścią key_cols,
+* feature_cols wykluczają __CLIENT_ID,
+* stara baza dostaje __CLIENT_ID = cid,
+* nowa baza bierze INVO_CLNTNO i kopiuje do __CLIENT_ID,
+* porównanie dotyczy tylko dataset.
+
+Jeżeli chcesz, mogę Ci od razu dać jeszcze wersję rozszerzoną, która:
+
+* porównuje także kolumny tekstowe, a nie tylko numeryczne,
+* robi tolerancję dla floatów, np. 1e-6,
+* i pokazuje tylko realne różnice biznesowe zamiast wszystkich minimalnych odchyleń.
