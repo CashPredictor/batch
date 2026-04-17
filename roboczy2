@@ -1,306 +1,283 @@
-Podejście powinno być dwustopniowe.
-
-Najpierw warto sprawdzić zgodność na poziomie ogólnym:
-
-* jakie tabele istnieją w obu bazach,
-* ile wierszy ma każda tabela,
-* jakie są kolumny,
-* które kolumny różnią się tylko tym, że w nowej bazie doszedł identyfikator klienta.
-
-Dopiero potem porównywać dane właściwe. Przy takim porównaniu zależy Ci nie na tym, czy schemat jest bit w bit identyczny, tylko czy dla klienta 13581 nowa logika wygenerowała te same dane biznesowe co stara baza. To oznacza, że:
-
-* w nowej bazie trzeba filtrować po kliencie 13581,
-* kolumnę klienta trzeba pominąć w porównaniu, jeśli w starej bazie jej nie było,
-* porównanie powinno być robione tabela po tabeli,
-* najlepiej porównywać zarówno liczbę rekordów, jak i dokładny zestaw rekordów,
-* dla czytelności dobrze mieć raport: OK / różnice / brak tabeli / różne kolumny.
-
-Żeby było w miarę wydajne i czytelne, najlepszy kompromis to:
-
-* dla każdej tabeli pobrać wspólne kolumny,
-* odfiltrować klienta w nowej bazie, jeśli tabela ma kolumnę klienta,
-* pominąć kolumny techniczne, które mogą się różnić naturalnie, jeśli zechcesz,
-* znormalizować wartości do tekstu,
-* policzyć hash każdego wiersza,
-* porównać multizbiory hashy zamiast od razu robić pełne diffy w pandas.
-
-To daje:
-
-* szybki test zgodności,
-* informację ile rekordów jest tylko w starej / tylko w nowej,
-* możliwość wyświetlenia przykładowych różnic.
-
-Poniżej masz gotowy skrypt w Pythonie do uruchomienia lokalnie.
-
 import sqlite3
 import pandas as pd
-import hashlib
+import numpy as np
 from pathlib import Path
-from collections import Counter
-# ============================================================
-# KONFIGURACJA
-# ============================================================
-BASE_DIR = Path(r"C:\Users\OE00SG\CashPredictor\dev3\databases\2026-03-02\2026-03-02")
-OLD_DB = BASE_DIR / "CashPredictorT_13581 — kopia.db"
-NEW_DB = BASE_DIR / "CashPredictor2.db"
-CLIENT_ID = 13581
-# Kolumny, które można pominąć globalnie, jeśli nie chcesz ich porównywać.
-# Na start zostawiam puste. Możesz później dopisać np. INSERT_TIMESTAMP.
-IGNORE_COLUMNS = {
-    # "INSERT_TIMESTAMP",
-    # "rowid",
-}
-# Mapowanie potencjalnych kolumn klienta
-CLIENT_COLUMNS = [
-    "INVO_CLNTNO",
-    "DEBC_CLNTNO",
-    "CLHS_CLNTNO",
-]
-# Ile przykładowych różnic pokazać
-SAMPLE_DIFF_ROWS = 5
-# ============================================================
-# POMOCNICZE
-# ============================================================
-def connect(db_path: Path) -> sqlite3.Connection:
-    return sqlite3.connect(str(db_path))
-def get_tables(conn: sqlite3.Connection) -> list[str]:
-    sql = """
-        SELECT name
-        FROM sqlite_master
-        WHERE type = 'table'
-          AND name NOT LIKE 'sqlite_%'
-        ORDER BY name
-    """
-    return [r[0] for r in conn.execute(sql).fetchall()]
-def get_columns(conn: sqlite3.Connection, table: str) -> list[str]:
-    sql = f"PRAGMA table_info([{table}])"
-    return [r[1] for r in conn.execute(sql).fetchall()]
-def find_client_column(columns: list[str]) -> str | None:
-    for col in CLIENT_COLUMNS:
-        if col in columns:
-            return col
-    return None
-def normalize_value(v):
-    if pd.isna(v):
-        return "<NULL>"
-    if isinstance(v, bytes):
-        return v.hex()
-    if isinstance(v, float):
-        # normalizacja floatów, żeby ograniczyć fałszywe różnice formatu
-        return f"{v:.10f}".rstrip("0").rstrip(".") if "." in f"{v:.10f}" else f"{v:.10f}"
-    return str(v)
-def row_hash(values: tuple) -> str:
-    payload = "||".join(normalize_value(v) for v in values)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-def load_table(
-    conn: sqlite3.Connection,
-    table: str,
-    select_columns: list[str],
-    client_id: int | None = None,
-    client_column: str | None = None,
-) -> pd.DataFrame:
-    cols_sql = ", ".join(f"[{c}]" for c in select_columns)
-    if client_id is not None and client_column is not None:
-        sql = f"SELECT {cols_sql} FROM [{table}] WHERE [{client_column}] = ?"
-        return pd.read_sql_query(sql, conn, params=(client_id,))
-    else:
-        sql = f"SELECT {cols_sql} FROM [{table}]"
-        return pd.read_sql_query(sql, conn)
-def compare_table(
-    old_conn: sqlite3.Connection,
-    new_conn: sqlite3.Connection,
-    table: str,
-    client_id: int,
-) -> dict:
-    old_cols = get_columns(old_conn, table)
-    new_cols = get_columns(new_conn, table)
-    new_client_col = find_client_column(new_cols)
-    old_client_col = find_client_column(old_cols)
-    # Pomijamy kolumny ignorowane i kolumnę klienta w nowej bazie,
-    # jeśli jej nie ma w starej.
-    old_cols_cmp = [c for c in old_cols if c not in IGNORE_COLUMNS]
-    new_cols_cmp = [c for c in new_cols if c not in IGNORE_COLUMNS]
-    if old_client_col is None and new_client_col is not None:
-        new_cols_cmp = [c for c in new_cols_cmp if c != new_client_col]
-    # Wspólne kolumny do porównania
-    common_cols = [c for c in old_cols_cmp if c in new_cols_cmp]
-    result = {
-        "table": table,
-        "status": None,
-        "old_rows": None,
-        "new_rows": None,
-        "common_cols_count": len(common_cols),
-        "only_in_old_cols": sorted(set(old_cols_cmp) - set(common_cols)),
-        "only_in_new_cols": sorted(set(new_cols_cmp) - set(common_cols)),
-        "only_in_old_rows": 0,
-        "only_in_new_rows": 0,
-        "samples_only_in_old": [],
-        "samples_only_in_new": [],
-    }
-    if not common_cols:
-        result["status"] = "NO_COMMON_COLUMNS"
-        return result
-    old_df = load_table(
-        old_conn,
-        table,
-        select_columns=common_cols,
-        client_id=client_id if old_client_col else None,
-        client_column=old_client_col,
-    )
-    new_df = load_table(
-        new_conn,
-        table,
-        select_columns=common_cols,
-        client_id=client_id if new_client_col else None,
-        client_column=new_client_col,
-    )
-    result["old_rows"] = len(old_df)
-    result["new_rows"] = len(new_df)
-    old_hashes = old_df.apply(lambda row: row_hash(tuple(row.values.tolist())), axis=1).tolist()
-    new_hashes = new_df.apply(lambda row: row_hash(tuple(row.values.tolist())), axis=1).tolist()
-    old_counter = Counter(old_hashes)
-    new_counter = Counter(new_hashes)
-    only_in_old = old_counter - new_counter
-    only_in_new = new_counter - old_counter
-    result["only_in_old_rows"] = sum(only_in_old.values())
-    result["only_in_new_rows"] = sum(only_in_new.values())
-    if result["only_in_old_rows"] == 0 and result["only_in_new_rows"] == 0:
-        if result["only_in_old_cols"] or result["only_in_new_cols"]:
-            result["status"] = "DATA_OK_SCHEMA_DIFF"
-        else:
-            result["status"] = "OK"
-        return result
-    result["status"] = "DATA_DIFF"
-    # przykładowe wiersze różnic
-    old_df = old_df.copy()
-    new_df = new_df.copy()
-    old_df["_hash"] = old_hashes
-    new_df["_hash"] = new_hashes
-    old_samples = []
-    for h in list(only_in_old.keys())[:SAMPLE_DIFF_ROWS]:
-        rows = old_df.loc[old_df["_hash"] == h, common_cols].head(1).to_dict(orient="records")
-        old_samples.extend(rows)
-    new_samples = []
-    for h in list(only_in_new.keys())[:SAMPLE_DIFF_ROWS]:
-        rows = new_df.loc[new_df["_hash"] == h, common_cols].head(1).to_dict(orient="records")
-        new_samples.extend(rows)
-    result["samples_only_in_old"] = old_samples[:SAMPLE_DIFF_ROWS]
-    result["samples_only_in_new"] = new_samples[:SAMPLE_DIFF_ROWS]
-    return result
-def main():
-    if not OLD_DB.exists():
-        raise FileNotFoundError(f"Brak starej bazy: {OLD_DB}")
-    if not NEW_DB.exists():
-        raise FileNotFoundError(f"Brak nowej bazy: {NEW_DB}")
-    old_conn = connect(OLD_DB)
-    new_conn = connect(NEW_DB)
-    try:
-        old_tables = set(get_tables(old_conn))
-        new_tables = set(get_tables(new_conn))
-        common_tables = sorted(old_tables & new_tables)
-        only_old_tables = sorted(old_tables - new_tables)
-        only_new_tables = sorted(new_tables - old_tables)
-        print("=" * 100)
-        print("PORÓWNANIE BAZ")
-        print("=" * 100)
-        print(f"Stara baza: {OLD_DB.name}")
-        print(f"Nowa baza : {NEW_DB.name}")
-        print(f"Klient     : {CLIENT_ID}")
-        print()
-        if only_old_tables:
-            print("Tabele tylko w starej bazie:")
-            for t in only_old_tables:
-                print(f"  - {t}")
-            print()
-        if only_new_tables:
-            print("Tabele tylko w nowej bazie:")
-            for t in only_new_tables:
-                print(f"  - {t}")
-            print()
-        results = []
-        for table in common_tables:
-            try:
-                res = compare_table(old_conn, new_conn, table, CLIENT_ID)
-                results.append(res)
-            except Exception as e:
-                results.append({
-                    "table": table,
-                    "status": f"ERROR: {e}",
-                    "old_rows": None,
-                    "new_rows": None,
-                    "common_cols_count": None,
-                    "only_in_old_cols": [],
-                    "only_in_new_cols": [],
-                    "only_in_old_rows": None,
-                    "only_in_new_rows": None,
-                    "samples_only_in_old": [],
-                    "samples_only_in_new": [],
-                })
-        summary_df = pd.DataFrame([{
-            "table": r["table"],
-            "status": r["status"],
-            "old_rows": r["old_rows"],
-            "new_rows": r["new_rows"],
-            "common_cols_count": r["common_cols_count"],
-            "only_in_old_rows": r["only_in_old_rows"],
-            "only_in_new_rows": r["only_in_new_rows"],
-            "only_in_old_cols_count": len(r["only_in_old_cols"]),
-            "only_in_new_cols_count": len(r["only_in_new_cols"]),
-        } for r in results])
-        print("=" * 100)
-        print("PODSUMOWANIE")
-        print("=" * 100)
-        print(summary_df.to_string(index=False))
-        print()
-        print("=" * 100)
-        print("SZCZEGÓŁY RÓŻNIC")
-        print("=" * 100)
-        any_diff = False
-        for r in results:
-            if r["status"] not in {"OK", "DATA_OK_SCHEMA_DIFF"}:
-                any_diff = True
-                print(f"\n--- {r['table']} ---")
-                print(f"Status: {r['status']}")
-                print(f"old_rows={r['old_rows']}, new_rows={r['new_rows']}")
-                print(f"Kolumny tylko w starej: {r['only_in_old_cols']}")
-                print(f"Kolumny tylko w nowej : {r['only_in_new_cols']}")
-                print(f"Wiersze tylko w starej: {r['only_in_old_rows']}")
-                print(f"Wiersze tylko w nowej : {r['only_in_new_rows']}")
-                if r["samples_only_in_old"]:
-                    print("Przykłady wierszy tylko w starej:")
-                    for x in r["samples_only_in_old"]:
-                        print(x)
-                if r["samples_only_in_new"]:
-                    print("Przykłady wierszy tylko w nowej:")
-                    for x in r["samples_only_in_new"]:
-                        print(x)
-        if not any_diff:
-            print("Brak różnic danych poza ewentualnymi różnicami schematu.")
-            print()
-        # zapis raportu CSV
-        report_path = BASE_DIR / f"compare_report_client_{CLIENT_ID}.csv"
-        summary_df.to_csv(report_path, index=False, encoding="utf-8-sig")
-        print(f"Raport CSV zapisany do: {report_path}")
-    finally:
-        old_conn.close()
-        new_conn.close()
-if __name__ == "__main__":
-    main()
 
-Jak tego używać:
+# =========================
+# PARAMETRY
+# =========================
+CLIENT_LIST = [10069]
 
-* zapisz np. jako compare_dbs.py,
-* upewnij się, że nazwy plików baz są dokładnie takie jak w katalogu,
-* uruchom lokalnie Pythonem.
+BASE_DIR_ASOF = Path(r"C:\Users\OE00SG\CashPredictor\dev3\databases\2026-01-22\2025-09-15")
+BASE_DIR_FULL = Path(r"C:\Users\OE00SG\CashPredictor\dev3\databases\2026-01-22\2026-01-22")
 
-Co ten skrypt sprawdza:
+TABLE_NAME = "dataset"
+DZIEN_FILTER = "2025-09-15"   # dzień, który porównujemy
 
-* wszystkie wspólne tabele w obu bazach,
-* w nowej bazie bierze tylko rekordy klienta 13581,
-* jeśli w nowej tabeli jest kolumna klienta, a w starej nie ma, to ją ignoruje,
-* porównuje dane tabela po tabeli,
-* daje raport podsumowujący i przykładowe różnice.
+KEY_INVO_COL = "INVO_NO"
+KEY_DAY_COL  = "DZIEN"
 
-Jedna ważna uwaga: jeżeli masz tabele, w których naturalnie różnią się kolumny techniczne, np. INSERT_TIMESTAMP, to dopisz je do IGNORE_COLUMNS, bo inaczej dostaniesz różnice, które nie są biznesowo istotne.
+OUT_REPORT_XLSX = Path("feature_diff_report_FROM_SQLITE1.xlsx")
+def load_dataset_from_dbs(base_dir: Path, clients, dzien: str) -> pd.DataFrame:
+    frames = []
 
-Następny sensowny krok to dopisać do tego drugą wersję raportu, która porówna tylko wybrane tabele krytyczne, na przykład group_cust_inv_days, grouped_client_days, summary_client_days_tab, extended_grouped_client_days_tab, statystyki_faktur, dataset_tab, dataset, bo to one najbardziej powiedzą, czy migracja logiki się udała.
+    for cid in clients:
+        db_path = base_dir / f"CashPredictorT_{cid}.db"
+        if not db_path.exists():
+            print(f"[WARN] Brak bazy: {db_path}")
+            continue
+
+        conn = sqlite3.connect(db_path)
+        try:
+            query = f"""
+                SELECT *
+                FROM {TABLE_NAME}
+                WHERE DATE(DZIEN) = DATE(?)
+            """
+            print(cid,"cid")
+            df = pd.read_sql_query(query, conn, params=[dzien])
+            df["__CLIENT_ID"] = cid
+            frames.append(df)
+        finally:
+            conn.close()
+
+    if not frames:
+        raise RuntimeError("Nie wczytano żadnych danych z baz.")
+
+    return pd.concat(frames, ignore_index=True)
+
+df_asof = load_dataset_from_dbs(BASE_DIR_ASOF, CLIENT_LIST, DZIEN_FILTER)
+df_full = load_dataset_from_dbs(BASE_DIR_FULL, CLIENT_LIST, DZIEN_FILTER)
+
+print("ASOF shape:", df_asof.shape)
+print("FULL shape:", df_full.shape)
+# Ujednolicenie nazw
+df_asof.columns = [c.strip() for c in df_asof.columns]
+df_full.columns = [c.strip() for c in df_full.columns]
+
+# Wspólne kolumny
+common_cols = [c for c in df_asof.columns if c in df_full.columns]
+df_asof = df_asof[common_cols].copy()
+df_full = df_full[common_cols].copy()
+
+# Klucze
+df_asof[KEY_INVO_COL] = pd.to_numeric(df_asof[KEY_INVO_COL], errors="coerce").astype("Int64")
+df_full[KEY_INVO_COL] = pd.to_numeric(df_full[KEY_INVO_COL], errors="coerce").astype("Int64")
+
+df_asof[KEY_DAY_COL] = pd.to_datetime(df_asof[KEY_DAY_COL], errors="coerce").dt.date
+df_full[KEY_DAY_COL] = pd.to_datetime(df_full[KEY_DAY_COL], errors="coerce").dt.date
+
+key_cols = [KEY_INVO_COL, KEY_DAY_COL]
+
+
+# 5️⃣ MERGE (ŹRÓDŁO PRAWDY O DATA-LEAK)
+
+df_merged = df_full.merge(
+    df_asof,
+    on=key_cols,
+    how="outer",
+    suffixes=("__FULL", "__ASOF"),
+    indicator=True
+)
+
+both = df_merged[df_merged["_merge"] == "both"].copy()
+
+
+# 6️⃣ ANALIZA RÓŻNIC KOLUMN (IDENTYCZNA JAK U CIEBIE)
+
+feature_cols = [c for c in common_cols if c not in key_cols and not c.startswith("__")]
+
+for c in feature_cols:
+    both[f"{c}__FULL"] = pd.to_numeric(both[f"{c}__FULL"], errors="coerce")
+    both[f"{c}__ASOF"] = pd.to_numeric(both[f"{c}__ASOF"], errors="coerce")
+
+results = []
+n = len(both)
+
+for c in feature_cols:
+    a = both[f"{c}__FULL"]
+    b = both[f"{c}__ASOF"]
+
+    both_na = a.isna() & b.isna()
+    absdiff = (a - b).abs()
+    is_diff = (~both_na) & (absdiff.fillna(np.inf) > 0)
+
+    results.append({
+        "column": c,
+        "n_rows": n,
+        "n_diff": int(is_diff.sum()),
+        "pct_diff": float(is_diff.mean()) if n else 0.0,
+        "max_abs_diff": float(absdiff[~both_na].max()) if (~both_na).any() else 0.0,
+        "mean_abs_diff": float(absdiff[~both_na].mean()) if (~both_na).any() else 0.0,
+        "median_abs_diff": float(absdiff[~both_na].median()) if (~both_na).any() else 0.0,
+        "n_na_full": int(a.isna().sum()),
+        "n_na_asof": int(b.isna().sum()),
+    })
+
+df_col_diff = pd.DataFrame(results).sort_values(
+    by=["pct_diff", "max_abs_diff", "mean_abs_diff"],
+    ascending=[False, False, False]
+)
+
+
+# 7️⃣ ANALIZA RÓŻNIC WIERSZY
+
+A = both[[f"{c}__FULL" for c in feature_cols]].to_numpy()
+B = both[[f"{c}__ASOF" for c in feature_cols]].to_numpy()
+
+eq = (A == B) | (np.isnan(A) & np.isnan(B))
+n_diffs_per_row = (~eq).sum(axis=1)
+
+df_row_diff = both[key_cols].copy()
+df_row_diff["n_feature_diffs"] = n_diffs_per_row
+df_row_diff = df_row_diff.sort_values("n_feature_diffs", ascending=False)
+
+
+# 8️⃣ EKSPORT DO EXCELA
+
+TOP_N = 30
+top_cols = df_col_diff.head(TOP_N)["column"].tolist()
+
+detail_cols = key_cols[:]
+for c in top_cols:
+    detail_cols += [f"{c}__FULL", f"{c}__ASOF"]
+
+df_detail = both[detail_cols].copy()
+
+with pd.ExcelWriter(OUT_REPORT_XLSX, engine="openpyxl") as writer:
+    df_col_diff.to_excel(writer, sheet_name="column_diff_rank", index=False)
+    df_row_diff.to_excel(writer, sheet_name="row_diff_rank", index=False)
+    df_detail.to_excel(writer, sheet_name="top_feature_detail", index=False)
+    df_merged.to_excel(writer, sheet_name="merged_raw", index=False)
+
+print("✅ Zapisano raport:", OUT_REPORT_XLSX.resolve())
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+# =========================
+# PARAMETRY
+# =========================
+XLSX_ASOF = Path("TRAIN_MERGE_READY_ASOF.xlsx")   # <- podmień nazwę
+XLSX_FULL = Path("TRAIN_MERGE_READY_FULL.xlsx")   # <- podmień nazwę
+
+KEY_INVO_COL = "INVO_NO"
+KEY_DAY_COL  = "DZIEN"
+
+OUT_REPORT_XLSX = Path("feature_diff_report_FROM_EXCEL.xlsx")
+
+# =========================
+# LOAD
+# =========================
+df_asof = pd.read_excel(XLSX_ASOF)
+df_full = pd.read_excel(XLSX_FULL)
+
+print("ASOF shape:", df_asof.shape)
+print("FULL shape:", df_full.shape)
+
+# Ujednolicenie nazw kolumn
+df_asof.columns = [c.strip() for c in df_asof.columns]
+df_full.columns = [c.strip() for c in df_full.columns]
+
+# Wspólne kolumny
+common_cols = [c for c in df_asof.columns if c in df_full.columns]
+df_asof = df_asof[common_cols].copy()
+df_full = df_full[common_cols].copy()
+
+# Klucze (typy)
+df_asof[KEY_INVO_COL] = pd.to_numeric(df_asof[KEY_INVO_COL], errors="coerce").astype("Int64")
+df_full[KEY_INVO_COL] = pd.to_numeric(df_full[KEY_INVO_COL], errors="coerce").astype("Int64")
+
+# DZIEN może być datą lub datetime – normalizujemy do date
+df_asof[KEY_DAY_COL] = pd.to_datetime(df_asof[KEY_DAY_COL], errors="coerce").dt.date
+df_full[KEY_DAY_COL] = pd.to_datetime(df_full[KEY_DAY_COL], errors="coerce").dt.date
+
+key_cols = [KEY_INVO_COL, KEY_DAY_COL]
+
+# =========================
+# MERGE
+# =========================
+df_merged = df_full.merge(
+    df_asof,
+    on=key_cols,
+    how="outer",
+    suffixes=("__FULL", "__ASOF"),
+    indicator=True
+)
+
+both = df_merged[df_merged["_merge"] == "both"].copy()
+
+# =========================
+# ANALIZA RÓŻNIC KOLUMN
+# =========================
+feature_cols = [c for c in common_cols if c not in key_cols and not c.startswith("__")]
+
+# Upewniamy się, że porównujemy numerycznie (jak w Twojej wersji)
+for c in feature_cols:
+    both[f"{c}__FULL"] = pd.to_numeric(both[f"{c}__FULL"], errors="coerce")
+    both[f"{c}__ASOF"] = pd.to_numeric(both[f"{c}__ASOF"], errors="coerce")
+
+results = []
+n = len(both)
+
+for c in feature_cols:
+    a = both[f"{c}__FULL"]
+    b = both[f"{c}__ASOF"]
+
+    both_na = a.isna() & b.isna()
+    absdiff = (a - b).abs()
+    is_diff = (~both_na) & (absdiff.fillna(np.inf) > 0)
+
+    results.append({
+        "column": c,
+        "n_rows": n,
+        "n_diff": int(is_diff.sum()),
+        "pct_diff": float(is_diff.mean()) if n else 0.0,
+        "max_abs_diff": float(absdiff[~both_na].max()) if (~both_na).any() else 0.0,
+        "mean_abs_diff": float(absdiff[~both_na].mean()) if (~both_na).any() else 0.0,
+        "median_abs_diff": float(absdiff[~both_na].median()) if (~both_na).any() else 0.0,
+        "n_na_full": int(a.isna().sum()),
+        "n_na_asof": int(b.isna().sum()),
+    })
+
+df_col_diff = pd.DataFrame(results).sort_values(
+    by=["pct_diff", "max_abs_diff", "mean_abs_diff"],
+    ascending=[False, False, False]
+)
+
+# =========================
+# ANALIZA RÓŻNIC WIERSZY
+# =========================
+A = both[[f"{c}__FULL" for c in feature_cols]].to_numpy()
+B = both[[f"{c}__ASOF" for c in feature_cols]].to_numpy()
+
+eq = (A == B) | (np.isnan(A) & np.isnan(B))
+n_diffs_per_row = (~eq).sum(axis=1)
+
+df_row_diff = both[key_cols].copy()
+df_row_diff["n_feature_diffs"] = n_diffs_per_row
+df_row_diff = df_row_diff.sort_values("n_feature_diffs", ascending=False)
+
+# =========================
+# DETAIL TOP N
+# =========================
+TOP_N = 30
+top_cols = df_col_diff.head(TOP_N)["column"].tolist()
+
+detail_cols = key_cols[:]
+for c in top_cols:
+    detail_cols += [f"{c}__FULL", f"{c}__ASOF"]
+
+df_detail = both[detail_cols].copy()
+
+# =========================
+# EXPORT
+# =========================
+with pd.ExcelWriter(OUT_REPORT_XLSX, engine="openpyxl") as writer:
+    df_col_diff.to_excel(writer, sheet_name="column_diff_rank", index=False)
+    df_row_diff.to_excel(writer, sheet_name="row_diff_rank", index=False)
+    df_detail.to_excel(writer, sheet_name="top_feature_detail", index=False)
+    df_merged.to_excel(writer, sheet_name="merged_raw", index=False)
+
+print("✅ Zapisano raport:", OUT_REPORT_XLSX.resolve())
+
