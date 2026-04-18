@@ -1,443 +1,268 @@
-Podsumowując: chcesz zrobić 3 rzeczy naraz.
+Tak — problem jest dokładnie tam.
 
-Po pierwsze, przenieść schemat first_model_tab do db_init, tak żeby first_model.py już nie tworzył tabeli dynamicznie. Już wcześniej miałeś to przewidziane w starej koncepcji jako query_create_first_model_tab  ￼.
+write_output_to_db(...) nadal woła funkcję typu create + insert, a ta funkcja robi:
 
-Po drugie, zmienić zapis wyników w first_model.py, żeby:
+* DROP TABLE IF EXISTS ...
+* CREATE TABLE ...
+* potem INSERT
 
-* nie było DROP TABLE,
-* nie było CREATE TABLE,
-* tylko append nowych wierszy do istniejącej tabeli,
-* z dodatkową kolumną RunIdentifier.
+Więc nawet jeśli wcześniej dobrze dodałeś RunIdentifier i przestałeś czyścić ręcznie tabelę, to i tak na końcu tabela jest przebudowywana od zera przy każdym zapisie. Efekt: zostaje tylko ostatni klient / ostatni run.
 
-Po trzecie, chcesz dostać skrypt do wygenerowania listy kolumn z aktualnego outputu modelu, żeby wkleić je do config.yaml jako definicję schematu.
+Najczystsze rozwiązanie teraz:
+nie psuć obecnej funkcji create-and-insert, bo może być jeszcze potrzebna w innych miejscach, tylko:
 
-I to jest dobry kierunek, bo dziś zapis outputu modelu nadal idzie przez ogólną funkcję, która dla first_model_tab robi najpierw DELETE, a potem i tak DROP TABLE i CREATE TABLE, więc finalnie tabela jest niszczona przy każdym runie  ￼. Jednocześnie sam first_model.py kończy na write_output_to_db(..., 'first_model_tab', ...)  ￼, więc zmiana powinna pójść głównie w warstwę database.py plus lekka korekta w first_model.py.
+* dodać nową funkcję: insert do istniejącej tabeli
+* zmienić write_output_to_db(...), żeby umiał wywołać:
+    * albo stare create_and_insert...
+    * albo nowe insert_into_existing...
 
-⸻
-
-Co dokładnie trzeba zmienić
-
-1. db_init.py
-
-Musisz dodać tworzenie tabeli first_model_tab z configa, tak samo jak robisz to dla innych tabel. Teraz db_init.py tworzy m.in. dataset, dataset_tab, group_cust_inv_days, INVO_CLHS_JOINED_TAB, ale nie widać tam query_create_first_model_tab  ￼.
-
-2. config.yaml
-
-Musisz dodać:
-
-* definicję kolumn outputu,
-* definicję CREATE TABLE first_model_tab,
-* najlepiej też indeksy dla tej tabeli.
-
-Masz już w configu parametr RunIdentifier_column: 'RunIdentifier'  ￼, więc to warto wykorzystać 1:1.
-
-3. database.py
-
-Tu jest główny problem:
-
-* create_and_insert_processed_table(...) dziś robi:
-    * dla first_model_tab najpierw DELETE,
-    * potem i tak DROP TABLE IF EXISTS,
-    * potem CREATE TABLE ...  ￼
-
-To trzeba rozdzielić:
-
-* dla zwykłych tabel może zostać obecne zachowanie,
-* ale dla first_model_tab trzeba zrobić append do istniejącej tabeli.
-
-4. first_model.py
-
-Tu trzeba:
-
-* dodać kolumnę RunIdentifier do final_output_df tuż przed zapisem,
-* zostawić samo write_output_to_db(...), ale już z nową logiką append.
+To jest bezpieczniejsze niż przerabianie starej funkcji warunkami dla first_model_tab.
 
 ⸻
 
-Jak wygenerować listę kolumn do configa
+Co zrobić
 
-Najpraktyczniej zrób to z realnego outputu final_output_df, bo on i tak jest ostatnim DataFrame przed zapisem do first_model_tab  ￼.
+1. Zostawić obecną funkcję bez zmian
 
-Skrypt pomocniczy
+Czyli:
 
-Uruchom to lokalnie na próbce DataFrame, albo wstaw tymczasowo przed write_output_to_db(...):
+* create_and_insert_processed_table(...) zostaje jak jest,
+* dalej może służyć tam, gdzie naprawdę chcesz budować tabelę od nowa.
 
-def generate_first_model_schema_yaml(df):
-    import pandas as pd
-    lines = []
-    lines.append("  first_model_output_columns:")
-    for col in df.columns:
-        dtype = df[col].dtype
-        if pd.api.types.is_integer_dtype(dtype):
-            sql_type = "INTEGER"
-        elif pd.api.types.is_float_dtype(dtype):
-            sql_type = "REAL"
-        elif pd.api.types.is_datetime64_any_dtype(dtype):
-            sql_type = "DATETIME"
-        else:
-            sql_type = "TEXT"
-        lines.append(f'    - ["{col}", "{sql_type}"]')
-    return "\n".join(lines)
+2. Dodać nową funkcję
 
-A potem tymczasowo w first_model.py, tuż przed zapisem:
+Nowa funkcja ma:
 
-print(generate_first_model_schema_yaml(final_output_df))
+* sprawdzić, czy tabela istnieje,
+* pobrać jej kolumny z PRAGMA table_info,
+* dopasować DataFrame do kolumn tabeli,
+* wykonać tylko INSERT,
+* bez DROP,
+* bez CREATE.
 
-⸻
+3. Rozszerzyć write_output_to_db(...)
 
-Co wkleić do config.yaml
+Dodać parametr np.:
 
-W first_model_params dodaj najpierw listę kolumn:
+insert_only=False
 
-  first_model_output_columns:
-    - ["RunIdentifier", "TEXT"]
-    - ["INVO_NO", "TEXT"]
-    - ["INVO_ADMNO", "TEXT"]
-    - ["INVO_CLNTNO", "TEXT"]
-    - ["INVO_DEBH_NO", "TEXT"]
-    - ["INVO_DEBC_NO", "TEXT"]
-    - ["INVO_INVDATE", "DATETIME"]
-    - ["DZIEN", "DATETIME"]
-    - ["INVO_DUEDATE", "DATETIME"]
-    - ["INVO_AINITIALH", "REAL"]
-    - ["INVO_FINALPAYMENTDATE", "DATETIME"]
-    - ["INVO_FINALPAYMENTDATE_DAYS_DIFF", "REAL"]
-    - ["predicted_INVO_FINALPAYMENTDATE", "REAL"]
-    - ["PREDICTED_PAYMENT_DATE", "DATETIME"]
+I wtedy:
 
-To tylko przykład początku — resztę wygenerujesz skryptem.
+* insert_only=False -> stare zachowanie
+* insert_only=True -> nowa funkcja append
 
-Potem dodaj definicję tabeli:
+4. W first_model.py
 
-  query_create_first_model_tab: |
-    CREATE TABLE IF NOT EXISTS first_model_tab (
-        RunIdentifier TEXT,
-        INVO_NO TEXT,
-        INVO_ADMNO TEXT,
-        INVO_CLNTNO TEXT,
-        INVO_DEBH_NO TEXT,
-        INVO_DEBC_NO TEXT,
-        INVO_INVDATE DATETIME,
-        DZIEN DATETIME,
-        INVO_DUEDATE DATETIME,
-        INVO_AINITIALH REAL,
-        INVO_FINALPAYMENTDATE DATETIME,
-        INVO_FINALPAYMENTDATE_DAYS_DIFF REAL,
-        predicted_INVO_FINALPAYMENTDATE REAL,
-        PREDICTED_PAYMENT_DATE DATETIME
-        -- dalsze kolumny wygenerowane skryptem
-    );
+Dla first_model_tab wywołać:
 
-Jeszcze lepiej: wygenerować od razu cały blok CREATE TABLE skryptem.
+write_output_to_db(..., insert_only=True)
 
 ⸻
 
-Lepszy skrypt: generowanie gotowego query_create_first_model_tab
+Kod do dodania do database.py
 
-To będzie dla Ciebie wygodniejsze niż ręczne składanie.
+Dodaj nową funkcję.
 
-def generate_first_model_create_table_yaml(df, table_name="first_model_tab"):
-    import pandas as pd
-    col_defs = ['        RunIdentifier TEXT']
-    for col in df.columns:
-        if col == "RunIdentifier":
-            continue
-        dtype = df[col].dtype
-        if pd.api.types.is_integer_dtype(dtype):
-            sql_type = "INTEGER"
-        elif pd.api.types.is_float_dtype(dtype):
-            sql_type = "REAL"
-        elif pd.api.types.is_datetime64_any_dtype(dtype):
-            sql_type = "DATETIME"
-        else:
-            sql_type = "TEXT"
-        col_defs.append(f'        {col} {sql_type}')
-    sql = "  query_create_first_model_tab: |\n"
-    sql += f"    CREATE TABLE IF NOT EXISTS {table_name} (\n"
-    sql += ",\n".join(col_defs)
-    sql += "\n    );"
-    return sql
-
-I tymczasowo:
-
-final_output_df_with_run = final_output_df.copy()
-final_output_df_with_run.insert(0, "RunIdentifier", "TEST_RUN")
-print(generate_first_model_create_table_yaml(final_output_df_with_run))
-
-To wkleić do config.yaml.
-
-⸻
-
-Co dodać do db_init.py
-
-W sekcji tworzenia tabel dopisz:
-
-exec_sql(conn, params.get("query_create_first_model_tab"), "query_create_first_model_tab")
-
-Najlepiej tutaj, razem z innymi tabelami, przed widokami:
-
-exec_sql(conn, params.get("query_create_grouped_client_days_table"), "query_create_grouped_client_days_table")
-exec_sql(conn, params.get("query_create_dataset"), "query_create_dataset")
-exec_sql(conn, params.get("query_create_invo_clhs_joined_tab_table"), "query_create_invo_clhs_joined_tab_table")
-exec_sql(conn, params.get("query_create_extended_grouped_client_days_tab_table"), "query_create_extended_grouped_client_days_tab_table")
-exec_sql(conn, params.get("query_create_first_model_tab"), "query_create_first_model_tab")
-
-Dodatkowo możesz dodać indeksy:
-
-if table_exists(cursor, "first_model_tab"):
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_first_model_tab_runid ON first_model_tab (RunIdentifier);")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_first_model_tab_client_day ON first_model_tab (INVO_CLNTNO, DZIEN);")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_first_model_tab_invoice ON first_model_tab (INVO_NO);")
-
-⸻
-
-Co zmienić w first_model.py
-
-Masz teraz końcówkę z zapisem przez write_output_to_db(...)  ￼. Tu przed zapisem dodaj RunIdentifier.
-
-Dodaj helper
-
-Na górze pliku:
-
-from uuid import uuid4
-
-albo bez UUID, jeśli chcesz prostszy run id.
-
-Dodaj przed write_output_to_db(...)
-
-Znajdź blok:
-
-write_output_to_db(final_output_df, 'first_model_tab', params, original_table_name=None, currently_testing=True, create_indexes=True, index_columns=[ 'INVO_NO', 'INVO_DEBC_NO', 'INVO_INVDATE', 'DZIEN', 'INVO_FINALPAYMENTDATE', 'PREDICTED_PAYMENT_DATE'])
-
-i zamień na:
-
-run_identifier = f"{operation_mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-final_output_df = final_output_df.copy()
-if "RunIdentifier" not in final_output_df.columns:
-    final_output_df.insert(0, "RunIdentifier", run_identifier)
-write_output_to_db(
-    final_output_df,
-    'first_model_tab',
-    params,
-    original_table_name="first_model_tab",
-    currently_testing=True,
-    create_indexes=False,
-    index_columns=None
-)
-
-Dlaczego tak:
-
-* RunIdentifier dodajesz jawnie,
-* original_table_name="first_model_tab" będzie pomocne do typów,
-* nie tworzysz indeksów przy każdym runie, bo indeksy ma robić db_init.
-
-⸻
-
-Co zmienić w database.py
-
-To jest najważniejsza zmiana.
-
-Obecny problem
-
-Masz teraz:
-
-if sanitized_table_name == "first_model_tab":
-    if cursor.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;", (sanitized_table_name,)).fetchone():
-        cursor.execute(f"DELETE FROM {sanitized_table_name};")
-        conn.commit()
-cursor.execute(f"DROP TABLE IF EXISTS {sanitized_table_name};")
-create_table_query = f"CREATE TABLE {sanitized_table_name} ({', '.join(columns_sql)});"
-cursor.execute(create_table_query)
-
-czyli nawet jeśli skasujesz dane, to i tak za chwilę kasujesz całą tabelę  ￼.
-
-Zamień cały fragment tworzenia tabeli na taki:
-
-    # Tworzenie / użycie tabeli docelowej
-    sanitized_table_name = sanitize_table_name(target_table_name)
-    table_exists = cursor.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;",
-        (sanitized_table_name,)
-    ).fetchone() is not None
-    if sanitized_table_name == "first_model_tab":
-        if not table_exists:
-            create_table_query = f"CREATE TABLE {sanitized_table_name} ({', '.join(columns_sql)});"
-            cursor.execute(create_table_query)
-            if create_indexes and index_columns:
-                for col in index_columns:
-                    idx_name = sanitize_table_name(f"idx_{sanitized_table_name}_{col}")
-                    sql = f"CREATE INDEX IF NOT EXISTS {idx_name} ON {sanitized_table_name}({col});"
-                    cursor.execute(sql)
-                logging.info(f"Utworzono indeksy na kolumnach: {index_columns}")
-    else:
-        cursor.execute(f"DROP TABLE IF EXISTS {sanitized_table_name};")
-        create_table_query = f"CREATE TABLE {sanitized_table_name} ({', '.join(columns_sql)});"
-        cursor.execute(create_table_query)
-        if create_indexes and index_columns:
-            for col in index_columns:
-                idx_name = sanitize_table_name(f"idx_{sanitized_table_name}_{col}")
-                sql = f"CREATE INDEX IF NOT EXISTS {idx_name} ON {sanitized_table_name}({col});"
-                cursor.execute(sql)
-            logging.info(f"Utworzono indeksy na kolumnach: {index_columns}")
-
-To daje:
-
-* dla first_model_tab: tylko użycie istniejącej tabeli,
-* dla reszty: stare zachowanie zostaje.
-
-⸻
-
-Jeszcze lepsza wersja: jawny append mode
-
-Lepiej docelowo nie opierać tego na nazwie tabeli, tylko na parametrze.
-
-Zmień sygnaturę:
-
-W database.py:
-
-def create_and_insert_processed_table(
+def insert_into_existing_table(
     conn,
     processed_df,
     target_table_name,
+    batch_size=500000
+):
+    """
+    Dopisuje dane do istniejącej tabeli.
+    NIE robi DROP TABLE.
+    NIE robi CREATE TABLE.
+    Zakłada, że schemat został już przygotowany wcześniej (np. przez db_init).
+    """
+    cursor = conn.cursor()
+    sanitized_table_name = sanitize_table_name(target_table_name)
+    # 1. Sprawdzenie, czy tabela istnieje
+    exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;",
+        (sanitized_table_name,)
+    ).fetchone()
+    if not exists:
+        raise RuntimeError(
+            f"Tabela '{sanitized_table_name}' nie istnieje. "
+            f"Najpierw utwórz ją w db_init lub innym etapie inicjalizacji."
+        )
+    # 2. Pobranie kolumn z istniejącej tabeli
+    cursor.execute(f"PRAGMA table_info({sanitized_table_name});")
+    table_info = cursor.fetchall()
+    table_columns = [row[1] for row in table_info]
+    if not table_columns:
+        raise RuntimeError(f"Nie udało się pobrać kolumn tabeli '{sanitized_table_name}'.")
+    # 3. Upewniamy się, że DF ma wszystkie kolumny wymagane przez tabelę
+    df = processed_df.copy()
+    for col in table_columns:
+        if col not in df.columns:
+            df[col] = None
+    # 4. Ograniczamy się do kolumn tabeli i w tej samej kolejności
+    df = df[table_columns]
+    # 5. Zamiana NaN/NaT na None
+    df = df.where(pd.notna(df), None)
+    placeholders = ", ".join(["?" for _ in table_columns])
+    insert_sql = f"""
+        INSERT INTO {sanitized_table_name} ({', '.join(table_columns)})
+        VALUES ({placeholders})
+    """
+    def _to_sqlite_safe(v):
+        if pd.isna(v):
+            return None
+        if isinstance(v, np.datetime64):
+            v = pd.to_datetime(v)
+        if isinstance(v, pd.Timestamp):
+            return v.to_pydatetime()
+        return v
+    total_inserted = 0
+    for start in range(0, len(df), batch_size):
+        chunk = df.iloc[start:start + batch_size]
+        rows = [
+            tuple(_to_sqlite_safe(v) for v in row)
+            for row in chunk.itertuples(index=False, name=None)
+        ]
+        cursor.executemany(insert_sql, rows)
+        conn.commit()
+        total_inserted += len(rows)
+    logging.info(
+        f"[insert_into_existing_table] Dopisano {total_inserted} wierszy do tabeli '{sanitized_table_name}'."
+    )
+
+⸻
+
+Jak zmienić write_output_to_db(...)
+
+Znajdź funkcję write_output_to_db(...) i zmień jej sygnaturę na:
+
+def write_output_to_db(
+    output_df,
+    target_table_name,
+    params,
     original_table_name=None,
-    batch_size=500000,
+    currently_testing=False,
     create_indexes=False,
     index_columns=None,
-    append_if_exists=False
+    insert_only=False
 ):
 
-Potem logika:
+A potem w środku, tam gdzie dziś wołasz create_and_insert_processed_table(...), zamień logikę na taką:
 
-    if append_if_exists:
-        if not table_exists:
-            create_table_query = f"CREATE TABLE {sanitized_table_name} ({', '.join(columns_sql)});"
-            cursor.execute(create_table_query)
-    else:
-        cursor.execute(f"DROP TABLE IF EXISTS {sanitized_table_name};")
-        create_table_query = f"CREATE TABLE {sanitized_table_name} ({', '.join(columns_sql)});"
-        cursor.execute(create_table_query)
+    conn = sqlite3.connect(
+        params['database'],
+        detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES
+    )
+    try:
+        if insert_only:
+            insert_into_existing_table(
+                conn=conn,
+                processed_df=output_df,
+                target_table_name=target_table_name,
+                batch_size=params.get("data_limit", 500000)
+            )
+        else:
+            create_and_insert_processed_table(
+                conn=conn,
+                processed_df=output_df,
+                target_table_name=target_table_name,
+                original_table_name=original_table_name,
+                create_indexes=create_indexes,
+                index_columns=index_columns
+            )
+    finally:
+        conn.close()
 
-A w write_output_to_db(...) dodaj parametr:
+Jeśli u Ciebie write_output_to_db(...) ma trochę inną strukturę, to sens ma być dokładnie ten:
 
-def write_output_to_db(df, table_name, params, original_table_name=None, currently_testing=False, create_indexes=False, index_columns=None, append_if_exists=False):
+* insert_only=True -> wywołuje nowy append
+* insert_only=False -> wywołuje stary create+insert
 
-i przekaż dalej.
+⸻
 
-A w first_model.py wywołaj:
+Jak zmienić wywołanie w first_model.py
+
+Tam, gdzie zapisujesz do first_model_tab, zmień wywołanie na:
 
 write_output_to_db(
     final_output_df,
     'first_model_tab',
     params,
-    original_table_name="first_model_tab",
+    original_table_name='first_model_tab',
     currently_testing=True,
     create_indexes=False,
     index_columns=None,
-    append_if_exists=True
+    insert_only=True
 )
 
-To jest czystsze niż specjalny if sanitized_table_name == "first_model_tab".
-
 ⸻
 
-Co jeszcze warto dodać
+Dodatkowo: co jeszcze sprawdzić
 
-Skoro tabela będzie appendowana, to dobrze dać też techniczne kolumny:
+Żeby to działało poprawnie, tabela first_model_tab musi już istnieć i mieć zgodny schemat. Czyli:
 
-* RunIdentifier
-* InsertTimestamp
-* opcjonalnie OperationMode
-* opcjonalnie ModelPath
-
-Najmniejsza sensowna wersja:
-
-run_identifier = f"{operation_mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-insert_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-final_output_df.insert(0, "RunIdentifier", run_identifier)
-final_output_df["InsertTimestamp"] = insert_timestamp
-
-Wtedy do configa dodajesz jeszcze:
-
-- ["InsertTimestamp", "DATETIME"]
-
-To bardzo pomoże później filtrować wyniki.
-
-⸻
-
-Minimalny zestaw zmian, który polecam teraz
-
-W config.yaml
-
-Dodać:
-
-* query_create_first_model_tab
-* najlepiej też first_model_output_columns pomocniczo
-
-W db_init.py
-
-Dodać:
+* w db_init.py musi być:
 
 exec_sql(conn, params.get("query_create_first_model_tab"), "query_create_first_model_tab")
 
-i indeksy dla first_model_tab.
+* i schemat tej tabeli musi zawierać także:
+    * RunIdentifier
+    * oraz inne nowe kolumny, które dodajesz przed insertem
 
-W first_model.py
+Bo nowa funkcja nie tworzy tabeli, tylko zakłada gotowy schemat.
 
-Dodać:
+⸻
 
-* RunIdentifier
-* opcjonalnie InsertTimestamp
+Dlaczego to podejście jest najlepsze teraz
+
+Bo:
+
+* nie rozwalasz starej logiki tam, gdzie nadal może być potrzebna,
+* dokładnie rozdzielasz dwa tryby:
+    * rebuild tabeli
+    * append do istniejącej tabeli
+* łatwiej to potem wykorzystać też dla innych wynikowych tabel, nie tylko first_model_tab
+
+Czyli architektonicznie:
+
+* create_and_insert_processed_table(...) = tryb bootstrap / recreate
+* insert_into_existing_table(...) = tryb produkcyjny / append
+
+To jest dużo czystsze niż dokładanie kolejnych if table_name == ....
+
+⸻
+
+Minimalny zestaw zmian
 
 W database.py
 
-Usunąć dla first_model_tab:
+Dodać:
 
-* DELETE
-* DROP TABLE
-* CREATE TABLE przy każdym runie
+* insert_into_existing_table(...)
 
-i przejść na append.
+Zmienić:
 
-⸻
+* write_output_to_db(..., insert_only=False)
 
-Najkrótsza wersja „co podmienić”
+W first_model.py
 
-1. db_init.py — dodać
+Zmienić wywołanie:
 
-exec_sql(conn, params.get("query_create_first_model_tab"), "query_create_first_model_tab")
+* insert_only=True
 
-2. first_model.py — podmienić końcówkę
+W db_init.py
 
-Z:
-
-write_output_to_db(final_output_df, 'first_model_tab', params, original_table_name=None, currently_testing=True, create_indexes=True, index_columns=[ 'INVO_NO', 'INVO_DEBC_NO', 'INVO_INVDATE', 'DZIEN', 'INVO_FINALPAYMENTDATE', 'PREDICTED_PAYMENT_DATE'])
-
-Na:
-
-run_identifier = f"{operation_mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-insert_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-final_output_df = final_output_df.copy()
-final_output_df.insert(0, "RunIdentifier", run_identifier)
-final_output_df["InsertTimestamp"] = insert_timestamp
-write_output_to_db(
-    final_output_df,
-    'first_model_tab',
-    params,
-    original_table_name="first_model_tab",
-    currently_testing=True,
-    create_indexes=False,
-    index_columns=None,
-    append_if_exists=True
-)
-
-3. database.py — dodać parametr
-
-W write_output_to_db i create_and_insert_processed_table:
-
-append_if_exists=False
-
-i zrobić dla append brak DROP/CREATE.
+Upewnić się, że first_model_tab jest tworzona wcześniej.
 
 ⸻
 
-Jeśli chcesz, w kolejnym kroku mogę Ci od razu rozpisać gotowy blok query_create_first_model_tab w YAML w formie generatora: uruchamiasz skrypt raz, on wypluwa kompletny CREATE TABLE gotowy do wklejenia do configa.
+Uwaga na jeszcze jeden szczegół
+
+Jeżeli chcesz później odróżniać runy i nie mieszać ich logicznie, to oprócz RunIdentifier warto dodać też:
+
+final_output_df["InsertTimestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+i dodać tę kolumnę do schematu tabeli.
+
+⸻
+
+Jeżeli chcesz, mogę Ci w następnym kroku rozpisać gotowy kompletny kod całego write_output_to_db(...) po zmianie, już w formie „wklej zamiast obecnej funkcji”.
