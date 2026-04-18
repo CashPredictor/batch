@@ -1,67 +1,144 @@
-Tak — problem jest dokładnie tam.
+import sqlite3
+import pandas as pd
+import numpy as np
+import json
+import datetime
+import logging
+import time
+from contextlib import contextmanager
 
-write_output_to_db(...) nadal woła funkcję typu create + insert, a ta funkcja robi:
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-* DROP TABLE IF EXISTS ...
-* CREATE TABLE ...
-* potem INSERT
+# Adapter: datetime → string (dla SQLite)
+def adapt_datetime(ts):
+    return ts.strftime('%Y-%m-%d %H:%M:%S')  # Format akceptowany przez SQLite
 
-Więc nawet jeśli wcześniej dobrze dodałeś RunIdentifier i przestałeś czyścić ręcznie tabelę, to i tak na końcu tabela jest przebudowywana od zera przy każdym zapisie. Efekt: zostaje tylko ostatni klient / ostatni run.
+# Konwerter: string → datetime (z SQLite)
+def convert_datetime(ts):
+    return datetime.strptime(ts.decode('utf-8'), '%Y-%m-%d %H:%M:%S')
 
-Najczystsze rozwiązanie teraz:
-nie psuć obecnej funkcji create-and-insert, bo może być jeszcze potrzebna w innych miejscach, tylko:
+def adapt_pandas_timestamp(ts):
+    return ts.to_pydatetime().strftime('%Y-%m-%d %H:%M:%S')
 
-* dodać nową funkcję: insert do istniejącej tabeli
-* zmienić write_output_to_db(...), żeby umiał wywołać:
-    * albo stare create_and_insert...
-    * albo nowe insert_into_existing...
+def convert_pandas_timestamp(ts):
+    return pd.Timestamp(ts.decode('utf-8'))
 
-To jest bezpieczniejsze niż przerabianie starej funkcji warunkami dla first_model_tab.
+# Rejestracja adapterów
+sqlite3.register_adapter(datetime, adapt_datetime)
+sqlite3.register_converter('DATETIME', convert_datetime)
+sqlite3.register_adapter(pd.Timestamp, adapt_pandas_timestamp)
+sqlite3.register_converter('DATETIME', convert_pandas_timestamp)
 
-⸻
+def convert_timestamps_in_df(df):
+    """
+    Konwertuje wartości typu datetime i pandas.Timestamp na format string zgodny z SQLite.
+    """
+    for col in df.select_dtypes(include=['datetime64[ns]']).columns:
+        df[col] = df[col].apply(lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notnull(x) else None)
+    return df
 
-Co zrobić
+@contextmanager
+def get_connection(database_path):
+    conn = None
+    try:
+        conn = sqlite3.connect(
+            database_path,
+            timeout=30,
+            detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES
+        )
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=60000;")
+        yield conn
+        conn.commit()
+    except Exception:
+        if conn is not None:
+            conn.rollback()
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
 
-1. Zostawić obecną funkcję bez zmian
+def create_and_insert_processed_table(conn, processed_df, target_table_name, original_table_name=None, batch_size=500000, create_indexes=False, index_columns=None):
+    """
+    Tworzy tabelę na podstawie struktury DataFrame i opcjonalnie oryginalnej tabeli w SQLite,
+    a następnie wstawia dane partiami (batch insert).
+    
+    :param conn: Połączenie z bazą danych SQLite.
+    :param processed_df: DataFrame z przetworzonymi danymi.
+    :param target_table_name: Nazwa tabeli docelowej.
+    :param original_table_name: Opcjonalna nazwa oryginalnej tabeli, z której pobieramy typy kolumn.
+    :param batch_size: Liczba wierszy w jednej partii wstawiania (domyślnie 500000).
+    """
+    cursor = conn.cursor()
+    
+    # Pobierz typy danych z oryginalnej tabeli, jeśli podano jej nazwę
+    original_column_types = {}
+    if original_table_name:
+        try:
+            original_column_types = get_column_types(cursor, original_table_name)
+        except Exception as e:
+            logging.warning(f"Could not fetch column types from original table '{original_table_name}': {e}")
+    
+    # Mapowanie typów danych dla kolumn
+    columns_sql = []
+    for col in processed_df.columns:
+        if col in original_column_types:
+            col_type = original_column_types[col]  # Użyj typu z oryginalnej tabeli
+        else:
+            # Przypisz typ danych na podstawie danych w DataFrame
+            if pd.api.types.is_integer_dtype(processed_df[col]):
+                col_type = "INTEGER"
+            elif pd.api.types.is_float_dtype(processed_df[col]):
+                col_type = "REAL"
+            elif pd.api.types.is_datetime64_any_dtype(processed_df[col]):
+                col_type = "DATETIME"
+            else:
+                col_type = "TEXT"  # Domyślny typ TEXT dla nowych kolumn
+        columns_sql.append(f"{col} {col_type}")
+    
+    # Tworzenie tabeli docelowej
+    sanitized_table_name = sanitize_table_name(target_table_name)
+    if sanitized_table_name == "first_model_tab":
+        if cursor.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;", (sanitized_table_name,)).fetchone():
+            cursor.execute(f"DELETE FROM {sanitized_table_name};")
+            conn.commit()
+    cursor.execute(f"DROP TABLE IF EXISTS {sanitized_table_name};")
+    create_table_query = f"CREATE TABLE {sanitized_table_name} ({', '.join(columns_sql)});"
+    cursor.execute(create_table_query)
 
-Czyli:
-
-* create_and_insert_processed_table(...) zostaje jak jest,
-* dalej może służyć tam, gdzie naprawdę chcesz budować tabelę od nowa.
-
-2. Dodać nową funkcję
-
-Nowa funkcja ma:
-
-* sprawdzić, czy tabela istnieje,
-* pobrać jej kolumny z PRAGMA table_info,
-* dopasować DataFrame do kolumn tabeli,
-* wykonać tylko INSERT,
-* bez DROP,
-* bez CREATE.
-
-3. Rozszerzyć write_output_to_db(...)
-
-Dodać parametr np.:
-
-insert_only=False
-
-I wtedy:
-
-* insert_only=False -> stare zachowanie
-* insert_only=True -> nowa funkcja append
-
-4. W first_model.py
-
-Dla first_model_tab wywołać:
-
-write_output_to_db(..., insert_only=True)
-
-⸻
-
-Kod do dodania do database.py
-
-Dodaj nową funkcję.
+    if create_indexes and index_columns:
+        for col in index_columns:
+            idx_name = sanitize_table_name(f"idx_{sanitized_table_name}_{col}")
+            sql = f"CREATE INDEX IF NOT EXISTS {idx_name} ON {sanitized_table_name}({col});"
+            cursor.execute(sql)
+        logging.info(f"Utworzono indeksy na kolumnach: {index_columns}")    
+    
+    # Konwersja wartości dat/czasu na format zgodny z SQLite
+    processed_df = convert_timestamps_in_df(processed_df)
+    
+    # Przygotowanie zapytania INSERT z placeholderami
+    placeholders = ", ".join(["?" for _ in processed_df.columns])
+    insert_query = f"INSERT INTO {sanitized_table_name} VALUES ({placeholders});"
+    
+    total_rows = len(processed_df)
+    print(f"[INFO] Rozpoczynam wstawianie {total_rows} wierszy do tabeli '{sanitized_table_name}' przy użyciu batch_size={batch_size}.")
+    
+    if total_rows <= batch_size:
+        # Jeśli rekordów nie więcej niż batch_size – jednorazowo
+        data_tuples = list(processed_df.itertuples(index=False, name=None))
+        cursor.executemany(insert_query, data_tuples)
+        conn.commit()
+    else:
+        # Wstawianie w partiach
+        for start in range(0, total_rows, batch_size):
+            end = min(start + batch_size, total_rows)
+            batch_df = processed_df.iloc[start:end]
+            data_tuples = list(batch_df.itertuples(index=False, name=None))
+            cursor.executemany(insert_query, data_tuples)
+            conn.commit()  # commit po każdej partii
+            print(f"[INFO] Wstawiono partie wierszy: {start} - {end}.")
+    
+    print(f"Tabela '{sanitized_table_name}' została utworzona i dane zostały zapisane.")
 
 def insert_into_existing_table(
     conn,
@@ -129,140 +206,1450 @@ def insert_into_existing_table(
         f"[insert_into_existing_table] Dopisano {total_inserted} wierszy do tabeli '{sanitized_table_name}'."
     )
 
-⸻
+def get_column_types(cursor, table_name):
+    """
+    Pobiera typy danych kolumn z tabeli SQLite.
+    """
+    cursor.execute(f"PRAGMA table_info({table_name});")
+    columns_info = cursor.fetchall()
+    return {col[1]: col[2] for col in columns_info}  # Słownik {nazwa_kolumny: typ_danych}
 
-Jak zmienić write_output_to_db(...)
+def get_sql_type(pandas_dtype):
+    """
+    Mapuje typ danych z Pandas na typy SQLite.
+    """
+    if pd.api.types.is_integer_dtype(pandas_dtype):
+        return "INTEGER"
+    elif pd.api.types.is_float_dtype(pandas_dtype):
+        return "REAL"
+    elif pd.api.types.is_bool_dtype(pandas_dtype):
+        return "INTEGER"
+    elif pd.api.types.is_datetime64_any_dtype(pandas_dtype):
+        return "DATETIME"
+    elif pd.api.types.is_object_dtype(pandas_dtype):
+        return "TEXT"
+    else:
+        raise ValueError(f"Unhandled pandas dtype: {pandas_dtype}")
 
-Znajdź funkcję write_output_to_db(...) i zmień jej sygnaturę na:
-
-def write_output_to_db(
-    output_df,
-    target_table_name,
-    params,
-    original_table_name=None,
-    currently_testing=False,
-    create_indexes=False,
-    index_columns=None,
-    insert_only=False
-):
-
-A potem w środku, tam gdzie dziś wołasz create_and_insert_processed_table(...), zamień logikę na taką:
-
-    conn = sqlite3.connect(
-        params['database'],
-        detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES
-    )
+def read_data_from_all_db(query, params, currently_testing):
+    print('jestem')
+    database_path='CashPredictor_X.db'
     try:
-        if insert_only:
-            insert_into_existing_table(
-                conn=conn,
-                processed_df=output_df,
-                target_table_name=target_table_name,
-                batch_size=params.get("data_limit", 500000)
-            )
+        with get_connection(database_path) as conn:
+            return pd.read_sql_query(query, conn, params=params)
+    except Exception as e:
+        logging.error(f"Failed to read data from database: {e}")
+        raise
+        
+def read_data_from_db(query, params, currently_testing=False, chunk_size=1_000_000):
+    if currently_testing:
+        database_path = params['test_database']
+    else:
+        database_path = params['database']
+    try:
+        with get_connection(database_path) as conn:
+            chunks = pd.read_sql_query(query, conn, params=params, chunksize=chunk_size)
+            all_chunks = []
+            for chunk in chunks:
+                float_cols = chunk.select_dtypes(include=["float64"]).columns
+                chunk[float_cols] = chunk[float_cols].astype("float32")
+                all_chunks.append(chunk)
+            df = pd.concat(all_chunks, ignore_index=True)
+            return df
+    except Exception as e:
+        logging.error(f"Failed to read data from database: {e}")
+        raise
+
+def sanitize_table_name(table_name):
+    sanitized_name = ''.join(c for c in table_name if c.isalnum() or c == '_')
+    print(f"Sanitized table name: Original='{table_name}', Sanitized='{sanitized_name}'")
+    return sanitized_name
+
+def standardize_dataframe_types(df, date_columns=None):
+    """
+    Wymusza standaryzację typów danych w DataFrame.
+    
+    :param df: DataFrame do standaryzacji.
+    :param date_columns: Lista kolumn, które powinny być konwertowane na datetime64[ns].
+    :return: Zaktualizowany DataFrame.
+    """
+    if date_columns:
+        for col in date_columns:
+            if col in df.columns and not pd.api.types.is_datetime64_any_dtype(df[col]):
+                df[col] = pd.to_datetime(df[col])
+    return df
+
+def write_output_to_db(df, table_name, params, original_table_name=None, currently_testing=False, create_indexes=False, index_columns=None, insert_only=False):
+    logging.info(f"Starting to write DataFrame to table: {table_name}")
+
+    if currently_testing:
+        database_path=params['test_database']
+    else:
+        database_path=params['database']
+        
+    logging.info(f"Attempting to write DataFrame to table: {table_name}")
+    with get_connection(database_path) as conn:
+        try:
+            if insert_only:
+                insert_into_existing_table(conn=conn, processed_df=df, target_table_name=table_name, batch_size=params.get("data_limit", 500000))
+            else:
+                create_and_insert_processed_table(conn, df, table_name, original_table_name, params['data_limit'], create_indexes=create_indexes, index_columns=index_columns)           
+        except Exception as e:
+            print(f"Failed to write DataFrame to table {table_name}: {e}")
+            conn.rollback()
+            raise
+    logging.info(f"Finished writing DataFrame to table: {table_name}")
+
+
+import pandas as pd
+import numpy as np
+import torch
+import os
+import logging
+import warnings
+from torch.utils.data import TensorDataset, DataLoader
+from torch import nn
+import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import skew, kurtosis, mode
+import matplotlib.pyplot as plt
+
+from mpl_toolkits.mplot3d import Axes3D
+from importlib import reload
+from database import read_data_from_db, write_output_to_db, read_data_from_all_db
+from datetime import datetime, timedelta
+from captum.attr import IntegratedGradients
+import math
+
+class NoDataError(Exception):
+    """Raised when query returns 0 rows for given client/time window."""
+    pass
+    
+def cap_fraction_power(n_clients: int,
+                       alpha: float = 0.5,
+                       min_frac: float = 0.05,
+                       max_frac: float = 1.0) -> float:
+    """
+    Power-law cap:
+      f(n) = c * n^(-alpha)
+    z ograniczeniami [min_frac, max_frac]
+    """
+    if n_clients <= 0:
+        return max_frac
+
+    frac = n_clients ** (-alpha)
+    frac = min(max_frac, frac)
+    frac = max(min_frac, frac)
+    return float(frac)
+    
+def explain_model_with_captum(model, X, device):
+    # Captum oczekuje skalaru; owijamy model tak, by zwracał wyłącznie głowę regresji jako [B,1]
+    class _RegWrapper(nn.Module):
+        def __init__(self, base):
+            super().__init__()
+            self.base = base
+        def forward(self, x):
+            reg_pred, _ = self.base(x)  # model multi-head zwraca (reg, logits)
+            return reg_pred.unsqueeze(-1)
+
+    X = X.to(device)
+    wrapped = _RegWrapper(model).to(device)
+    ig = IntegratedGradients(wrapped)
+    attributions, _ = ig.attribute(X, target=0, return_convergence_delta=True)
+    attributions_np = attributions.detach().cpu().numpy()
+    return attributions_np
+
+def aggregate_attributions(attributions_list, feature_names):
+    # Łączenie wszystkich wyników z batchy w jeden numpy array
+    all_attributions = np.concatenate(attributions_list, axis=0)
+
+    # Tworzenie DataFrame z wynikami
+    df_attributions = pd.DataFrame(all_attributions, columns=feature_names)
+
+    # Obliczanie zagregowanych wartości istotności (avg, min, max, std)
+    df_agg = pd.DataFrame({
+        'Feature': feature_names,  # Dodanie nazw kolumn
+        'avg_importance': df_attributions.mean(),
+        'std_importance': df_attributions.std(),
+        'min_importance': df_attributions.min(),
+        'max_importance': df_attributions.max()
+    })
+
+    # Dodawanie kolumn z wartościami bezwzględnymi
+    df_agg['abs_avg_importance'] = df_agg['avg_importance'].abs()
+    df_agg['abs_std_importance'] = df_agg['std_importance'].abs()
+    df_agg['abs_min_importance'] = df_agg['min_importance'].abs()
+    df_agg['abs_max_importance'] = df_agg['max_importance'].abs()
+
+    # Sortowanie według avg_importance malejąco
+    df_agg = df_agg.sort_values(by='avg_importance', ascending=False)
+
+    return df_agg
+
+class NeuralNetModel1(nn.Module):
+    def __init__(self, input_size, hidden_layers, output_size, n_classes=181, keep_regression_head=True):
+        super(NeuralNetModel1, self).__init__()
+        self.hidden_layer_1 = nn.Linear(input_size, hidden_layers[0])
+        self.hidden_layer_2 = nn.Linear(hidden_layers[0], hidden_layers[1])
+        self.hidden_layer_3 = nn.Linear(hidden_layers[1], hidden_layers[2])
+        self.hidden_layer_4 = nn.Linear(hidden_layers[2], output_size)
+        self.hidden_activation = nn.ReLU()
+
+        # --- Głowy wyjściowe ---
+        self.keep_regression_head = keep_regression_head
+        if keep_regression_head:
+            self.out = nn.Linear(output_size, 1)      # STARE: ciągła liczba dni
+        self.cls_head = nn.Linear(output_size, n_classes)  # NOWE: klasy 0..N (N = koszyk N+)
+
+    def forward(self, x):
+        x = self.hidden_layer_1(x)
+        x = self.hidden_layer_2(x)
+        x = self.hidden_layer_3(x)
+        x = self.hidden_layer_4(x)
+        h = self.hidden_activation(x)
+
+        logits = self.cls_head(h)                    # [B, N+1]
+        if self.keep_regression_head:
+            reg = self.out(h).squeeze(-1)           # [B]
         else:
-            create_and_insert_processed_table(
-                conn=conn,
-                processed_df=output_df,
-                target_table_name=target_table_name,
-                original_table_name=original_table_name,
-                create_indexes=create_indexes,
-                index_columns=index_columns
+            reg = None
+        return reg, logits
+
+class CustomLossModel1(nn.Module):
+    def __init__(self):
+        super(CustomLossModel1, self).__init__()
+        self.mse_loss = nn.MSELoss()
+
+    def forward(self, y_pred, y_true):
+        mse = self.mse_loss(y_pred, y_true)
+        total_loss = mse
+
+        return total_loss
+
+def get_modulo_condition(row_count, limit, invo_no_col, d=0):
+    """
+    Zwraca (divisor, condition_sql).
+    - Jeśli row_count <= limit → (None, "").
+    - Gdy nadmiar jest mały (row_count/limit ≤ 2): odrzucamy co g-ty wiersz:  AND (INVO_NO % g != 0)
+    - Gdy nadmiar jest duży (row_count/limit > 2): zostawiamy co k-ty wiersz: AND (INVO_NO % k = 0)
+    """
+    if limit is None or limit <= 0 or row_count <= limit:
+        return None, ""
+
+    over = row_count - limit
+    # Próg: gdy wierszy jest co najwyżej 2x więcej niż limit, lepsze jest „odrzucanie co g-ty”
+    if row_count / limit <= 2:
+        # Chcemy odrzucić ~over wierszy → g ≈ row_count / over
+        g = max(2, row_count // over)  # floor
+        # Korekta: upewnij się, że po odrzuceniu nie przekroczymy limitu
+        # (przybliżenie: zostaje row_count - floor(row_count/g))
+        while row_count - (row_count // g) > limit:
+            g += 1
+        condition_sql = f"AND (({invo_no_col} % {g}) != {d})"  # odrzucamy co g-ty
+        return g, condition_sql
+    else:
+        # Chcemy zostawić ~limit wierszy → k ≈ ceil(row_count / limit)
+        k = math.ceil(row_count / limit)
+        # Korekta: upewnij się, że po zostawieniu co k-tych nie przekroczysz limitu
+        # (przybliżenie: zostaje floor(row_count/k))
+        while (row_count // k) > limit:
+            k += 1
+        condition_sql = f"AND (({invo_no_col} % {k}) = {d})"  # zostawiamy co k-ty
+        return k, condition_sql
+
+def _parse_test_ids(raw_ids):
+    """
+    Akceptuje: None / 'ALL' / 'all' / liczba / '6017' / '6017,619' / '[6017, 619]'
+    Zwraca: list[int] lub None (dla ALL).
+    """
+    if raw_ids is None:
+        return None
+    if isinstance(raw_ids, (list, tuple, set)):
+        ids = [int(x) for x in raw_ids]
+        return ids if len(ids) > 0 else None
+    s = str(raw_ids).strip()
+    if s.lower() in ("all", ""):
+        return None
+    # lista w stringu
+    if s.startswith("[") and s.endswith("]"):
+        import ast
+        try:
+            arr = ast.literal_eval(s)
+            return [int(x) for x in arr]
+        except Exception:
+            pass
+    # csv
+    if "," in s:
+        return [int(x.strip()) for x in s.split(",") if x.strip()]
+    # pojedyncza liczba
+    try:
+        return [int(s)]
+    except ValueError:
+        return None
+
+def build_client_filter_sql(params):
+    """
+    Zwraca string typu 'AND <client_id_col> IN (..)' albo '' dla ALL.
+    Wymaga: params['client_id_col'] (np. 'INVO_DEBC_NO' lub 'CLIENT_ID').
+    Źródło ID: params['test_client_id'] (lista, csv, '[..]' lub 'ALL').
+    """
+    col = params.get('client_id_col') 
+    ids = _parse_test_ids(params.get('test_client_id'))
+    if col and ids:
+        in_list = ",".join(str(i) for i in sorted(set(ids)))
+        return f"AND {col} IN ({in_list})"
+    return ""  # ALL        
+
+def preprocess_data_model1(data_start, data_end, params, operation_mode='test', currently_testing=False, train_on_all=False):
+    query_template = params['sql_query_train'] if not currently_testing else params['sql_query_test']
+    base_query = query_template.format(data_start=data_start, data_end=data_end).rstrip().rstrip(";")
+
+    # 1) klient-filter (jeśli masz) MUSI być doklejony do base_query i do countów
+    client_filter_sql = build_client_filter_sql(params)
+    if client_filter_sql:
+        base_query_with_filter = f"{base_query}\n{client_filter_sql}"
+        logging.info(f"[first_model] Using client filter: {client_filter_sql}")
+    else:
+        base_query_with_filter = base_query
+        logging.info("[first_model] Client filter: ALL (no filtering)")
+
+    # 2) policz row_count bazowego selekta (to jest "przed dodaniem warunku 10%")
+    base_count_query = f"SELECT COUNT(*) as row_count FROM ({base_query_with_filter}) q"
+    df_base_count = read_data_from_db(base_count_query, params, currently_testing=currently_testing)
+    row_count_base = int(df_base_count['row_count'].iloc[0])
+
+    # 3) build query (na start = bazowy)
+    query = base_query_with_filter
+
+    # 4) TRAIN-ONLY: cap per klient = 10% globalnego wyniku bazowego
+    if operation_mode == 'train':
+        per_client_count_query = f"""
+        SELECT INVO_CLNTNO, COUNT(*) AS cnt
+        FROM ({base_query_with_filter}) q
+        GROUP BY INVO_CLNTNO
+        """
+        df_pc = read_data_from_db(per_client_count_query, params, currently_testing=currently_testing)
+    
+        # 2) lista klientów pochodzi z danych (to jest dawny CAPPED_CLIENTS)
+        capped_clients = sorted(df_pc["INVO_CLNTNO"].astype(int).unique().tolist())
+        clients_csv = ",".join(str(x) for x in capped_clients)
+    
+        # 3) dynamiczny cap_frac zależny od liczby klientów
+        n_clients = len(capped_clients)
+        cap_frac = cap_fraction_power(n_clients, alpha=0.5, min_frac=0.05)
+        cap_global = max(1, int(row_count_base * cap_frac))
+    
+        invo_no_col = params['invoice_id']  # np. INVO_NO
+    
+        capped_conditions = []
+        capped_clients_over = []
+    
+        for _, r in df_pc.iterrows():
+            cl = int(r["INVO_CLNTNO"])
+            cnt = int(r["cnt"])
+    
+            if cnt > cap_global:
+                # ✅ TU używamy Twojej funkcji get_modulo_condition
+                div, cond = get_modulo_condition(cnt, limit=cap_global, invo_no_col=invo_no_col, d=1)
+    
+                # cond ma postać np.: "AND ((INVO_NO % 17) = 0)" albo "AND ((INVO_NO % 5) != 0)"
+                cond_inner = cond.strip()
+                if cond_inner.upper().startswith("AND"):
+                    cond_inner = cond_inner[3:].strip()
+    
+                capped_clients_over.append(cl)
+                capped_conditions.append(f"(INVO_CLNTNO = {cl} AND ({cond_inner}))")
+    
+                print(f"[CAP] client={cl} cnt={cnt} > {cap_global} -> divisor={div} cond={cond_inner}")
+    
+        if capped_conditions:
+            # warunek: pozostali klienci bez zmian; klienci z listy:
+            # - jeśli nie przekroczyli capa -> bez zmian
+            # - jeśli przekroczyli -> filtr modulo z get_modulo_condition
+            where_cap = f"""
+            AND (
+                INVO_CLNTNO NOT IN ({clients_csv})
+                OR
+                (
+                    INVO_CLNTNO IN ({clients_csv})
+                    AND (
+                        INVO_CLNTNO NOT IN ({",".join(map(str, capped_clients_over))})
+                        OR
+                        {" OR ".join(capped_conditions)}
+                    )
+                )
             )
-    finally:
-        conn.close()
+            """
+    
+            # ✅ WAŻNE: nie doklejamy AND na koniec surowego SELECT-a,
+            # tylko owijamy go i dopiero dajemy WHERE 1=1
+            query = f"SELECT * FROM ({query}) q WHERE 1=1 {where_cap}"
+        else:
+            print("[CAP] No clients exceeded cap_global, no cap filter applied.")
 
-Jeśli u Ciebie write_output_to_db(...) ma trochę inną strukturę, to sens ma być dokładnie ten:
+    # 5) Teraz dopiero Twój globalny limiter rows_limit (jak dotychczas)
+    # policz count query z AKTUALNEGO query (już po cap)
+    final_count_query = f"SELECT COUNT(*) as row_count FROM ({query}) q"
+    df_count = read_data_from_db(final_count_query, params, currently_testing=currently_testing)
+    row_count = int(df_count['row_count'].iloc[0])
+    if row_count == 0:
+        # ważne: log, żebyś wiedział DLACZEGO skip
+        logging.info(f"[SKIP] preprocess_data_model1: row_count=0 for range {data_start}..{data_end}, operation_mode={operation_mode}")
+        raise NoDataError(f"No data for {data_start}..{data_end} op={operation_mode}")    
 
-* insert_only=True -> wywołuje nowy append
-* insert_only=False -> wywołuje stary create+insert
+    limit = params['rows_limit']
+    invo_no_col = params['invoice_id']
+    divisor, condition_sql = get_modulo_condition(row_count, limit=limit, invo_no_col=invo_no_col)
 
-⸻
+    if divisor is not None:
+        print(f"[INFO] row_count={row_count} > {limit}, divisor={divisor}, dopinam: {condition_sql}")
+        query = f"{query}\n{condition_sql}"
+    else:
+        print(f"[INFO] row_count={row_count} <= {limit} => pobieram wszystkie wiersze.")
 
-Jak zmienić wywołanie w first_model.py
+    # 6) fetch
+    if train_on_all:
+        df = read_data_from_all_db(query, params, currently_testing=currently_testing)
+    else:
+        df = read_data_from_db(query, params, currently_testing=currently_testing)
 
-Tam, gdzie zapisujesz do first_model_tab, zmień wywołanie na:
+    df = df.fillna(0)
+    data_zaplaty_column = params['clear_date']
+    df[data_zaplaty_column] = pd.to_datetime(df[data_zaplaty_column], errors='coerce')
+    selected_columns = df[params['return_columns']] if params.get('return_columns') else None
 
-write_output_to_db(
-    final_output_df,
-    'first_model_tab',
-    params,
-    original_table_name='first_model_tab',
-    currently_testing=True,
-    create_indexes=False,
-    index_columns=None,
-    insert_only=True
-)
+    df[params['clear_days']] = np.clip(df[params['clear_days']], 1, 365)
+    
+    original_columns = df.columns.tolist()
+    
+    non_numeric_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
 
-⸻
+    for col in non_numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-Dodatkowo: co jeszcze sprawdzić
 
-Żeby to działało poprawnie, tabela first_model_tab musi już istnieć i mieć zgodny schemat. Czyli:
+    colums_to_remove = params['non_numeric_cols']
+    df = df.drop(columns=[col for col in colums_to_remove if col in df.columns], errors='ignore', axis=1)
+    licz_korelacje = 'false'
+    if licz_korelacje == 'true':
+        # --- wybór kolumn do korelacji ---
+        target_col = params['clear_days']  # UWAGA: musi być string z nazwą kolumny
+        feature_cols = [c for c in df.columns if c != target_col]
+        all_cols = feature_cols + [target_col]
+        
+        # --- próbka (żeby nie zabić RAMu) ---
+        SAMPLE_N_PEARSON  = 1_000_000
+        SAMPLE_N_SPEARMAN = 200_000   # spearman jest cięższy
+        
+        df_all = df[all_cols]
+        
+        df_p = df_all.sample(n=min(SAMPLE_N_PEARSON, len(df_all)), random_state=42) if len(df_all) > SAMPLE_N_PEARSON else df_all
+        df_s = df_all.sample(n=min(SAMPLE_N_SPEARMAN, len(df_all)), random_state=42) if len(df_all) > SAMPLE_N_SPEARMAN else df_all
+        
+        # --- korelacje ---
+        corr_p = df_p.corr(method='pearson')
+        corr_s = df_s.corr(method='spearman')
+        
+        # --- korelacja feature -> target (super do leakage / kandydatów) ---
+        corr_to_target_p = df_p[feature_cols].corrwith(df_p[target_col], method="pearson") \
+                                            .sort_values(key=lambda s: s.abs(), ascending=False)
+        
+        corr_to_target_s = df_s[feature_cols].corrwith(df_s[target_col], method="spearman") \
+                                            .sort_values(key=lambda s: s.abs(), ascending=False)
+        
+        # --- export do Excela ---
+        out_xlsx = r"C:\Users\OE00SG\CashPredictor\dev3\wyniki\corr_matrix_sample.xlsx"
+        with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
+            corr_p.to_excel(w, sheet_name="corr_p")
+            corr_s.to_excel(w, sheet_name="corr_s")
+            corr_to_target_p.to_frame("pearson_to_target").to_excel(w, sheet_name="to_target_p")
+            corr_to_target_s.to_frame("spearman_to_target").to_excel(w, sheet_name="to_target_s")
+        
+        print("Saved:", out_xlsx, "shape pearson:", corr_p.shape, "shape spearman:", corr_s.shape)
+        print("Top pearson->target:\n", corr_to_target_p.head(30))
+        print("Top spearman->target:\n", corr_to_target_s.head(30))
+        
+    remaining_columns = df.columns.tolist()
+    removed_columns = set(original_columns) - set(remaining_columns)
 
-* w db_init.py musi być:
+    # # --- START 20260110 DROP LEAKY "F*" FEATURES (z wyjątkami) ---
+    
+    # explicit_keep_cols = {
+    #     "FROM_DZIEN_TO_INVO_INVDATE",
+    #     "FROM_DZIEN_TO_INVO_DUEDATE",
+    # }    
+    
+    # cols_before = df.columns.tolist()
+    
+    # to_drop = [
+    #     c for c in df.columns
+    #     if (
+    #         c not in explicit_keep_cols
+    #         and c.startswith("F")
+    #         and any(ch.isdigit() for ch in c)
+    #     )
+    # ]
+    
+    # df = df.drop(columns=to_drop, errors="ignore")
+    
+    # print(f"[LEAKAGE DROP] dropped={len(to_drop)} columns")
+    # print(f"[LEAKAGE DROP] kept explicit={explicit_keep_cols}")
+    # print(f"[LEAKAGE DROP] columns before={len(cols_before)} after={len(df.columns)}")
+    
+    # # --- STOP 20260110 DROP LEAKY "F*" FEATURES (z wyjątkami) ---
+    
+    feature_names = df.drop(params['clear_days'], axis=1).columns.tolist()
 
-exec_sql(conn, params.get("query_create_first_model_tab"), "query_create_first_model_tab")
+    # Następnie wywołujesz get_invoice_date_column_positions:
+    invoice_date_column_positions = get_invoice_date_column_positions(df, params)
 
-* i schemat tej tabeli musi zawierać także:
-    * RunIdentifier
-    * oraz inne nowe kolumny, które dodajesz przed insertem
+    X_np = df.drop(params['clear_days'], axis=1).values
+    input_size = X_np.shape[1]
+    y_np = df[params['clear_days']].values
 
-Bo nowa funkcja nie tworzy tabeli, tylko zakłada gotowy schemat.
+    if selected_columns is not None and not selected_columns.empty:
+        return (X_np, y_np, input_size, selected_columns, feature_names, invoice_date_column_positions)
+    else:
+        # jak trenujesz model dla wielu kleintów, to podaj w test id te same co w train id bo inaczej wpadnie tutaj        
+        return (X_np, y_np, input_size, feature_names, invoice_date_column_positions)
 
-⸻
+def compute_mean_std_model1(X):
+    mean = np.mean(X, axis=0)
+    std = np.std(X, axis=0)
+    return mean, std
 
-Dlaczego to podejście jest najlepsze teraz
+def normalize_data_model1(X, mean, std):
+    return (X - mean) / (std + 1e-10)
 
-Bo:
+def prepare_for_training(train_start, train_end, operation_mode, params, device):
+    is_training = True
+    model_id=1
+    X_train_np, y_train_np, input_size, additional_data, feature_names, invoice_date_column_positions = preprocess_data_model1(train_start, train_end, params, operation_mode=operation_mode,currently_testing=False, train_on_all=False)
+    
+    # Pominięcie wierszy z NULL w kolumnie daty zapłaty dla treningu
+    valid_indices = ~np.isnan(y_train_np)
+    X_train_np = X_train_np[valid_indices]
+    y_train_np = y_train_np[valid_indices]   
 
-* nie rozwalasz starej logiki tam, gdzie nadal może być potrzebna,
-* dokładnie rozdzielasz dwa tryby:
-    * rebuild tabeli
-    * append do istniejącej tabeli
-* łatwiej to potem wykorzystać też dla innych wynikowych tabel, nie tylko first_model_tab
+    # Wyświetlenie ilości wierszy pominiętych w stosunku do wszystkich
+    total_rows = len(y_train_np) + sum(~valid_indices)
+    skipped_rows = sum(~valid_indices)
+    print(f"Pominięto {skipped_rows} z {total_rows} wierszy (NULL w kolumnie daty zapłaty).")
+    
+    X_train, X_test, y_train, y_test = train_test_split(X_train_np, y_train_np, test_size=0.01, random_state=42)
+    mean_np, std_np = compute_mean_std_model1(X_train)
+    mean = torch.from_numpy(mean_np).to(device).to(torch.float32)
+    std = torch.from_numpy(std_np).to(device).to(torch.float32)
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float).to(device)
+    y_train_tensor = torch.tensor(y_train.reshape((-1, 1)), dtype=torch.float).to(device)
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    train_dataloader = DataLoader(train_dataset, batch_size=params['batch_size'], shuffle=True, drop_last=True)
+    
+    X_test_tensor = torch.tensor(X_test, dtype=torch.float).to(device)
+    y_test_tensor = torch.tensor(y_test.reshape((-1, 1)), dtype=torch.float).to(device)
+    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+    test_dataloader = DataLoader(test_dataset, batch_size=params['batch_size'], shuffle=False, drop_last=True)
+    
+    return train_dataloader, test_dataloader, mean, std, input_size, model_id, invoice_date_column_positions
 
-Czyli architektonicznie:
+def prepare_for_testing(test_start, test_end, operation_mode, params, device):
+    is_training = False
+    model_id=1
+    X_test_np, y_test_np, input_size, additional_data, feature_names, invoice_date_column_positions = preprocess_data_model1(test_start, test_end, params, operation_mode=operation_mode, currently_testing=True)
+    X_test_tensor = torch.tensor(X_test_np, dtype=torch.float).to(device)
+    y_test_tensor = torch.tensor(y_test_np.reshape((-1, 1)), dtype=torch.float).to(device)
+    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+    test_dataloader = DataLoader(test_dataset, batch_size=params['batch_size'], shuffle=False, drop_last=(operation_mode not in params['test_modes']))
+    return test_dataloader, additional_data, input_size, model_id, feature_names, invoice_date_column_positions
 
-* create_and_insert_processed_table(...) = tryb bootstrap / recreate
-* insert_into_existing_table(...) = tryb produkcyjny / append
+def get_train_test_params(params, operation_mode, t0, acceptance_period, retrain_period):
+    default_params = {
+        "model_path": params['model_path'],
+        "train_start": datetime.strptime(params['train_start'], '%Y-%m-%d').date(),
+        "train_end": t0 - timedelta(days=acceptance_period),
+        "test_start": t0 - timedelta(days=acceptance_period),
+        "test_end": t0 - timedelta(days=1),
+    }
 
-To jest dużo czystsze niż dokładanie kolejnych if table_name == ....
+    mode_params = {
+        "test_today": {
+            "test_start": t0,
+            "test_end": t0
+        },
+        "acceptance_test": {
+            "test_end":  t0 + timedelta(days=acceptance_period)
+        },
+        "test_to_the_end": {
+            "test_start": t0,
+            "test_end": datetime.strptime(params['test_end'], '%Y-%m-%d').date()
+        },
+        "train": {
+            "train_end": t0 - timedelta(days=1)
+        },
+        "retrain_periods": {
+            "train_end": t0 - timedelta(days=1)
+        },
+        "train_and_acceptance_test": {
+            "train_start": datetime.strptime(params['train_start'], '%Y-%m-%d').date(),
+            "train_end": t0 - timedelta(days=1) - timedelta(days=acceptance_period),
+            "test_start": t0 - timedelta(days=1) - timedelta(days=acceptance_period),
+            "test_end": t0 - timedelta(days=1)
+        },
+        "both": {},
+        "test_to_today": {
+            "test_start": datetime.strptime(params['train_start'], '%Y-%m-%d').date(),
+            "test_end": t0
+        },
 
-⸻
+        "test_null_to_today": {
+            "test_start": datetime.strptime(params['train_start'], '%Y-%m-%d').date(),
+            "test_end": t0
+        }
+    }
 
-Minimalny zestaw zmian
+    selected_params = mode_params.get(operation_mode, {})
+    final_params = {**default_params, **selected_params}
+    # 30122025 START dla 100 klientów nie da się przekazać tak długiej nazwy
+    return (final_params['model_path'], final_params['test_start'], final_params['test_end'], final_params['train_start'], final_params['train_end'])
+    # return ('C:/Users/OE00SG/CashPredictor/dev3/model/first_model_FULL_2026-03-02.pt', final_params['test_start'], final_params['test_end'], final_params['train_start'], final_params['train_end'])
+    # 30122025 STOP
+    
+def train_model1(dataloader, model, reg_loss_fn, ce_loss_fn, optimizer, mean, std, device, params, N, alpha, beta):
+    model.train()
+    train_loss = 0.0
+    for X, y in dataloader:
+        X, y = X.to(device), y.to(device)  # y: [B,1]
+        # sanity
+        X = torch.where(torch.isnan(X) | torch.isinf(X), torch.tensor(0.0, device=X.device), X)
+        X = normalize_data_model1(X, mean, std)
 
-W database.py
+        # targety
+        y_days = y.squeeze(-1)                                # [B]
+        cls_target = torch.clamp(y_days.round().long(), 0, N) # indeks klasy 0..N
 
-Dodać:
+        optimizer.zero_grad()
+        reg_pred, logits = model(X)                           # reg:[B], logits:[B,N+1]
 
-* insert_into_existing_table(...)
+        # straty
+        loss_reg = reg_loss_fn(reg_pred, y_days)
+        loss_cls = ce_loss_fn(logits, cls_target)
+        loss = alpha * loss_cls + beta * loss_reg
 
-Zmienić:
+        train_loss += loss.item()
+        loss.backward()
+        optimizer.step()
 
-* write_output_to_db(..., insert_only=False)
+    avg_loss = train_loss / max(1, len(dataloader))
+    logging.info(f'train total loss: {avg_loss:.6f}')
+    return avg_loss
 
-W first_model.py
+def extract_date_info(X, params, invoice_date_column_positions, wyodrebnij_date=False):
+    # Pobieranie kolumn na podstawie pozycji z invoice_date_column_positions
+    DNI_OD_UTWORZENIA = X[:, invoice_date_column_positions['DNI_OD_UTWORZENIA']].long()
+    UTW_DZIEN_TYG = X[:, invoice_date_column_positions['UTW_DZIEN_TYG']].long()
+    if wyodrebnij_date:
+        UTW_DZIEN_MIESIACA = X[:, invoice_date_column_positions['UTW_DZIEN_MIESIACA']].long()
+        UTW_MIESIAC = X[:, invoice_date_column_positions['UTW_MIESIAC']].long()
+        UTW_ROK = X[:, invoice_date_column_positions['UTW_ROK']].long()
+        return DNI_OD_UTWORZENIA, UTW_DZIEN_TYG, UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK
+    else:
+        return DNI_OD_UTWORZENIA, UTW_DZIEN_TYG
 
-Zmienić wywołanie:
+def get_invoice_date_column_positions(df, params):
+    positions = {
+        'UTW_DZIEN_TYG': df.columns.get_loc(params['UTW_DZIEN_TYG']),
+        'UTW_DZIEN_MIESIACA': df.columns.get_loc(params['UTW_DZIEN_MIESIACA']),
+        'UTW_MIESIAC': df.columns.get_loc(params['UTW_MIESIAC']),
+        'UTW_ROK': df.columns.get_loc(params['UTW_ROK']),
+        'DNI_OD_UTWORZENIA': df.columns.get_loc(params['DNI_OD_UTWORZENIA']),
+    }
 
-* insert_only=True
+    return positions
 
-W db_init.py
+def adjust_past_predictions(predicted_days, initial_weekday, DNI_OD_UTWORZENIA, params):
+    next_days_probabilities = params['next_days_probabilities']
+    shift_options = {
+        6: params['shift_options6'],
+        5: params['shift_options5'],
+        4: params['shift_options4'],
+        3: params['shift_options3'],
+        2: params['shift_options2'],
+        1: params['shift_options1'],
+        0: params['shift_options0']
+    }
+    
+    shifted_days = torch.zeros_like(predicted_days, dtype=torch.float32, device=predicted_days.device)
+    adjusted_predicted_days = predicted_days.clone()
+    
+    # Iteracja po wszystkich prognozach
+    for i in range(len(predicted_days)):
+        # Przesuwanie, dopóki estymacja jest wcześniejsza niż aktualny dzień
+        while DNI_OD_UTWORZENIA[i] > adjusted_predicted_days[i]:
+            est_weekday = (initial_weekday[i] + adjusted_predicted_days[i]) % 7
+            est_weekday_val = int(est_weekday.item())  # Pobranie estymowanego dnia tygodnia
 
-Upewnić się, że first_model_tab jest tworzona wcześniej.
+            shift_option = shift_options[est_weekday_val]  # Pobranie opcji przesunięcia
+            # Losowanie przesunięcia na podstawie opcji dla danego dnia tygodnia
+            chosen_shift = np.random.choice(shift_option, p=next_days_probabilities)
+            adjusted_predicted_days[i] += chosen_shift
 
-⸻
+    return adjusted_predicted_days
 
-Uwaga na jeszcze jeden szczegół
+def adjust_predicted_days_for_holidays(predicted_days, UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK, params):
+    # Pobranie dat świątecznych z bazy danych
+    holiday_dates_df = read_data_from_db(params['sql_query_holidays'], params, currently_testing=False)
 
-Jeżeli chcesz później odróżniać runy i nie mieszać ich logicznie, to oprócz RunIdentifier warto dodać też:
+    if isinstance(holiday_dates_df, pd.DataFrame):
+        holiday_dates_raw = holiday_dates_df['data'].tolist()
+    else:
+        holiday_dates_raw = holiday_dates_df
 
-final_output_df["InsertTimestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Konwersja Timestamp do date
+    holiday_dates = set()
+    for day in holiday_dates_raw:
+        if isinstance(day, pd.Timestamp):
+            holiday_dates.add(day.date())
+        elif isinstance(day, str):
+            holiday_dates.add(datetime.strptime(day, "%Y-%m-%d").date())
 
-i dodać tę kolumnę do schematu tabeli.
+    # Konwersja przewidywanych dni na daty
+    try:
+        predicted_dates = [
+            datetime(UTW_ROK[i].item(), UTW_MIESIAC[i].item(), UTW_DZIEN_MIESIACA[i].item()) + 
+            timedelta(days=int(predicted_days[i].item())) 
+            for i in range(len(predicted_days))
+        ]
+    except OverflowError:
+        print("Błąd: Przewidywana liczba dni jest zbyt duża do konwersji. Prawdopodobnie należy powtórzyć trening.")
+        return None
 
-⸻
+    adjusted_predicted_days = predicted_days.clone().fill_(0)
 
-Jeżeli chcesz, mogę Ci w następnym kroku rozpisać gotowy kompletny kod całego write_output_to_db(...) po zmianie, już w formie „wklej zamiast obecnej funkcji”.
+    for i, date in enumerate(predicted_dates):
+        original_date = date
+        while date.date() in holiday_dates:
+            date += timedelta(days=1)
+        
+        final_shift = (date - original_date).days
+        adjusted_predicted_days[i] = final_shift
+
+    return predicted_days + adjusted_predicted_days
+    
+def adjust_predicted_days_for_weekends(predicted_days, initial_weekday, UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK, DNI_OD_UTWORZENIA, params):
+    from1 = params['from1']
+    from2 = params['from2']
+    probabilities1 = params['probabilities1']
+    probabilities2 = params['probabilities2']
+
+    # Upewnij się, że to wektory 1D [B]
+    predicted_days = predicted_days.view(-1)      # [B]
+    initial_weekday = initial_weekday.view(-1)    # [B]
+
+    # KLUCZ: dodajemy element-po-elemencie, bez unsqueeze(1)
+    predicted_weekday = (initial_weekday + torch.round(predicted_days).long()) % 7  # [B]
+
+    adjusted_predicted_days = predicted_days.clone()
+    shifted_days = predicted_days.clone().fill_(0)
+
+    for i in range(len(predicted_days)):
+        wday = int(predicted_weekday[i].item())  # skalar
+        if wday == 5:
+            chosen_shift = np.random.choice(from1, p=probabilities1)
+            shifted_days[i] = chosen_shift
+        elif wday == 6:
+            chosen_shift = np.random.choice(from2, p=probabilities2)
+            shifted_days[i] = chosen_shift
+
+    adjusted_predicted_days += shifted_days
+    return adjusted_predicted_days
+
+def adjust_predicted_days(predicted_days, initial_weekday, UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK, DNI_OD_UTWORZENIA, params):
+
+    out_holidays = adjust_predicted_days_for_holidays(predicted_days, UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK, params)
+
+    out_weekends = adjust_predicted_days_for_weekends(out_holidays, initial_weekday, UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK, DNI_OD_UTWORZENIA, params)
+
+    out_past = adjust_past_predictions(out_weekends, initial_weekday, DNI_OD_UTWORZENIA, params)
+    
+    return out_past
+
+def _build_shift_kernels(params, device):
+    """
+    Zwraca:
+      - shift_list: dict weekday-> 1D LongTensor z dozwolonymi przesunięciami (np. [1,2,3])
+      - prob_list:  dict weekday-> 1D FloatTensor z wagami tych przesunięć (sum=1)
+    """
+    # globalne wagi (tak jak w regresji)
+    base_p = torch.tensor(params['next_days_probabilities'], dtype=torch.float32, device=device)
+    base_p = base_p / base_p.sum()
+
+    shift_list, prob_list = {}, {}
+    for w in range(7):
+        opts = params[f'shift_options{w}']  # np. [1,2,3]
+        s = torch.tensor(opts, dtype=torch.long, device=device)
+        # dopasuj długość – jeżeli base_p ma inną długość niż opts, renormalizujemy po przycięciu
+        p = base_p[:len(opts)].clone()
+        p = p / p.sum()
+        shift_list[w] = s
+        prob_list[w]  = p
+    return shift_list, prob_list
+
+def _redistribute_masked_mass(probs, mask_allowed, initial_weekday, device, N, shift_list, prob_list, max_extra_shift=30):
+    """
+    probs: [B, N+1] (ostatnia kolumna = bucket N_plus)
+    mask_allowed: [B, N+1] w {0,1} — 1 = dozwolone, 0 = wyciąć (dla index=N maskę zwykle 1)
+    initial_weekday: [B] w {0..6} — weekday daty bazowej (UTW_DZIEN_TYG)
+    N: max dzień (ostatnia klasa = N_plus)
+    shift_list, prob_list: słowniki weekday-> tensory shiftów i wag (sum=1)
+    max_extra_shift: zabezpieczenie, by nie iterować w nieskończoność,
+                    gdy kolejne cele też są niedozwolone (np. długi okres świąt/weekendów)
+    Zwraca: probs po przerozdziale.
+    """
+    B = probs.size(0)
+    device = probs.device
+    # Kopie robocze
+    out = probs.clone()
+    # Wycinamy masę z zakazanych pozycji (0..N-1). N_plus (kol. N) zwykle nie maskujemy.
+    illegal_mass = out * (1 - mask_allowed)
+    out = out * mask_allowed  # zero w miejscach zabronionych
+
+    # Rozlewamy masę z zakazanych pozycji – dzień po dniu
+    # Przechodzimy po dniach 0..N-1 (klasy zwykłe)
+    for d in range(N):
+        # masa do przeniesienia z dnia d: [B]
+        m = illegal_mass[:, d]  # [B]
+        if torch.all(m == 0):
+            continue
+
+        # Weekday tego dnia: (initial_weekday + d) % 7
+        wday = (initial_weekday + d) % 7  # [B]
+
+        # Dla każdego z 7 wday mamy różne shift-listy i wagi
+        # Zrobimy 7 masek i rozlejemy hurtowo (bez pętli po B)
+        for w in range(7):
+            mask_w = (wday == w)
+            if mask_w.any():
+                m_w = m[mask_w]  # [b_w]
+                if torch.all(m_w == 0):
+                    continue
+                shifts = shift_list[w]  # [S]
+                weights = prob_list[w]  # [S], sum=1
+
+                # targety = d + shift
+                targets = d + shifts  # [S]
+                # kopiujemy, by nie modyfikować oryginału
+                targets_clamped = targets.clone()
+
+                # te > N-1 trafiają do N_plus (indeks N)
+                to_plus = (targets_clamped > (N - 1))
+                targets_clamped[to_plus] = N  # koszyk plus
+
+                # Zderzenie z kolejną maską: jeżeli target też zablokowany,
+                # to w pętli przesuwamy o dodatkowe 1,2,.. aż do max_extra_shift lub do koszyka N_plus.
+                # (lekka pętla po S jest akceptowalna, S zwykle mała: 2–5)
+                # Uwaga: mask_allowed różni się per próbka, więc sprawdzamy na wycinku mask_w
+                for _ in range(max_extra_shift):
+                    # sprawdź gdzie wciąż trafiamy w zabronione (i nie jest to N_plus)
+                    bad = (targets_clamped < N) & (mask_allowed[mask_w, targets_clamped] == 0)
+                    if not bad.any():
+                        break
+                    # spróbuj przesunąć o +1 (w stronę przyszłości)
+                    targets_clamped[bad] += 1
+                    # wszystko co wyjedzie poza N-1 -> N_plus
+                    over = targets_clamped > (N - 1)
+                    targets_clamped[over] = N
+
+                # Teraz rozlewamy m_w * weights na out[mask_w, targets_clamped]
+                # Każda próbka z mask_w dostaje ten sam rozkład wag z dnia d.
+                # Zbudujemy macierz przydziałów: [b_w, S]
+                alloc = m_w.unsqueeze(1) * weights.unsqueeze(0)  # [b_w, S]
+
+                # Suma do N_plus oraz na poszczególne dni
+                # Niestety targets_clamped ma kształt [S]; musimy zebrać po kolumnach S.
+                # Zrobimy pętlę po S (zwykle małą).
+                for j in range(len(shifts)):
+                    t = targets_clamped[j].item()  # int
+                    out[mask_w, t] += alloc[:, j]
+
+    # Renormalizacja (na wszelki wypadek numeryczny)
+    out = out / (out.sum(dim=1, keepdim=True) + 1e-12)
+    return out
+
+def _mask_weekends(B, N, initial_weekday, device):
+    """
+    Zwraca maskę [B,N+1] w {0,1}: sob/nd (5/6) = 0, reszta = 1; kolumna N_plus = 1.
+    """
+    days = torch.arange(N, device=device).view(1, -1).expand(B, -1)  # [B,N]
+    wday = (initial_weekday.view(-1,1) + days) % 7                  # [B,N]
+    allowed = ((wday != 5) & (wday != 6)).float()                   # [B,N]
+    allowed = torch.cat([allowed, torch.ones(B,1, device=device)], dim=1)  # N_plus
+    return allowed
+
+def _mask_past(B, N, dni_od_utworzenia, device):
+    """
+    Maska [B,N+1]: dni < dni_od_utworzenia = 0; reszta = 1; N_plus = 1
+    """
+    d = torch.arange(N, device=device).view(1, -1)                      # [1,N]
+    cutoff = dni_od_utworzenia.view(-1,1)                               # [B,1]
+    allowed = (d >= cutoff).float().expand(d.size(0), -1)               # [B,N]
+    allowed = allowed.clone()  # expand zwraca view; chcemy realny tensor
+    allowed = torch.cat([allowed, torch.ones(B,1, device=device)], dim=1)
+    return allowed
+
+def _mask_holidays(UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK, holidays_set, N, device):
+    """
+    Zwraca maskę [B,N+1] w {0,1}: święta=0, reszta=1; N_plus=1
+    holidays_set: zbiór pythonowy (set) dat.date()
+    Uwaga: generuje pętlę po B (bo set działa w Pythonie). Dla N~180 i B~kilkaset jest OK.
+    """
+    B = UTW_ROK.size(0)
+    allowed = torch.ones(B, N+1, device=device)
+    allowed[:, N] = 1.0  # plus-bucket zawsze dozwolony
+
+    for i in range(B):
+        try:
+            base = datetime(int(UTW_ROK[i].item()), int(UTW_MIESIAC[i].item()), int(UTW_DZIEN_MIESIACA[i].item()))
+        except Exception:
+            # jeżeli baza zła, nie maskuj (albo zamaskuj wszystko — zależnie od preferencji)
+            continue
+        row = torch.ones(N, device=device)
+        for d in range(N):
+            if (base + timedelta(days=int(d))).date() in holidays_set:
+                row[d] = 0.0
+        allowed[i, :N] = row
+    return allowed
+
+def adjust_pmf(probs,  # [B,N+1]
+               initial_weekday,  # [B]
+               UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK,  # [B] int
+               DNI_OD_UTWORZENIA,  # [B] int
+               params, N, device, holidays_set=None):
+    """
+    Zastosuj kolejno: święta -> weekendy -> przeszłość,
+    po każdej fazie przerozdziel masę z pozycji zabronionych do przodu wg shift-kerneli.
+    """
+    shift_list, prob_list = _build_shift_kernels(params, device)
+
+    out = probs.clone()
+
+    # 1) ŚWIĘTA (opcjonalnie)
+    if holidays_set is not None:
+        m_h = _mask_holidays(UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK, holidays_set, N, device)
+        out = _redistribute_masked_mass(out, m_h, initial_weekday, device, N, shift_list, prob_list)
+
+    # 2) WEEKENDY
+    m_w = _mask_weekends(out.size(0), N, initial_weekday, device)
+    out = _redistribute_masked_mass(out, m_w, initial_weekday, device, N, shift_list, prob_list)
+
+    # 3) PRZESZŁOŚĆ
+    m_p = _mask_past(out.size(0), N, DNI_OD_UTWORZENIA, device)
+    out = _redistribute_masked_mass(out, m_p, initial_weekday, device, N, shift_list, prob_list)
+
+    return out
+
+def predict_model1(dataloader, model, mean, std, reg_loss_fn, device, params, invoice_date_column_positions, N):
+    if len(dataloader) == 0:
+        logging.warning("Dataloader is empty. Skipping prediction.")
+        return None, None, [], None  # + dist_pack
+
+    model.eval()
+    avg_err = 0.0
+    predictions = []
+    attributions_list = []
+    feature_names = [f'Feature_{i+1}' for i in range(dataloader.dataset.tensors[0].shape[1])]
+
+    # Do zebrania rozkładów:
+    all_probs = []   # lista np.array shape [N+1]
+    all_expected = []
+    all_median = []
+    all_p_within_7 = []
+    all_p_within_30 = []
+
+    total_null_count = 0
+    total_row_count = 0
+    total_valid_count = 0
+
+    with torch.no_grad():
+        for X, y in dataloader:
+            X, y = X.to(device), y.to(device)
+            DNI_OD_UTWORZENIA, UTW_DZIEN_TYG, UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK = extract_date_info(
+                X, params, invoice_date_column_positions, wyodrebnij_date=True
+            )
+
+            X = torch.where(torch.isnan(X) | torch.isinf(X), torch.tensor(0.0, device=X.device), X)
+            total_null_count += torch.isnan(y).sum().item()
+            total_row_count += y.numel()
+
+            X = normalize_data_model1(X, mean, std)
+            reg_pred, logits = model(X)              # reg:[B], logits:[B,N+1]
+
+            # sanity clamp regresji (jak u Ciebie)
+            reg_pred = torch.where(torch.isnan(reg_pred), torch.tensor(365., device=device), reg_pred)
+            reg_pred = torch.clamp(reg_pred, min=-1000, max=1000)
+
+            # Captum na regresji
+            attributions_np = explain_model_with_captum(model, X, device)
+            attributions_list.append(attributions_np)
+
+            # PMF i statystyki
+            # temperatura τ>1 wypłaszcza rozkład (τ<1 wyostrza)
+            tau = max(1e-6, params.get('classification_head', {}).get('softmax_temperature', 1.0))
+            probs = F.softmax(logits / tau, dim=-1)  # [B,N+1], suma=1
+
+            adj_cfg = params.get('classification_head', {})
+            if adj_cfg.get('adjust_pmf', False):
+                # święta – przygotuj set (jak w regresji)
+                holidays_df = read_data_from_db(params['sql_query_holidays'], params, currently_testing=False)
+                if isinstance(holidays_df, pd.DataFrame):
+                    hl = holidays_df['data'].tolist()
+                else:
+                    hl = holidays_df
+                holidays_set = set(
+                    d.date() if isinstance(d, pd.Timestamp)
+                    else datetime.strptime(d, "%Y-%m-%d").date()
+                    for d in hl
+                )
+                probs = adjust_pmf(
+                    probs,
+                    initial_weekday=UTW_DZIEN_TYG,
+                    UTW_DZIEN_MIESIACA=UTW_DZIEN_MIESIACA,
+                    UTW_MIESIAC=UTW_MIESIAC,
+                    UTW_ROK=UTW_ROK,
+                    DNI_OD_UTWORZENIA=DNI_OD_UTWORZENIA,
+                    params=params,
+                    N=N,
+                    device=device,
+                    holidays_set=holidays_set  # możesz dać None, jeśli chcesz na start tylko weekendy+przeszłość
+                )
+            
+            cdf = probs.cumsum(dim=-1)
+        
+            idxs = torch.arange(0, N+1, device=probs.device, dtype=probs.dtype)
+            expected_day = (probs * idxs).sum(dim=-1)            # [B]
+            median_day = (cdf >= 0.5).float().argmax(dim=-1)     # [B]
+            p_within_7 = cdf[:, min(7, N)]
+            p_within_30 = cdf[:, min(30, N)]
+
+            # korekty na dniach z regresji (Twoja logika)
+            all_y_hat = adjust_predicted_days(torch.round(reg_pred), UTW_DZIEN_TYG, UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK, DNI_OD_UTWORZENIA, params)
+            predictions.extend(all_y_hat.detach().cpu().numpy().flatten())
+
+            # metryka na nie-NaN y
+            valid_indices = ~torch.isnan(y.squeeze(-1))
+            if valid_indices.sum() > 0:
+                valid_y = y.squeeze(-1)[valid_indices]
+                valid_y_hat = all_y_hat[valid_indices]
+                y_diff_abs = torch.abs(valid_y_hat - valid_y) / torch.abs(valid_y)
+                y_diff_abs = torch.clamp(y_diff_abs, max=1)
+                avg_err += torch.sum(1 - y_diff_abs)
+                total_valid_count += valid_indices.sum().item()
+
+            # zbierz rozkłady
+            all_probs.append(probs.detach().cpu().numpy())          # [B,N+1]
+            all_expected.append(expected_day.detach().cpu().numpy())
+            all_median.append(median_day.detach().cpu().numpy())
+            all_p_within_7.append(p_within_7.detach().cpu().numpy())
+            all_p_within_30.append(p_within_30.detach().cpu().numpy())
+
+    if total_valid_count > 0:
+        avg_err = (avg_err / total_valid_count).item()
+        logging.info(f'Test ACC: {avg_err * 100:.2f}%')
+    else:
+        logging.info("Brak danych do obliczenia ACC. Prawdopodobnie brak zaksięgowanych płatności na dziś.")
+        avg_err = 0.0
+
+    logging.info(f'{total_null_count} z {total_row_count} wierszy (NULL w kolumnie daty zapłaty).')
+
+    # spakuj rozkłady do jednego dicta (po B)
+    dist_pack = {
+        "probs": np.concatenate(all_probs, axis=0),                   # [B, N+1]
+        "expected": np.concatenate(all_expected, axis=0),             # [B]
+        "median": np.concatenate(all_median, axis=0),                 # [B]
+        "p_within_7": np.concatenate(all_p_within_7, axis=0),         # [B]
+        "p_within_30": np.concatenate(all_p_within_30, axis=0),       # [B]
+    }
+    return predictions, avg_err, attributions_list, dist_pack
+
+def save_model(model, optimizer, epoch, mean, std, learning_rate, batch_size, model_path, operation_mode, retrain_period, train_start, train_end): 
+    logging.info(f"Liczba kolumn (cech) przy zapisie modelu: {model.hidden_layer_1.in_features}")
+    
+    # Logowanie parametrów modelu
+    logging.info(f"Zapisuję model do {model_path} z parametrami:")
+    logging.info(f"Epoch: {epoch}")
+    logging.info(f"Learning rate: {learning_rate}")
+    logging.info(f"Batch size: {batch_size}")
+    logging.info(f"Train start: {train_start}")
+    logging.info(f"Train end: {train_end}")    
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': epoch,
+        'mean': mean,
+        'std': std,
+        'learning_rate': learning_rate,
+        'batch_size': batch_size,
+        'operation_mode': operation_mode,
+        'train_start': train_start.strftime('%Y-%m-%d'),
+        'train_end': train_end.strftime('%Y-%m-%d'),
+    }, model_path)
+    logging.info(f"Model saved to {model_path}")
+
+def load_model(model_path, device, model):
+    try:
+        checkpoint = torch.load(model_path, map_location=device)
+    except FileNotFoundError as e:
+        logging.error(f"Error loading model: {e}")
+        raise
+
+    # 1) Wczytaj wagi modelu tolerancyjnie (nowe głowy/warstwy mogą nie istnieć w starym checkpointcie)
+    missing, unexpected = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    if missing:
+        logging.info(f"[load] Missing keys (new heads etc.): {missing}")
+    if unexpected:
+        logging.info(f"[load] Unexpected keys: {unexpected}")
+
+    # 2) Dane pomocnicze
+    mean = checkpoint.get('mean', None)
+    std = checkpoint.get('std', None)
+    # Uwaga: stare checkpointy mogą nie mieć tych pól – sprawdź i zaloguj
+    if mean is None or std is None:
+        logging.warning("[load] 'mean' lub 'std' nie znalezione w checkpoint — użyj wartości z treningu/konfiguracji, jeśli to potrzebne.")
+
+    train_end_str = checkpoint.get('train_end', None)
+    train_start_str = checkpoint.get('train_start', None)
+    if train_end_str:
+        train_end = datetime.strptime(train_end_str, '%Y-%m-%d').date()
+    else:
+        train_end = None
+    if train_start_str:
+        train_start = datetime.strptime(train_start_str, '%Y-%m-%d').date()
+    else:
+        train_start = None
+
+    # 3) Zbuduj optimizer i spróbuj wczytać jego stan — jeśli nie pasuje, zainicjalizuj od nowa
+    lr = checkpoint.get('learning_rate', 1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    try:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    except Exception as e:
+        logging.warning(f"[load] Nie udało się wczytać optimizer_state_dict ({e}). Inicjalizuję optimizer od nowa (lr={lr}).")
+
+    logging.info(f"Wczytuję model z {model_path} z parametrami z checkpointu:")
+    logging.info(f"Epoch: {checkpoint.get('epoch','?')}")
+    logging.info(f"Learning rate: {lr}")
+    logging.info(f"Batch size: {checkpoint.get('batch_size','?')}")
+    logging.info(f"Train start: {train_start}")
+    logging.info(f"Train end: {train_end}")
+
+    return model, optimizer, mean, std, train_end
+
+def first_model(actual_model_path, test_start, test_end, train_start, train_end, params, operation_mode, t0, acceptance_period, retrain_period):
+    avg_accuracy = 0
+    params['operation_mode'] = operation_mode
+    device = params['device'] if torch.cuda.is_available() else 'cpu'
+
+    N = int(params.get('max_estimation_period', 180))
+    keep_reg_head = bool(params.get('keep_regression_head', True))
+
+    cls_cfg = params.get('classification_head', {}) or {}
+    reg_cfg = params.get('regression_head', {}) or {}
+
+    # --- temperatura softmaxu (inference) ---
+    softmax_temperature = float(cls_cfg.get('softmax_temperature', 1.0))
+    # upewnij się, że trafi do predict_model1 przez params
+    params.setdefault('classification_head', {})
+    params['classification_head']['softmax_temperature'] = softmax_temperature
+    
+    alpha = float(cls_cfg.get('loss_weight', 1.0))
+    beta  = float(reg_cfg.get('loss_weight', 0.3))
+    label_smoothing = float(cls_cfg.get('label_smoothing', 0.0))
+    class_weighting = str(cls_cfg.get('class_weighting', 'none')).lower()
+    reg_loss_type = str(reg_cfg.get('loss_type', 'huber')).lower()
+
+    # wagi klas (opcjonalnie) - tutaj placeholder; jeśli chcesz, policz freq i podaj tensor
+    class_weights_tensor = None
+    ce_loss_fn = nn.CrossEntropyLoss(weight=class_weights_tensor, label_smoothing=label_smoothing)
+
+    if reg_loss_type == "huber":
+        reg_loss_fn = nn.HuberLoss()
+    elif reg_loss_type == "mae":
+        reg_loss_fn = nn.L1Loss()
+    else:
+        reg_loss_fn = nn.MSELoss()
+    
+    test_mode_active = operation_mode in params['test_modes'] or operation_mode in params['train_and_test_modes']
+
+    model = NeuralNetModel1(99, params['network_config']['hidden_layers'], params['network_config']['output_size'], n_classes=N+1, keep_regression_head=keep_reg_head).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=params['learning_rate'])
+    is_training_split_test = False
+    if operation_mode in params['train_modes'] or operation_mode in params['retrain_modes'] or operation_mode in params['train_and_test_modes']:
+        is_training = True
+        if operation_mode in params['retrain_modes']:
+            model, optimizer, mean, std, last_train_end = load_model(actual_model_path, device, model)
+            train_start = last_train_end + 1
+            if train_end < train_start:
+                raise ValueError(f"Cannot perform retraining: train_end ({train_end}) is less than train_start ({train_start}).")
+            if train_end < train_start + retrain_period:
+                warnings.warn(f"Train end ({train_end}) is less than train_start ({train_start}) + retrain_period ({retrain_period}). Retraining will be performed on data from {train_start} to {train_end}.")        
+        train_dataloader, test_dataloader, mean, std, input_size, model_id, invoice_date_column_positions = prepare_for_training(train_start, train_end, operation_mode, params, device)    
+        is_training_split_test = True
+        model = NeuralNetModel1(input_size, params['network_config']['hidden_layers'], params['network_config']['output_size'],
+                                n_classes=N+1, keep_regression_head=keep_reg_head).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=params['learning_rate'])
+        
+        for epoch in range(params['epochs']):
+            train_model1(
+                train_dataloader, model,
+                reg_loss_fn, ce_loss_fn, optimizer,
+                mean, std, device, params,
+                N, alpha, beta
+            )
+        
+        predicted_clear_dates, avg_accuracy, attributions_list, dist_pack = predict_model1(test_dataloader, model, mean, std, reg_loss_fn, device, params, invoice_date_column_positions, N)
+        save_model(model, optimizer, params['epochs'], mean, std, params['learning_rate'], params['batch_size'], actual_model_path, operation_mode, retrain_period, train_start, train_end)
+        is_training_split_test = False
+    
+    if test_mode_active and not is_training_split_test:
+        is_training = False        
+        test_dataloader, additional_data, input_size, model_id, feature_names, invoice_date_column_positions = prepare_for_testing(test_start, test_end, operation_mode, params, device)
+        model = NeuralNetModel1(input_size, params['network_config']['hidden_layers'], params['network_config']['output_size'], n_classes=N+1, keep_regression_head=keep_reg_head).to(device)
+        model, optimizer, mean, std, last_train_end = load_model(actual_model_path, device, model)
+        predicted_clear_dates, avg_accuracy, attributions_list, dist_pack = predict_model1(test_dataloader, model, mean, std, reg_loss_fn, device, params, invoice_date_column_positions, N)
+
+        # Zapis wag Captum
+        df_agg = aggregate_attributions(attributions_list, feature_names)
+        output_filename = f"C:/Users/OE00SG/CashPredictor/dev3/wagi/wagi_{params['test_client_id']}.xlsx"
+        df_agg.to_excel(output_filename, index=False)
+        print(f"Istotności wag Captum zostały zapisane do pliku Excel: {output_filename}")
+        
+        additional_data = additional_data.iloc[:len(predicted_clear_dates)].reset_index(drop=True)
+        additional_data[params['created_data_column']] = pd.to_datetime(additional_data[params['created_data_column']], errors='coerce')
+        predicted_payment_dates = pd.to_datetime(additional_data[params['created_data_column']], errors='coerce') + pd.to_timedelta(predicted_clear_dates, unit='D')
+        predictions_df = pd.DataFrame(predicted_clear_dates, columns=[f'predicted_{params["clear_date"]}'])
+        final_output_df = pd.concat([additional_data.reset_index(drop=True), predictions_df], axis=1)
+        final_output_df['PREDICTED_PAYMENT_DATE'] = predicted_payment_dates
+        # --- NEW: rozkład po dniach i KPI z dist_pack ---
+        if dist_pack is not None:
+            probs = dist_pack["probs"]          # shape [B, N+1]
+            expected = dist_pack["expected"]    # [B]
+            median = dist_pack["median"]        # [B]
+            p7 = dist_pack["p_within_7"]        # [B]
+            p30 = dist_pack["p_within_30"]      # [B]
+
+            # upewnij się, że długości się zgadzają
+            B = len(final_output_df)
+            if probs.shape[0] >= B:
+                probs = probs[:B, :]
+                expected = expected[:B]
+                median = median[:B]
+                p7 = p7[:B]
+                p30 = p30[:B]
+
+                # PMF 0..N-1
+                pmf_cols = {f"p_day_{d}": probs[:, d] for d in range(N)}
+                pmf_df = pd.DataFrame(pmf_cols)
+                
+                # Koszyk N+
+                pmf_df[f"p_day_{N}_plus"] = probs[:, N]
+                
+                # Statystyki i KPI
+                stats_df = pd.DataFrame({
+                    "expected_payment_day": expected,
+                    "median_payment_day": median.astype(int, copy=False),
+                    "p_paid_within_7": p7,
+                    "p_paid_within_30": p30,
+                })
+                
+                # Ujednolić indeksy i skleić jednorazowo
+                final_output_df = pd.concat(
+                    [final_output_df.reset_index(drop=True), pmf_df.reset_index(drop=True), stats_df.reset_index(drop=True)],
+                    axis=1
+                )
+            
+        # Uzupełnianie brakujących wartości DATA_ZAPLATY_NA_DZIEN
+        final_output_df[params['clear_date']] = final_output_df.apply(
+            lambda row: pd.Timestamp(t0) if (pd.isnull(row[params['clear_date']]) and pd.Timestamp(t0) > row[params['invoice_date']] + timedelta(days=24))
+            else (row[params['invoice_date']] + timedelta(days=24) if pd.isnull(row[params['clear_date']])
+                  else row[params['clear_date']]),
+            axis=1
+        )
+        run_identifier = f"{operation_mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        final_output_df = final_output_df.copy()
+        if "RunIdentifier" not in final_output_df.columns:
+            final_output_df.insert(0, "RunIdentifier", run_identifier)
+        write_output_to_db(
+            final_output_df,
+            'first_model_tab',
+            params,
+            original_table_name="first_model_tab",
+            currently_testing=True,
+            create_indexes=False,
+            index_columns=None
+        )
+    
+    return avg_accuracy
+
+(cpdev50)C:\Users\OE00SG\CashPredictor\dev3\gcp batch>python runner_batch.py ^
+More?   --t0 2026-01-01 ^
+More?   --run-test ^
+More?   --test-client-ids 13581,10095,6089,8964,8989 ^
+More?   --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db ^
+More?   --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+2026-04-18 20:46:09,580 - INFO - === START single-client test on shared DB: 13581 ===
+2026-04-18 20:46:09,581 - INFO - === START phase test_today ===
+2026-04-18 20:46:09,581 - INFO - train_client_id=[13581, 10095, 6089, 8964, 8989]
+2026-04-18 20:46:09,581 - INFO - test_client_id=13581
+2026-04-18 20:46:09,582 - INFO - database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-18 20:46:09,583 - INFO - test_database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-18 20:46:09,583 - INFO - model_path=C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+2026-04-18 20:46:13,208 - INFO - [first_model] Using client filter: AND INVO_CLNTNO IN (13581)
+[INFO] row_count=150 <= 3000000 => pobieram wszystkie wiersze.
+C:\Users\OE00SG\CashPredictor\dev3\gcp batch\first_model.py:314: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
+  df = df.fillna(0)
+2026-04-18 20:46:13,771 - INFO - Wczytuję model z C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt z parametrami z checkpointu:
+2026-04-18 20:46:13,771 - INFO - Epoch: 5
+2026-04-18 20:46:13,772 - INFO - Learning rate: 0.0001
+2026-04-18 20:46:13,772 - INFO - Batch size: 32
+2026-04-18 20:46:13,772 - INFO - Train start: 2024-06-22
+2026-04-18 20:46:13,772 - INFO - Train end: 2025-12-31
+2026-04-18 20:46:14,120 - INFO - Test ACC: 0.00%
+2026-04-18 20:46:14,120 - INFO - 0 z 150 wierszy (NULL w kolumnie daty zapłaty).
+Istotności wag Captum zostały zapisane do pliku Excel: C:/Users/OE00SG/CashPredictor/dev3/wagi/wagi_13581.xlsx
+2026-04-18 20:46:14,524 - INFO - Starting to write DataFrame to table: first_model_tab
+2026-04-18 20:46:14,524 - INFO - Attempting to write DataFrame to table: first_model_tab
+Sanitized table name: Original='first_model_tab', Sanitized='first_model_tab'
+[INFO] Rozpoczynam wstawianie 150 wierszy do tabeli 'first_model_tab' przy użyciu batch_size=500000.
+Tabela 'first_model_tab' została utworzona i dane zostały zapisane.
+2026-04-18 20:46:14,583 - INFO - Finished writing DataFrame to table: first_model_tab
+2026-04-18 20:46:14,652 - INFO - Appended run to results file: model_runs.xlsx
+2026-04-18 20:46:14,653 - INFO - === END phase test_today ===
+2026-04-18 20:46:14,653 - INFO - === END single-client test on shared DB: 13581 ===
+2026-04-18 20:46:14,653 - INFO - === START single-client test on shared DB: 10095 ===
+2026-04-18 20:46:14,654 - INFO - === START phase test_today ===
+2026-04-18 20:46:14,655 - INFO - train_client_id=[13581, 10095, 6089, 8964, 8989]
+2026-04-18 20:46:14,655 - INFO - test_client_id=10095
+2026-04-18 20:46:14,655 - INFO - database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-18 20:46:14,655 - INFO - test_database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-18 20:46:14,655 - INFO - model_path=C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+2026-04-18 20:46:14,659 - INFO - [first_model] Using client filter: AND INVO_CLNTNO IN (10095)
+[INFO] row_count=90 <= 3000000 => pobieram wszystkie wiersze.
+C:\Users\OE00SG\CashPredictor\dev3\gcp batch\first_model.py:314: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
+  df = df.fillna(0)
+2026-04-18 20:46:15,086 - INFO - Wczytuję model z C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt z parametrami z checkpointu:
+2026-04-18 20:46:15,087 - INFO - Epoch: 5
+2026-04-18 20:46:15,087 - INFO - Learning rate: 0.0001
+2026-04-18 20:46:15,087 - INFO - Batch size: 32
+2026-04-18 20:46:15,087 - INFO - Train start: 2024-06-22
+2026-04-18 20:46:15,087 - INFO - Train end: 2025-12-31
+2026-04-18 20:46:15,249 - INFO - Test ACC: 11.16%
+2026-04-18 20:46:15,249 - INFO - 0 z 90 wierszy (NULL w kolumnie daty zapłaty).
+Istotności wag Captum zostały zapisane do pliku Excel: C:/Users/OE00SG/CashPredictor/dev3/wagi/wagi_10095.xlsx
+2026-04-18 20:46:15,375 - INFO - Starting to write DataFrame to table: first_model_tab
+2026-04-18 20:46:15,375 - INFO - Attempting to write DataFrame to table: first_model_tab
+Sanitized table name: Original='first_model_tab', Sanitized='first_model_tab'
+[INFO] Rozpoczynam wstawianie 90 wierszy do tabeli 'first_model_tab' przy użyciu batch_size=500000.
+Tabela 'first_model_tab' została utworzona i dane zostały zapisane.
+2026-04-18 20:46:15,430 - INFO - Finished writing DataFrame to table: first_model_tab
+2026-04-18 20:46:15,482 - INFO - Appended run to results file: model_runs.xlsx
+2026-04-18 20:46:15,482 - INFO - === END phase test_today ===
+2026-04-18 20:46:15,482 - INFO - === END single-client test on shared DB: 10095 ===
+2026-04-18 20:46:15,482 - INFO - === START single-client test on shared DB: 6089 ===
+2026-04-18 20:46:15,483 - INFO - === START phase test_today ===
+2026-04-18 20:46:15,483 - INFO - train_client_id=[13581, 10095, 6089, 8964, 8989]
+2026-04-18 20:46:15,483 - INFO - test_client_id=6089
+2026-04-18 20:46:15,483 - INFO - database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-18 20:46:15,483 - INFO - test_database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-18 20:46:15,483 - INFO - model_path=C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+2026-04-18 20:46:15,489 - INFO - [first_model] Using client filter: AND INVO_CLNTNO IN (6089)
+[INFO] row_count=129 <= 3000000 => pobieram wszystkie wiersze.
+C:\Users\OE00SG\CashPredictor\dev3\gcp batch\first_model.py:314: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
+  df = df.fillna(0)
+2026-04-18 20:46:16,322 - INFO - Wczytuję model z C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt z parametrami z checkpointu:
+2026-04-18 20:46:16,322 - INFO - Epoch: 5
+2026-04-18 20:46:16,322 - INFO - Learning rate: 0.0001
+2026-04-18 20:46:16,322 - INFO - Batch size: 32
+2026-04-18 20:46:16,322 - INFO - Train start: 2024-06-22
+2026-04-18 20:46:16,322 - INFO - Train end: 2025-12-31
+2026-04-18 20:46:16,533 - INFO - Test ACC: 0.00%
+2026-04-18 20:46:16,534 - INFO - 0 z 129 wierszy (NULL w kolumnie daty zapłaty).
+Istotności wag Captum zostały zapisane do pliku Excel: C:/Users/OE00SG/CashPredictor/dev3/wagi/wagi_6089.xlsx
+2026-04-18 20:46:16,624 - INFO - Starting to write DataFrame to table: first_model_tab
+2026-04-18 20:46:16,624 - INFO - Attempting to write DataFrame to table: first_model_tab
+Sanitized table name: Original='first_model_tab', Sanitized='first_model_tab'
+[INFO] Rozpoczynam wstawianie 129 wierszy do tabeli 'first_model_tab' przy użyciu batch_size=500000.
+Tabela 'first_model_tab' została utworzona i dane zostały zapisane.
+2026-04-18 20:46:16,653 - INFO - Finished writing DataFrame to table: first_model_tab
+2026-04-18 20:46:16,705 - INFO - Appended run to results file: model_runs.xlsx
+2026-04-18 20:46:16,705 - INFO - === END phase test_today ===
+2026-04-18 20:46:16,705 - INFO - === END single-client test on shared DB: 6089 ===
+2026-04-18 20:46:16,705 - INFO - === START single-client test on shared DB: 8964 ===
+2026-04-18 20:46:16,706 - INFO - === START phase test_today ===
+2026-04-18 20:46:16,706 - INFO - train_client_id=[13581, 10095, 6089, 8964, 8989]
+2026-04-18 20:46:16,706 - INFO - test_client_id=8964
+2026-04-18 20:46:16,706 - INFO - database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-18 20:46:16,706 - INFO - test_database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-18 20:46:16,706 - INFO - model_path=C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+2026-04-18 20:46:16,712 - INFO - [first_model] Using client filter: AND INVO_CLNTNO IN (8964)
+[INFO] row_count=215 <= 3000000 => pobieram wszystkie wiersze.
+C:\Users\OE00SG\CashPredictor\dev3\gcp batch\first_model.py:314: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
+  df = df.fillna(0)
+2026-04-18 20:46:19,749 - INFO - Wczytuję model z C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt z parametrami z checkpointu:
+2026-04-18 20:46:19,749 - INFO - Epoch: 5
+2026-04-18 20:46:19,749 - INFO - Learning rate: 0.0001
+2026-04-18 20:46:19,750 - INFO - Batch size: 32
+2026-04-18 20:46:19,750 - INFO - Train start: 2024-06-22
+2026-04-18 20:46:19,750 - INFO - Train end: 2025-12-31
+2026-04-18 20:46:20,086 - INFO - Test ACC: 0.38%
+2026-04-18 20:46:20,086 - INFO - 0 z 215 wierszy (NULL w kolumnie daty zapłaty).
+Istotności wag Captum zostały zapisane do pliku Excel: C:/Users/OE00SG/CashPredictor/dev3/wagi/wagi_8964.xlsx
+2026-04-18 20:46:20,212 - INFO - Starting to write DataFrame to table: first_model_tab
+2026-04-18 20:46:20,212 - INFO - Attempting to write DataFrame to table: first_model_tab
+Sanitized table name: Original='first_model_tab', Sanitized='first_model_tab'
+[INFO] Rozpoczynam wstawianie 215 wierszy do tabeli 'first_model_tab' przy użyciu batch_size=500000.
+Tabela 'first_model_tab' została utworzona i dane zostały zapisane.
+2026-04-18 20:46:20,249 - INFO - Finished writing DataFrame to table: first_model_tab
+2026-04-18 20:46:20,304 - INFO - Appended run to results file: model_runs.xlsx
+2026-04-18 20:46:20,304 - INFO - === END phase test_today ===
+2026-04-18 20:46:20,304 - INFO - === END single-client test on shared DB: 8964 ===
+2026-04-18 20:46:20,304 - INFO - === START single-client test on shared DB: 8989 ===
+2026-04-18 20:46:20,306 - INFO - === START phase test_today ===
+2026-04-18 20:46:20,306 - INFO - train_client_id=[13581, 10095, 6089, 8964, 8989]
+2026-04-18 20:46:20,306 - INFO - test_client_id=8989
+2026-04-18 20:46:20,306 - INFO - database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-18 20:46:20,306 - INFO - test_database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-18 20:46:20,306 - INFO - model_path=C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+2026-04-18 20:46:20,312 - INFO - [first_model] Using client filter: AND INVO_CLNTNO IN (8989)
+[INFO] row_count=191 <= 3000000 => pobieram wszystkie wiersze.
+C:\Users\OE00SG\CashPredictor\dev3\gcp batch\first_model.py:314: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
+  df = df.fillna(0)
+2026-04-18 20:46:22,885 - INFO - Wczytuję model z C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt z parametrami z checkpointu:
+2026-04-18 20:46:22,885 - INFO - Epoch: 5
+2026-04-18 20:46:22,885 - INFO - Learning rate: 0.0001
+2026-04-18 20:46:22,885 - INFO - Batch size: 32
+2026-04-18 20:46:22,886 - INFO - Train start: 2024-06-22
+2026-04-18 20:46:22,886 - INFO - Train end: 2025-12-31
+2026-04-18 20:46:23,177 - INFO - Test ACC: 0.00%
+2026-04-18 20:46:23,177 - INFO - 0 z 191 wierszy (NULL w kolumnie daty zapłaty).
+Istotności wag Captum zostały zapisane do pliku Excel: C:/Users/OE00SG/CashPredictor/dev3/wagi/wagi_8989.xlsx
+2026-04-18 20:46:23,294 - INFO - Starting to write DataFrame to table: first_model_tab
+2026-04-18 20:46:23,294 - INFO - Attempting to write DataFrame to table: first_model_tab
+Sanitized table name: Original='first_model_tab', Sanitized='first_model_tab'
+[INFO] Rozpoczynam wstawianie 191 wierszy do tabeli 'first_model_tab' przy użyciu batch_size=500000.
+Tabela 'first_model_tab' została utworzona i dane zostały zapisane.
+2026-04-18 20:46:23,323 - INFO - Finished writing DataFrame to table: first_model_tab
+2026-04-18 20:46:23,377 - INFO - Appended run to results file: model_runs.xlsx
+2026-04-18 20:46:23,377 - INFO - === END phase test_today ===
+2026-04-18 20:46:23,378 - INFO - === END single-client test on shared DB: 8989 ===
+
+przeanalizuj bo nadal coś jest nie tak, ponieważ mam tylko 
+:
+
+INVO_CLNTNO	count(*)
+0	8989	191
+
+dla df_query = pd.read_sql_query("""
+select INVO_CLNTNO,count(*) from first_model_tab group by INVO_CLNTNO;
+""", conn)
+df_query
+
