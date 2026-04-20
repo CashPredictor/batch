@@ -1,298 +1,78 @@
-Dobra — zrobiłeś już 80% roboty, teraz tylko domykamy spójnie całą logikę i usuwamy stare relikty 👍
+Model zapisuje się dopiero po zakończeniu jednego całego przebiegu treningowego, a nie po każdym kliencie osobno.
 
-⸻
+W Twoim obecnym flow runner_batch.py dla --run-train robi jedno wywołanie:
 
-✅ 1. Jak MA działać docelowo (finalny kontrakt)
+run_phase(... operation_mode=args.train_mode, train_client_ids=resolved_train_client_ids, ...)
 
-Parametry wejściowe (WSZYSTKO z CLI, nic z configu):
+a run_phase() robi jedno wywołanie:
 
-Masz tylko:
+avg_acc = first_model.first_model(...)
 
-* include_clients (lista albo None)
-* exclude_clients (lista albo None)
+Czyli dla treningu lista klientów trafia raz do first_model().
 
-Interpretacja:
+W samym first_model.py trening wygląda tak:
 
-include	exclude	wynik
-None	None	✅ wszyscy
-[]	None	✅ wszyscy
-None	[]	✅ wszyscy
-[A,B]	None	✅ tylko A,B
-None	[A,B]	✅ wszyscy oprócz A,B
-[A,B,C]	[B]	✅ A,C
+1. prepare_for_training(...)
+2. wewnątrz tego preprocess_data_model1(...)
+3. tam budowany jest jeden query na dataset, z filtrem klientów
+4. dane wszystkich wybranych klientów są pobierane do jednego DataFrame
+5. potem robiony jest:
+    * train_test_split(...)
+    * DataLoader
+    * pętla po epokach
+6. dopiero po całym treningu jest:
 
-👉 I to już masz dobrze zrobione w:
+save_model(...)
 
-resolve_clients(...)
+To wywołanie jest tutaj:
 
-✔️ to jest dokładnie poprawna implementacja
-✔️ nic więcej tu nie trzeba zmieniać
+for epoch in range(params['epochs']):
+    train_model1(...)
+predicted_clear_dates, avg_accuracy, attributions_list, dist_pack = predict_model1(...)
+save_model(...)
 
-⸻
+Czyli:
 
-✅ 2. build_dataset_db – jest OK (ale… kilka reliktów)
+* nie ma zapisu modelu po każdym kliencie,
+* nie ma osobnej pętli „train client 1 → save → train client 2 → save”,
+* model jest trenowany na jednym wspólnym zbiorze treningowym złożonym z danych klientów objętych filtrem,
+* zapis następuje raz, po całym treningu.
 
-Twoja funkcja:
+Najważniejszy problem u Ciebie jest gdzie indziej: z logów widać, że trening poszedł na ALL, a nie na listę, którą podałeś.
 
-build_dataset_db(params, t0, include_clients=None, exclude_clients=None, ...)
+Masz w logu:
 
-✔️ bierze klientów z Excela
-✔️ filtruje przez resolve_clients
-✔️ działa zgodnie z nową logiką
+[first_model] Client filter: ALL (no filtering)
+[CAP] client=10069 ...
+[CAP] client=11437 ...
 
-⸻
+To znaczy, że do treningu w ogóle nie został zastosowany filtr po train_client_id. Gdyby działał poprawnie, nie pojawiłby się klient 11437, skoro trenowałeś na 10069, 9320, 13581.
 
-❗ Relikty / rzeczy do usunięcia
+Czyli odpowiedź brzmi:
 
-❌ 1. files_for_client = None
+Nie, model nie zapisuje się po każdym kliencie. Zapisuje się raz po treningu całego wspólnego zbioru. Natomiast obecnie najpewniej trenujesz nie na tej liście klientów, którą myślisz, tylko na wszystkich klientach, bo filtr treningowy nie działa.
 
-files_for_client = None  # w tym trybie niepotrzebne
+Skąd to wynika w kodzie:
+w build_client_filter_sql(params, currently_testing=False) masz:
 
-👉 do usunięcia (stary tryb multi-file)
+col = params.get('train_client_id_column', params.get('test_client_id_column'))
+ids = params.get('train_client_id')
+if col and ids:
+    ...
+return ""
 
-⸻
+A log pokazuje Client filter: ALL, więc w praktyce jeden z tych warunków jest fałszywy:
 
-❌ 2. Podwójny print kolejności
+* albo train_client_id_column nie istnieje w configu,
+* albo nie trafia poprawnie train_client_id,
+* albo nazwa kolumny w configu jest inna niż ta, której funkcja szuka.
 
-Masz 2x:
+Czyli model ma kontekst całego datasetu, który faktycznie został pobrany przez query. Problem nie jest w momencie zapisu modelu, tylko w tym, jakie dane weszły do treningu przed zapisem.
 
-print("Kolejność przetwarzania...")
+Najkrócej:
 
-👉 zostaw jeden
+* zapis modelu: raz po całym treningu,
+* nie po kliencie,
+* błąd najpewniej leży w filtrze klientów do treningu, nie w save_model().
 
-⸻
-
-❌ 3. komentarze o trybach (myli)
-
-# skip_raw_tables=False, build_derived=True -> NORMAL
-# skip_raw_tables=False, build_derived=False -> ETAP 1
-# skip_raw_tables=True,  build_derived=True -> ETAP 2
-
-👉 jeśli nie używasz etapów → usuń albo uprość
-
-⸻
-
-❌ 4. params['train_client_id'] – NIE MOŻE ISTNIEĆ
-
-Masz to jeszcze w build_client_db.py (zaraz poprawimy)
-
-⸻
-
-✅ 3. build_client_db.py – TU JEST PROBLEM
-
-Obecnie robisz:
-
-config["first_model_params"]["train_client_id"] = cli_clients
-
-❌ TO MUSI ZNIKNĄĆ
-
-⸻
-
-✔️ POPRAWNA wersja
-
-Dodaj:
-
-parser.add_argument(
-    "--include-clients",
-    help="Comma-separated list of client IDs to INCLUDE"
-)
-parser.add_argument(
-    "--exclude-clients",
-    help="Comma-separated list of client IDs to EXCLUDE"
-)
-
-⸻
-
-✔️ parsing
-
-include_clients = parse_client_ids(args.include_clients)
-exclude_clients = parse_client_ids(args.exclude_clients)
-
-⸻
-
-✔️ wywołanie
-
-build_dataset_db.build_dataset_db(
-    config["first_model_params"],
-    t0,
-    include_clients=include_clients,
-    exclude_clients=exclude_clients
-)
-
-⸻
-
-❌ usuń całkowicie:
-
---build-clients
-train_client_id
-
-⸻
-
-✅ FINALNA wersja build_client_db.py (skrót)
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--t0", required=True)
-    parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--db-path", required=True)
-    parser.add_argument("--include-clients")
-    parser.add_argument("--exclude-clients")
-    args = parser.parse_args()
-    config = load_config(args.config)
-    t0 = datetime.strptime(args.t0, "%Y-%m-%d").date()
-    config["first_model_params"]["database"] = args.db_path
-    include_clients = parse_client_ids(args.include_clients)
-    exclude_clients = parse_client_ids(args.exclude_clients)
-    print(f"[INFO] include={include_clients}, exclude={exclude_clients}")
-    build_dataset_db.build_dataset_db(
-        config["first_model_params"],
-        t0,
-        include_clients=include_clients,
-        exclude_clients=exclude_clients
-    )
-
-⸻
-
-✅ 4. runner_batch.py – jak to spiąć
-
-Masz teraz:
-
-* --train-client-ids
-* --test-client-ids
-
-👉 i to jest OK — tylko:
-
-🔥 WAŻNE: NIE przekazuj tego przez config
-
-Tylko bezpośrednio do:
-
-* build (dataset)
-* train
-* test
-
-⸻
-
-✅ 5. FINALNE WYWOŁANIA (po zmianach)
-
-⸻
-
-🟢 DB INIT (bez zmian)
-
-python db_init.py ^
-  --config config.yaml ^
-  --db-path ...
-
-⸻
-
-🟢 BUILD – wszyscy
-
-python build_client_db.py ^
-  --t0 2026-03-02 ^
-  --db-path ...
-
-⸻
-
-🟢 BUILD – tylko wybrani
-
-python build_client_db.py ^
-  --t0 2026-03-02 ^
-  --include-clients 13581,10095,6089 ^
-  --db-path ...
-
-⸻
-
-🟢 BUILD – wszyscy oprócz
-
-python build_client_db.py ^
-  --t0 2026-03-02 ^
-  --exclude-clients 13581,10095 ^
-  --db-path ...
-
-⸻
-
-🟢 BUILD – include + exclude
-
-python build_client_db.py ^
-  --t0 2026-03-02 ^
-  --include-clients 13581,10095,6089 ^
-  --exclude-clients 10095 ^
-  --db-path ...
-
-👉 wynik: 13581, 6089
-
-⸻
-
-✅ TRAIN / TEST (runner_batch.py)
-
-Tu nic nie zmieniasz w CLI — tylko w środku:
-
-⸻
-
-🟢 TEST
-
-python runner_batch.py ^
-  --t0 2026-01-01 ^
-  --run-test ^
-  --test-client-ids 13581,10095,6089 ^
-  --db-path ... ^
-  --model-path ...
-
-⸻
-
-🟢 TRAIN
-
-python runner_batch.py ^
-  --t0 2026-01-01 ^
-  --run-train ^
-  --train-client-ids 10069,9320,13581 ^
-  --db-path ... ^
-  --model-path ...
-
-⸻
-
-🟢 TRAIN + TEST
-
-python runner_batch.py ^
-  --t0 2026-01-01 ^
-  --run-train ^
-  --run-test ^
-  --train-client-ids 10069,9320,13581 ^
-  --test-client-ids 13581,10095,6089 ^
-  --db-path ... ^
-  --model-path ...
-
-⸻
-
-⚠️ 6. OSTATNIE RELIKTY DO USUNIĘCIA (ważne)
-
-Usuń WSZĘDZIE:
-
-* ❌ train_client_id z configu
-* ❌ test_client_id z configu
-* ❌ exclude_client_ids z configu
-
-I ich użycia:
-
-params.get("train_client_id")
-params.get("test_client_id")
-
-⸻
-
-🧠 TL;DR
-
-✔ Jedno źródło → Excel
-✔ Jedna baza
-✔ Klienci wybierani WYŁĄCZNIE z CLI
-✔ Logika:
-
-final = include or all
-final -= exclude
-
-✔ build / train / test → każdy bierze klientów z parametrów
-✔ config = tylko techniczne rzeczy (ścieżki, SQL, etc.)
-
-⸻
-
-Jeśli chcesz, mogę teraz:
-
-👉 przejrzeć runner_batch.py i wskazać dokładnie gdzie jeszcze masz stare train/test/exclude z configu (na 99% tam jeszcze coś siedzi)
+Mogę Ci od razu wskazać dokładnie, co sprawdzić w configu i jaki jeden log dodać, żeby potwierdzić na 100%, czy trening idzie po właściwej liście klientów.
