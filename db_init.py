@@ -4,7 +4,22 @@ import os
 import sqlite3
 import sys
 import yaml
+from pathlib import Path
 
+def load_sql_file(path: str) -> str:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"SQL file not found: {path}")
+    return p.read_text(encoding="utf-8")
+
+def exec_sql_file(conn, path: str):
+    sql = Path(path).read_text(encoding="utf-8")
+    conn.executescript(sql)
+    
+def exec_sql_dir(conn, dir_path: str):
+    for path in sorted(Path(dir_path).glob("*.sql")):
+        print(f"[INFO] Executing {path}")
+        exec_sql_file(conn, str(path))
 
 def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -93,6 +108,7 @@ def seed_swieta(cursor: sqlite3.Cursor, params: dict) -> None:
     print(f"[OK] Seed swieta zakończony. Dodano {inserted} nowych rekordów.")
 
 def main():
+    
     parser = argparse.ArgumentParser(description="SQLite DB schema initialization")
     parser.add_argument("--config", required=True)
     parser.add_argument("--db-path", required=True)
@@ -107,6 +123,11 @@ def main():
 
     cfg = load_config(args.config)
     params = cfg["first_model_params"]
+
+    schema_dir = cfg["sql_paths"]["schema_dir"]
+    views_dir = cfg["sql_paths"]["views_dir"]
+    exec_sql_dir(conn, schema_dir)
+    exec_sql_dir(conn, views_dir)    
 
     conn = sqlite3.connect(args.db_path)
     cursor = conn.cursor()
