@@ -1,7 +1,8 @@
+# build_client_db.py
 import argparse
 from datetime import datetime
 import yaml
-import CreateDatabase
+import build_dataset_db
 
 def load_config(path="config.yaml"):
     with open(path, "r", encoding="utf-8") as f:
@@ -30,11 +31,19 @@ def main():
         help="Comma-separated list of client IDs to build DBs for (overrides config)"
     )
 
+    parser.add_argument(
+        "--db-path",
+        required=True,
+        help="Ścieżka do wspólnej bazy SQLite"
+    )
+
+
     args = parser.parse_args()
 
     config = load_config(args.config)
     t0 = datetime.strptime(args.t0, "%Y-%m-%d").date()
 
+    config["first_model_params"]["database"] = args.db_path
     cli_clients = parse_client_ids(args.build_clients)
 
     if cli_clients:
@@ -48,10 +57,10 @@ def main():
         )
 
     # CORE: dalej zostaje EXACTLY ten sam mechanizm
-    CreateDatabase.CreateDatabase(
+    build_dataset_db.build_dataset_db(
         config["first_model_params"],
         t0,
-        create_many_dbs_from_one_excel=True
+        create_db_from_one_excel=True
     )
 
 if __name__ == "__main__":
