@@ -13,54 +13,43 @@ def parse_client_ids(raw):
         return None
     return [int(x.strip()) for x in raw.split(",") if x.strip()]
 
+def ensure_db_initialized(config_path: str, db_path: str):
+    if os.path.exists(db_path):
+        print(f"[INFO] DB already exists, skipping init: {db_path}")
+        return
+    print(f"[INFO] DB does not exist, initializing: {db_path}")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "db_init.py",
+            "--config", config_path,
+            "--db-path", db_path,
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"db_init.py failed with exit code {result.returncode}")    
+
 def main():
-    parser = argparse.ArgumentParser(description="Build per-client SQLite DBs from single Excel file")
-
-    parser.add_argument(
-        "--t0",
-        required=True,
-        help="Current date in YYYY-MM-DD"
-    )
-    parser.add_argument(
-        "--config",
-        default="config.yaml",
-        help="Path to config.yaml"
-    )
-    parser.add_argument(
-        "--build-clients",
-        help="Comma-separated list of client IDs to build DBs for (overrides config)"
-    )
-
-    parser.add_argument(
-        "--db-path",
-        required=True,
-        help="Ścieżka do wspólnej bazy SQLite"
-    )
-
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--t0", required=True)
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--db-path", required=True)
+    parser.add_argument("--include-clients")
+    parser.add_argument("--exclude-clients")
     args = parser.parse_args()
-
     config = load_config(args.config)
     t0 = datetime.strptime(args.t0, "%Y-%m-%d").date()
-
+    ensure_db_initialized(args.config, args.db_path)    
     config["first_model_params"]["database"] = args.db_path
-    cli_clients = parse_client_ids(args.build_clients)
-
-    if cli_clients:
-        # NADPISUJEMY tylko na potrzeby tego wywołania
-        config["first_model_params"]["train_client_id"] = cli_clients
-        print(f"[INFO] Using client list from CLI: {cli_clients}")
-    else:
-        print(
-            "[INFO] Using client list from config.yaml:",
-            config["first_model_params"].get("train_client_id")
-        )
-
-    # CORE: dalej zostaje EXACTLY ten sam mechanizm
+    include_clients = parse_client_ids(args.include_clients)
+    exclude_clients = parse_client_ids(args.exclude_clients)
+    print(f"[INFO] include={include_clients}, exclude={exclude_clients}")
     build_dataset_db.build_dataset_db(
         config["first_model_params"],
         t0,
-        create_db_from_one_excel=True
+        include_clients=include_clients,
+        exclude_clients=exclude_clients
     )
 
 if __name__ == "__main__":
