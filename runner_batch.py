@@ -3,39 +3,29 @@ import copy
 import logging
 import os
 from datetime import datetime
-
 import pandas as pd
 import yaml
-
 import first_model
 from first_model import get_train_test_params
-
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
-
-
-def load_config(config_path="config.yaml"):
+def load_config(config_path: str = "config.yaml") -> dict:
     with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
-
-
 def save_model_run(results_file, config, operation_mode, avg_accuracy):
     row_data = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "train_client_id": config["first_model_params"]["train_client_id"],
-        "test_client_id": config["first_model_params"]["test_client_id"],
+        "train_client_id": str(config["first_model_params"]["train_client_id"]),
+        "test_client_id": str(config["first_model_params"]["test_client_id"]),
         "model_path": config["first_model_params"]["model_path"],
         "database": config["first_model_params"]["database"],
         "test_database": config["first_model_params"].get("test_database"),
         "operation_mode": operation_mode,
         "avg_accuracy": avg_accuracy,
     }
-
     df_new = pd.DataFrame([row_data])
-
     if not os.path.exists(results_file):
         df_new.to_excel(results_file, index=False, sheet_name="runs")
         logging.info("Created results file: %s", results_file)
@@ -44,80 +34,43 @@ def save_model_run(results_file, config, operation_mode, avg_accuracy):
         combined_df = pd.concat([existing_df, df_new], ignore_index=True)
         combined_df.to_excel(results_file, index=False, sheet_name="runs")
         logging.info("Appended run to results file: %s", results_file)
-
-
-def build_db_path(db_root, t0_str, client_id):
-    return os.path.join(db_root, t0_str, t0_str, f"CashPredictorT_{client_id}.db")
-
-def build_db_path_from_template(db_template, client_id):
-    """
-    Przykład template:
-    C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictorT_{client_id}.db
-    """
-    return db_template.format(client_id=client_id)
-
 def parse_client_ids(raw_value):
     if raw_value is None:
         return None
-
     parts = [x.strip() for x in str(raw_value).split(",") if x.strip()]
     ids = [int(x) for x in parts]
-
     if len(ids) == 1:
         return ids[0]
     return ids
-
 def ensure_list(client_ids):
     if client_ids is None:
         return []
     if isinstance(client_ids, list):
         return client_ids
     return [client_ids]
-
-
-def resolve_db_path(db_root, t0, client_ids, explicit_db_path=None):
-    if explicit_db_path:
-        if not os.path.exists(explicit_db_path):
-            raise FileNotFoundError(f"Baza nie istnieje: {explicit_db_path}")
-        return explicit_db_path
-
-    if isinstance(client_ids, list):
-        raise ValueError(
-            "Dla wielu client IDs musisz podać jawnie --train-db-path albo --test-db-path"
-        )
-
-    t0_str = t0.strftime("%Y-%m-%d")
-    db_path = build_db_path(db_root, t0_str, client_ids)
-
+def validate_db_path(db_path: str) -> str:
+    if not db_path:
+        raise ValueError("Musisz podać --db-path")
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"Baza nie istnieje: {db_path}")
-
     return db_path
-
-
 def prepare_config_for_run(
     config,
     train_client_ids,
     test_client_ids,
     model_path,
-    train_db_path,
-    test_db_path,
+    db_path,
 ):
     cfg = copy.deepcopy(config)
-
     cfg["first_model_params"]["train_client_id"] = train_client_ids
     cfg["first_model_params"]["test_client_id"] = test_client_ids
-    cfg["first_model_params"]["database"] = train_db_path
-    cfg["first_model_params"]["test_database"] = test_db_path
+    cfg["first_model_params"]["database"] = db_path
+    cfg["first_model_params"]["test_database"] = db_path
     cfg["first_model_params"]["model_path"] = model_path
-
-    # jeśli te pola istnieją/mają znaczenie w first_model
+    # pola pomocnicze dla nowej logiki jednej bazy
     cfg["first_model_params"]["client_ids_to_train_on_one_db"] = train_client_ids
     cfg["first_model_params"]["client_ids_to_test_on_one_db"] = test_client_ids
-
     return cfg
-
-
 def run_phase(
     config,
     t0,
@@ -125,8 +78,7 @@ def run_phase(
     train_client_ids,
     test_client_ids,
     model_path,
-    train_db_path,
-    test_db_path,
+    db_path,
     results_file,
 ):
     cfg = prepare_config_for_run(
@@ -134,13 +86,10 @@ def run_phase(
         train_client_ids=train_client_ids,
         test_client_ids=test_client_ids,
         model_path=model_path,
-        train_db_path=train_db_path,
-        test_db_path=test_db_path,
+        db_path=db_path,
     )
-
     acceptance_period = cfg["first_model_params"]["acceptance_period"]
     retrain_period = cfg["first_model_params"]["retrain_period"]
-
     actual_model_path, test_start, test_end, train_start, train_end = get_train_test_params(
         cfg["first_model_params"],
         operation_mode,
@@ -148,14 +97,12 @@ def run_phase(
         acceptance_period,
         retrain_period,
     )
-
     logging.info("=== START phase %s ===", operation_mode)
     logging.info("train_client_id=%s", cfg["first_model_params"]["train_client_id"])
     logging.info("test_client_id=%s", cfg["first_model_params"]["test_client_id"])
     logging.info("database=%s", cfg["first_model_params"]["database"])
     logging.info("test_database=%s", cfg["first_model_params"]["test_database"])
     logging.info("model_path=%s", cfg["first_model_params"]["model_path"])
-
     avg_acc = first_model.first_model(
         actual_model_path,
         test_start,
@@ -168,34 +115,23 @@ def run_phase(
         acceptance_period,
         retrain_period,
     )
-
     save_model_run(results_file, cfg, operation_mode, avg_acc)
-
     logging.info("=== END phase %s ===", operation_mode)
     return avg_acc
-
-def run_test_for_each_client(
+def run_test_for_each_client_on_shared_db(
     config,
     t0,
     test_mode,
     train_client_ids,
     test_client_ids,
     model_path,
-    test_db_template,
+    db_path,
     results_file,
 ):
     failures = []
-
     for test_client_id in ensure_list(test_client_ids):
-        logging.info("=== START single-client test: %s ===", test_client_id)
-
+        logging.info("=== START single-client test on shared DB: %s ===", test_client_id)
         try:
-            test_db_path = build_db_path_from_template(test_db_template, test_client_id)
-
-            if not os.path.exists(test_db_path):
-                raise FileNotFoundError(f"Baza nie istnieje: {test_db_path}")
-
-            # w trybie pomostowym test ma czytać i zapisywać do pojedynczej bazy klienta
             run_phase(
                 config=config,
                 t0=t0,
@@ -203,104 +139,57 @@ def run_test_for_each_client(
                 train_client_ids=train_client_ids,
                 test_client_ids=test_client_id,
                 model_path=model_path,
-                train_db_path=test_db_path,
-                test_db_path=test_db_path,
+                db_path=db_path,
                 results_file=results_file,
             )
-
         except first_model.NoDataError as e:
             logging.warning("[SKIP TEST] client %s: %s", test_client_id, e)
         except Exception as e:
             logging.exception("Test failed for client %s: %s", test_client_id, e)
             failures.append(test_client_id)
-
-        logging.info("=== END single-client test: %s ===", test_client_id)
-
+        logging.info("=== END single-client test on shared DB: %s ===", test_client_id)
     return failures
-
 def parse_args():
-    parser = argparse.ArgumentParser(description="Batch runner for first_model")
-
+    parser = argparse.ArgumentParser(description="Batch runner for first_model on one shared DB")
     parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
     parser.add_argument("--t0", required=True, help="Current date in YYYY-MM-DD")
-    parser.add_argument("--model-path", required=True, help="Base path to .pt model")
-    parser.add_argument("--db-root", default="databases", help="Root directory for per-client databases")
+    parser.add_argument("--model-path", required=True, help="Path to .pt model")
+    parser.add_argument("--db-path", required=True, help="Path to shared SQLite DB")
     parser.add_argument("--results-file", default="model_runs.xlsx", help="Excel file for run results")
-
     parser.add_argument("--run-train", action="store_true", help="Run training phase")
     parser.add_argument("--run-test", action="store_true", help="Run test phase")
-
     parser.add_argument("--train-mode", default="train", help="Operation mode for training")
     parser.add_argument("--test-mode", default="test_today", help="Operation mode for testing")
-
     parser.add_argument("--train-client-ids", help="Single client id or comma-separated list for training")
     parser.add_argument("--test-client-ids", help="Single client id or comma-separated list for testing")
-
-    parser.add_argument("--train-db-path", help="Explicit DB path for training")
-    parser.add_argument("--test-db-path", help="Explicit DB path for testing")
-
-    parser.add_argument("--test-db-template", help="Template path for per-client test DB, e.g. C:/.../CashPredictorT_{client_id}.db")    
-
-    # opcjonalnie dla zgodności wstecznej z Twoim starym test runnerem
-    parser.add_argument("--client-id", type=int, help="Single client id shortcut for test")
-    parser.add_argument("--client-list", help="Comma separated client ids shortcut for test")
-
     return parser.parse_args()
-
-
 def main():
     args = parse_args()
     config = load_config(args.config)
     t0 = datetime.strptime(args.t0, "%Y-%m-%d").date()
-
     if not args.run_train and not args.run_test:
         raise SystemExit("Podaj przynajmniej --run-train albo --run-test")
-
-    # zgodność wsteczna: stary test runner
-    fallback_test_client_ids = None
-    if args.client_id is not None:
-        fallback_test_client_ids = args.client_id
-    elif args.client_list:
-        fallback_test_client_ids = [int(x.strip()) for x in args.client_list.split(",") if x.strip()]
-
+    db_path = validate_db_path(args.db_path)
     train_client_ids = parse_client_ids(args.train_client_ids)
     test_client_ids = parse_client_ids(args.test_client_ids)
-
-    if test_client_ids is None and fallback_test_client_ids is not None:
-        test_client_ids = fallback_test_client_ids
-
     if args.run_train and train_client_ids is None:
         raise SystemExit("Dla --run-train musisz podać --train-client-ids")
-
     if args.run_test and test_client_ids is None:
-        raise SystemExit("Dla --run-test musisz podać --test-client-ids albo --client-id/--client-list")
-
+        raise SystemExit("Dla --run-test musisz podać --test-client-ids")
     failures = []
-
-    trained_model_path = args.model_path
-
+    model_path = args.model_path
     # TRAIN
     if args.run_train:
         try:
-            train_db_path = resolve_db_path(
-                db_root=args.db_root,
-                t0=t0,
-                client_ids=train_client_ids,
-                explicit_db_path=args.train_db_path,
-            )
-
-            # przy samym train test_client_ids może być takie samo jak train_client_ids
             effective_test_ids_for_train = test_client_ids if test_client_ids is not None else train_client_ids
-
             run_phase(
                 config=config,
                 t0=t0,
                 operation_mode=args.train_mode,
                 train_client_ids=train_client_ids,
                 test_client_ids=effective_test_ids_for_train,
-                model_path=trained_model_path,
-                train_db_path=train_db_path,
-                test_db_path=train_db_path,
+                model_path=model_path,
+                db_path=db_path,
                 results_file=args.results_file,
             )
         except first_model.NoDataError as e:
@@ -308,64 +197,40 @@ def main():
         except Exception as e:
             logging.exception("Train failed: %s", e)
             failures.append("train")
-
     # TEST
     if args.run_test:
         try:
             effective_train_ids_for_test = train_client_ids if train_client_ids is not None else test_client_ids
-
-            # TRYB POMOSTOWY:
-            # test wielu klientów przez pętlę po pojedynczych bazach
             if isinstance(test_client_ids, list):
-                if not args.test_db_template:
-                    raise SystemExit(
-                        "Dla testu wielu klientów w rozwiązaniu pomostowym musisz podać --test-db-template"
-                    )
-
-                test_failures = run_test_for_each_client(
+                test_failures = run_test_for_each_client_on_shared_db(
                     config=config,
                     t0=t0,
                     test_mode=args.test_mode,
                     train_client_ids=effective_train_ids_for_test,
                     test_client_ids=test_client_ids,
-                    model_path=trained_model_path,
-                    test_db_template=args.test_db_template,
+                    model_path=model_path,
+                    db_path=db_path,
                     results_file=args.results_file,
                 )
-
                 if test_failures:
                     failures.extend([f"test:{client_id}" for client_id in test_failures])
-
             else:
-                # stary wariant: test jednego klienta
-                test_db_path = resolve_db_path(
-                    db_root=args.db_root,
-                    t0=t0,
-                    client_ids=test_client_ids,
-                    explicit_db_path=args.test_db_path,
-                )
-
                 run_phase(
                     config=config,
                     t0=t0,
                     operation_mode=args.test_mode,
                     train_client_ids=effective_train_ids_for_test,
                     test_client_ids=test_client_ids,
-                    model_path=trained_model_path,
-                    train_db_path=test_db_path,
-                    test_db_path=test_db_path,
+                    model_path=model_path,
+                    db_path=db_path,
                     results_file=args.results_file,
                 )
-
         except first_model.NoDataError as e:
             logging.warning("[SKIP TEST] %s", e)
         except Exception as e:
             logging.exception("Test failed: %s", e)
             failures.append("test")
-
     if failures:
         raise SystemExit(f"Run finished with failures in phases: {failures}")
-
-
 if __name__ == "__main__":
     main()
