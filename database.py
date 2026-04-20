@@ -140,6 +140,71 @@ def create_and_insert_processed_table(conn, processed_df, target_table_name, ori
     
     print(f"Tabela '{sanitized_table_name}' została utworzona i dane zostały zapisane.")
 
+def insert_into_existing_table(
+    conn,
+    processed_df,
+    target_table_name,
+    batch_size=500000
+):
+    """
+    Dopisuje dane do istniejącej tabeli.
+    NIE robi DROP TABLE.
+    NIE robi CREATE TABLE.
+    Zakłada, że schemat został już przygotowany wcześniej (np. przez db_init).
+    """
+    cursor = conn.cursor()
+    sanitized_table_name = sanitize_table_name(target_table_name)
+    # 1. Sprawdzenie, czy tabela istnieje
+    exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;",
+        (sanitized_table_name,)
+    ).fetchone()
+    if not exists:
+        raise RuntimeError(
+            f"Tabela '{sanitized_table_name}' nie istnieje. "
+            f"Najpierw utwórz ją w db_init lub innym etapie inicjalizacji."
+        )
+    # 2. Pobranie kolumn z istniejącej tabeli
+    cursor.execute(f"PRAGMA table_info({sanitized_table_name});")
+    table_info = cursor.fetchall()
+    table_columns = [row[1] for row in table_info]
+    if not table_columns:
+        raise RuntimeError(f"Nie udało się pobrać kolumn tabeli '{sanitized_table_name}'.")
+    # 3. Upewniamy się, że DF ma wszystkie kolumny wymagane przez tabelę
+    df = processed_df.copy()
+    for col in table_columns:
+        if col not in df.columns:
+            df[col] = None
+    # 4. Ograniczamy się do kolumn tabeli i w tej samej kolejności
+    df = df[table_columns]
+    # 5. Zamiana NaN/NaT na None
+    df = df.where(pd.notna(df), None)
+    placeholders = ", ".join(["?" for _ in table_columns])
+    insert_sql = f"""
+        INSERT INTO {sanitized_table_name} ({', '.join(table_columns)})
+        VALUES ({placeholders})
+    """
+    def _to_sqlite_safe(v):
+        if pd.isna(v):
+            return None
+        if isinstance(v, np.datetime64):
+            v = pd.to_datetime(v)
+        if isinstance(v, pd.Timestamp):
+            return v.to_pydatetime()
+        return v
+    total_inserted = 0
+    for start in range(0, len(df), batch_size):
+        chunk = df.iloc[start:start + batch_size]
+        rows = [
+            tuple(_to_sqlite_safe(v) for v in row)
+            for row in chunk.itertuples(index=False, name=None)
+        ]
+        cursor.executemany(insert_sql, rows)
+        conn.commit()
+        total_inserted += len(rows)
+    logging.info(
+        f"[insert_into_existing_table] Dopisano {total_inserted} wierszy do tabeli '{sanitized_table_name}'."
+    )
 
 def get_column_types(cursor, table_name):
     """
@@ -214,7 +279,7 @@ def standardize_dataframe_types(df, date_columns=None):
                 df[col] = pd.to_datetime(df[col])
     return df
 
-def write_output_to_db(df, table_name, params, original_table_name=None, currently_testing=False, create_indexes=False, index_columns=None):
+def write_output_to_db(df, table_name, params, original_table_name=None, currently_testing=False, create_indexes=False, index_columns=None, insert_only=False):
     logging.info(f"Starting to write DataFrame to table: {table_name}")
 
     if currently_testing:
@@ -225,7 +290,10 @@ def write_output_to_db(df, table_name, params, original_table_name=None, current
     logging.info(f"Attempting to write DataFrame to table: {table_name}")
     with get_connection(database_path) as conn:
         try:
-            create_and_insert_processed_table(conn, df, table_name, original_table_name, params['data_limit'], create_indexes=create_indexes, index_columns=index_columns)
+            if insert_only:
+                insert_into_existing_table(conn=conn, processed_df=df, target_table_name=table_name, batch_size=params.get("data_limit", 500000))
+            else:
+                create_and_insert_processed_table(conn, df, table_name, original_table_name, params['data_limit'], create_indexes=create_indexes, index_columns=index_columns)           
         except Exception as e:
             print(f"Failed to write DataFrame to table {table_name}: {e}")
             conn.rollback()
