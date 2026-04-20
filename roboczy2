@@ -1,231 +1,253 @@
-Dobra — tu już widać, że logika klientów jest w zasadzie dobrze zaprojektowana, tylko trzeba ją delikatnie „uszczelnić”, żeby spełniała wszystkie Twoje scenariusze:
+Dobra — uporządkujmy to raz a dobrze, bo tu już wchodzimy w docelowy design sterowania klientami 👍
 
 ⸻
 
-✅ 1. Co już działa dobrze
+🧠 1. Jak to MA działać (docelowo)
 
-Masz funkcję:
+Chcesz mieć:
 
-def resolve_clients(all_clients, include=None, exclude=None):
-    all_clients = set(all_clients)
-    if include:
-        selected = set(include)
+🎯 Sterowanie WYŁĄCZNIE z wywołania (runtime), NIE z configa
+
+Czyli:
+
+* ❌ brak:
+    * train_client_id w YAML
+    * test_client_id w YAML
+    * exclude_ids w YAML
+* ✅ wszystko idzie z parametrów funkcji (np. runner)
+
+⸻
+
+🔥 Docelowa logika
+
+Funkcja przyjmuje:
+
+include_clients   # lista klientów do uruchomienia
+exclude_clients   # lista klientów do wykluczenia
+
+I działa tak:
+
+przypadek	efekt
+brak include	wszyscy
+include=[]	wszyscy
+include=[…]	tylko ci
+exclude=[…]	wywal tych
+include + exclude	include minus exclude
+
+⸻
+
+🧱 2. Co to oznacza dla build_dataset_db
+
+NOWA sygnatura:
+
+def build_dataset_db(
+    params,
+    t0,
+    include_clients=None,
+    exclude_clients=None,
+    create_db_from_one_excel=False,
+    skip_raw_tables=False,
+    build_derived=True
+):
+
+⸻
+
+🧨 3. Czy można usunąć drugi tryb (else)?
+
+TAK — ale pod jednym warunkiem:
+
+👉 Zawsze używasz:
+
+create_db_from_one_excel=True
+
+I:
+
+* masz jeden plik z wieloma klientami
+* NIE korzystasz z plików per klient
+
+⸻
+
+🔍 Co robi ten else teraz?
+
+# wiele plików: jeden Excel na klienta
+
+Czyli:
+
+* szuka Bartek_*_{client}.xlsx
+* ładuje osobno
+
+⸻
+
+❗ Jeśli tego NIE używasz:
+
+👉 możesz usunąć cały blok else w 100% bezpiecznie
+
+⸻
+
+✂️ 4. Co dokładnie usuwasz
+
+Usuń CAŁY ten blok:
+
+else:
+    suffix = params["train_client_id"]
+    if isinstance(suffix, (list, tuple, np.ndarray)):
+        client_ids = list(suffix)
     else:
-        selected = all_clients
-    if exclude:
-        selected -= set(exclude)
-    return sorted(selected)
+        client_ids = [suffix]
+    files_for_client = {}
+    for cid in client_ids:
+        matches = glob.glob(...)
+        ...
 
-I to jest prawie idealne — ale ma jeden krytyczny problem 👇
+I też:
 
-⸻
+files_for_client = None
 
-❌ 2. Problem: if include: i if exclude:
+oraz w pętli:
 
-To rozwala przypadki:
-
-* include = [] → traktowane jak False → bierze WSZYSTKICH ❌
-* exclude = [] → traktowane jak False → OK, ale przypadkiem
-
-Czyli nie rozróżniasz:
-
-* None → brak parametru
-* [] → pusty, ale podany
+else:
+    file_path = files_for_client[client_id]
+    df_invo, df_debc, df_clhs, df_dcmo = load_excel_sheets(file_path, params)
 
 ⸻
 
-✅ 3. POPRAWKA (kluczowa)
+🔧 5. Co zmieniasz w głównym trybie
 
-Zamień funkcję na:
-
-def resolve_clients(all_clients, include=None, exclude=None):
-    all_clients = set(all_clients)
-    # include
-    if include is None:
-        selected = all_clients
-    else:
-        selected = set(include)
-    # exclude
-    if exclude is not None:
-        selected -= set(exclude)
-    return sorted(selected)
-
-⸻
-
-🔥 4. Co to daje (dokładnie Twoje wymagania)
-
-przypadek	include	exclude	wynik
-brak obu	None	None	wszyscy ✅
-include=[]	[]	None	nikt (świadomie)
-exclude=[]	None	[]	wszyscy
-include=[1,2]	[1,2]	None	tylko 1,2
-exclude=[3]	None	[3]	wszyscy poza 3
-include=[1,2,3] + exclude=[2]			→ [1,3] ✅
-
-⸻
-
-⚠️ 5. ALE: Ty chcesz trochę inne zachowanie
-
-Z Twojego opisu:
-
-„pusta lista = traktuj jak brak parametru”
-
-czyli:
-
-* include=[] → wszyscy
-* exclude=[] → brak wykluczeń
-
-⸻
-
-✅ 6. Wersja zgodna z Twoją logiką
-
-Zrób tak:
-
-def resolve_clients(all_clients, include=None, exclude=None):
-    all_clients = set(all_clients)
-    # include
-    if include is None or len(include) == 0:
-        selected = all_clients
-    else:
-        selected = set(include)
-    # exclude
-    if exclude:
-        selected -= set(exclude)
-    return sorted(selected)
-
-⸻
-
-🧠 7. Co teraz masz dokładnie
-
-include	exclude	wynik
-None	None	wszyscy
-[]	None	wszyscy
-None	[]	wszyscy
-[1,2]	None	1,2
-None	[3]	wszyscy bez 3
-[1,2,3]	[2]	1,3
-
-👉 dokładnie to, co chciałeś
-
-⸻
-
-🔍 8. Gdzie to jest używane
-
-Masz to tutaj:
+❌ usuń:
 
 include_clients = params.get("train_client_id")
 exclude_clients = params.get("exclude_ids")
+
+⸻
+
+✅ zastąp:
+
 client_ids = resolve_clients(
     all_clients=all_client_ids,
     include=include_clients,
     exclude=exclude_clients,
 )
 
-✔️ to zostaje bez zmian
-
 ⸻
 
-⚠️ 9. Drugi problem (ważny!)
+🧩 6. Finalna wersja (kluczowy fragment)
 
-Masz też drugi tryb:
-
-suffix = params["train_client_id"]
-if isinstance(suffix, (list, tuple, np.ndarray)):
-    client_ids = list(suffix)
-else:
-    client_ids = [suffix]
-
-👉 TU NIE MA exclude ❌
-👉 TU NIE MA “ALL” ❌
-
-⸻
-
-✅ 10. Popraw drugi tryb
-
-Zastąp to:
-
-suffix = params["train_client_id"]
-if isinstance(suffix, (list, tuple, np.ndarray)):
-    client_ids = list(suffix)
-else:
-    client_ids = [suffix]
-
-tym:
-
-include_clients = params.get("train_client_id")
-exclude_clients = params.get("exclude_ids")
-# zbierz wszystkich klientów z plików
-all_clients = []
-for file in glob.glob(r"C:\Users\OE00SG\CashPredictor\dev3\co i jak baza\Bartek_*_*.xlsx"):
-    match = re.search(r"_(\d+)\.xlsx$", file)
-    if match:
-        all_clients.append(int(match.group(1)))
+# wszystkie klienty z danych
+all_client_ids = (
+    df_invo_all['INVO_CLNTNO']
+    .dropna()
+    .astype(int)
+    .unique()
+    .tolist()
+)
 client_ids = resolve_clients(
-    all_clients=all_clients,
+    all_clients=all_client_ids,
     include=include_clients,
     exclude=exclude_clients,
 )
 
 ⸻
 
-🔥 11. BONUS: logowanie (bardzo polecam)
+🔧 7. resolve_clients (ostateczna wersja)
 
-Dodaj po resolve:
-
-print(f"[CLIENT RESOLUTION]")
-print(f"include: {include_clients}")
-print(f"exclude: {exclude_clients}")
-print(f"final: {client_ids}")
+def resolve_clients(all_clients, include=None, exclude=None):
+    all_clients = set(all_clients)
+    if include is None or len(include) == 0:
+        selected = all_clients
+    else:
+        selected = set(include)
+    if exclude:
+        selected -= set(exclude)
+    return sorted(selected)
 
 ⸻
 
-🚀 12. Przykładowe wywołania
+🧹 8. Co jeszcze możesz usunąć
+
+z configa YAML:
+
+Usuń:
+
+train_client_id:
+test_client_id:
+exclude_ids:
+
+⸻
+
+z kodu (globalnie)
+
+Wyszukaj i usuń WSZĘDZIE:
+
+params.get("train_client_id")
+params.get("test_client_id")
+params.get("exclude_ids")
+
+⸻
+
+⚠️ 9. WAŻNE: runner_batch.py
+
+Jeśli masz runner:
+
+👉 MUSISZ teraz przekazywać:
+
+build_dataset_db(
+    params,
+    t0,
+    include_clients=...,
+    exclude_clients=...
+)
+
+⸻
+
+🧪 10. Przykłady wywołań
 
 ✅ wszyscy
 
-# brak parametru
-
-✅ wszyscy (jawnie)
-
-train_client_id: []
+build_dataset_db(params, t0)
 
 ✅ tylko wybrani
 
-train_client_id: [6089, 10095]
+build_dataset_db(params, t0, include_clients=[6089, 10095])
 
-✅ wszyscy oprócz
+✅ wszyscy oprócz jednego
 
-exclude_ids: [6089]
+build_dataset_db(params, t0, exclude_clients=[6089])
 
 ✅ mix
 
-train_client_id: [6089, 10095, 20000]
-exclude_ids: [10095]
-
-→ wynik: [6089, 20000]
-
-⸻
-
-🧠 13. TL;DR (co masz zrobić)
-
-1. ZMIEŃ funkcję:
-
-resolve_clients
-
-2. POPRAW drugi tryb (multi-file)
-
-3. DODAJ logowanie
+build_dataset_db(
+    params,
+    t0,
+    include_clients=[6089, 10095, 20000],
+    exclude_clients=[10095]
+)
 
 ⸻
 
-💡 14. Najważniejsze
+🧠 11. TL;DR
 
-Twój pipeline jest już dobrze zaprojektowany —
-tu była tylko subtelna rzecz:
+✔ możesz usunąć else → TAK (jeśli jeden Excel)
 
-👉 różnica między None a []
+✔ usuń klienty z configa → TAK
+
+✔ przenieś sterowanie do parametrów funkcji → TAK
+
+✔ zostaje tylko:
+
+* resolve_clients
+* include_clients, exclude_clients
 
 ⸻
 
-Jak chcesz, następny krok:
-👉 mogę Ci spiąć to jeszcze z runnerem i first_model, żeby wszędzie było spójne (bo tam pewnie jeszcze jest leak)
+🚀 12. Efekt końcowy
+
+Masz:
+
+* prosty pipeline
+* zero magii w YAML
+* pełna kontrola z runnera
+
+⸻
+
+Jeśli chcesz, następny krok:
+👉 mogę Ci uprościć jeszcze runner_batch + first_model, żeby wszystko było spójne (bo tam pewnie jeszcze masz stare podejście)
