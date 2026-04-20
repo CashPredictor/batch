@@ -1,3 +1,5 @@
+# runner_batch.py
+import sqlite3
 import argparse
 import copy
 import logging
@@ -7,18 +9,19 @@ import pandas as pd
 import yaml
 import first_model
 from first_model import get_train_test_params
+from build_dataset_db import resolve_clients
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
+
 def load_config(config_path: str = "config.yaml") -> dict:
     with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+        
 def save_model_run(results_file, config, operation_mode, avg_accuracy):
     row_data = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "train_client_id": str(config["first_model_params"]["train_client_id"]),
-        "test_client_id": str(config["first_model_params"]["test_client_id"]),
         "model_path": config["first_model_params"]["model_path"],
         "database": config["first_model_params"]["database"],
         "test_database": config["first_model_params"].get("test_database"),
@@ -34,26 +37,43 @@ def save_model_run(results_file, config, operation_mode, avg_accuracy):
         combined_df = pd.concat([existing_df, df_new], ignore_index=True)
         combined_df.to_excel(results_file, index=False, sheet_name="runs")
         logging.info("Appended run to results file: %s", results_file)
-def parse_client_ids(raw_value):
-    if raw_value is None:
+
+def get_all_clients_from_db(db_path: str, table_name: str = "dataset") -> list[int]:
+    conn = sqlite3.connect(db_path)
+    try:
+        query = f"""
+            SELECT DISTINCT INVO_CLNTNO
+            FROM {table_name}
+            WHERE INVO_CLNTNO IS NOT NULL
+            ORDER BY INVO_CLNTNO
+        """
+        df = pd.read_sql_query(query, conn)
+        return df["INVO_CLNTNO"].astype(int).tolist()
+    finally:
+        conn.close()    
+        
+def parse_client_ids(s):
+    if not s:
         return None
-    parts = [x.strip() for x in str(raw_value).split(",") if x.strip()]
-    ids = [int(x) for x in parts]
-    if len(ids) == 1:
-        return ids[0]
-    return ids
+    s = s.strip()
+    if not s:
+        return None
+    return [int(x) for x in s.split(",") if x.strip()]
+    
 def ensure_list(client_ids):
     if client_ids is None:
         return []
     if isinstance(client_ids, list):
         return client_ids
     return [client_ids]
+    
 def validate_db_path(db_path: str) -> str:
     if not db_path:
         raise ValueError("Musisz podać --db-path")
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"Baza nie istnieje: {db_path}")
     return db_path
+    
 def prepare_config_for_run(
     config,
     train_client_ids,
@@ -62,15 +82,13 @@ def prepare_config_for_run(
     db_path,
 ):
     cfg = copy.deepcopy(config)
-    cfg["first_model_params"]["train_client_id"] = train_client_ids
-    cfg["first_model_params"]["test_client_id"] = test_client_ids
     cfg["first_model_params"]["database"] = db_path
     cfg["first_model_params"]["test_database"] = db_path
     cfg["first_model_params"]["model_path"] = model_path
-    # pola pomocnicze dla nowej logiki jednej bazy
-    cfg["first_model_params"]["client_ids_to_train_on_one_db"] = train_client_ids
-    cfg["first_model_params"]["client_ids_to_test_on_one_db"] = test_client_ids
+    cfg["first_model_params"]["train_client_id"] = train_client_ids
+    cfg["first_model_params"]["test_client_id"] = test_client_ids    
     return cfg
+    
 def run_phase(
     config,
     t0,
@@ -98,8 +116,6 @@ def run_phase(
         retrain_period,
     )
     logging.info("=== START phase %s ===", operation_mode)
-    logging.info("train_client_id=%s", cfg["first_model_params"]["train_client_id"])
-    logging.info("test_client_id=%s", cfg["first_model_params"]["test_client_id"])
     logging.info("database=%s", cfg["first_model_params"]["database"])
     logging.info("test_database=%s", cfg["first_model_params"]["test_database"])
     logging.info("model_path=%s", cfg["first_model_params"]["model_path"])
@@ -162,31 +178,43 @@ def parse_args():
     parser.add_argument("--test-mode", default="test_today", help="Operation mode for testing")
     parser.add_argument("--train-client-ids", help="Single client id or comma-separated list for training")
     parser.add_argument("--test-client-ids", help="Single client id or comma-separated list for testing")
+    parser.add_argument("--exclude-train-client-ids", type=str, help="Single client id or comma-separated list for training")
+    parser.add_argument("--exclude-test-client-ids", type=str, help="Single client id or comma-separated list for testing")
     return parser.parse_args()
+    
 def main():
-    args = parse_args()
+    args = parse_args()    
     config = load_config(args.config)
     t0 = datetime.strptime(args.t0, "%Y-%m-%d").date()
     if not args.run_train and not args.run_test:
         raise SystemExit("Podaj przynajmniej --run-train albo --run-test")
     db_path = validate_db_path(args.db_path)
-    train_client_ids = parse_client_ids(args.train_client_ids)
-    test_client_ids = parse_client_ids(args.test_client_ids)
-    if args.run_train and train_client_ids is None:
-        raise SystemExit("Dla --run-train musisz podać --train-client-ids")
-    if args.run_test and test_client_ids is None:
-        raise SystemExit("Dla --run-test musisz podać --test-client-ids")
+    train_include = parse_client_ids(args.train_client_ids)
+    test_include = parse_client_ids(args.test_client_ids)
+    train_exclude = parse_client_ids(args.exclude_train_client_ids)
+    test_exclude = parse_client_ids(args.exclude_test_client_ids)    
+    all_clients = get_all_clients_from_db(db_path, table_name="dataset")
+    resolved_train_client_ids = resolve_clients(
+        all_clients=all_clients,
+        include=train_include,
+        exclude=train_exclude,
+    )
+    resolved_test_client_ids = resolve_clients(
+        all_clients=all_clients,
+        include=test_include,
+        exclude=test_exclude,
+    )
     failures = []
     model_path = args.model_path
     # TRAIN
     if args.run_train:
         try:
-            effective_test_ids_for_train = test_client_ids if test_client_ids is not None else train_client_ids
+            effective_test_ids_for_train = resolved_test_client_ids
             run_phase(
                 config=config,
                 t0=t0,
                 operation_mode=args.train_mode,
-                train_client_ids=train_client_ids,
+                train_client_ids=resolved_train_client_ids,
                 test_client_ids=effective_test_ids_for_train,
                 model_path=model_path,
                 db_path=db_path,
@@ -200,14 +228,14 @@ def main():
     # TEST
     if args.run_test:
         try:
-            effective_train_ids_for_test = train_client_ids if train_client_ids is not None else test_client_ids
-            if isinstance(test_client_ids, list):
+            effective_train_ids_for_test = resolved_train_client_ids
+            if len(resolved_test_client_ids) > 1:
                 test_failures = run_test_for_each_client_on_shared_db(
                     config=config,
                     t0=t0,
                     test_mode=args.test_mode,
                     train_client_ids=effective_train_ids_for_test,
-                    test_client_ids=test_client_ids,
+                    test_client_ids=resolved_test_client_ids,
                     model_path=model_path,
                     db_path=db_path,
                     results_file=args.results_file,
@@ -220,7 +248,7 @@ def main():
                     t0=t0,
                     operation_mode=args.test_mode,
                     train_client_ids=effective_train_ids_for_test,
-                    test_client_ids=test_client_ids,
+                    test_client_ids=resolved_test_client_ids,
                     model_path=model_path,
                     db_path=db_path,
                     results_file=args.results_file,
