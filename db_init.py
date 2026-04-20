@@ -47,16 +47,6 @@ def create_indexes(index_definitions: dict[str, list[str]], conn: sqlite3.Connec
 
     conn.commit()
 
-def create_and_import_swieta(conn, params, file_path):
-
-    # Wczytaj dane z pliku Excel
-    data = pd.read_excel(file_path)
-    
-    # Konwertuj kolumnę 'data' na typ daty
-    data['data'] = pd.to_datetime(data['data'], format='%d.%m.%Y')
-    
-    # Import danych do tabeli
-    data.to_sql('swieta', conn, if_exists='append', index=False)
 
 def create_aggregated_data_temp_schema(cursor: sqlite3.Cursor, params: dict) -> None:
     cursor.execute(params.get("query_aggregated_data_temp"))
@@ -65,6 +55,42 @@ def create_aggregated_data_temp_schema(cursor: sqlite3.Cursor, params: dict) -> 
         ON aggregated_data_temp (DZIEN);
     """)
 
+def seed_swieta(cursor: sqlite3.Cursor, params: dict) -> None:
+    columns = params.get("swieta_columns")
+    rows = params.get("swieta_rows")
+
+    if not columns or not rows:
+        print("[WARN] Brak definicji świąt w configu, pomijam seed tabeli swieta.")
+        return
+
+    placeholders = ", ".join(["?"] * len(columns))
+    columns_sql = ", ".join(columns)
+
+    # wstawiamy tylko jeśli identyczny rekord jeszcze nie istnieje
+    where_clause = " AND ".join([f"{col} = ?" for col in columns])
+
+    inserted = 0
+    for row in rows:
+        if len(row) != len(columns):
+            raise RuntimeError(
+                f"Nieprawidłowy rekord swieta. Oczekiwano {len(columns)} pól, "
+                f"otrzymano {len(row)}: {row}"
+            )
+
+        cursor.execute(
+            f"SELECT 1 FROM swieta WHERE {where_clause} LIMIT 1",
+            tuple(row),
+        )
+        exists = cursor.fetchone() is not None
+
+        if not exists:
+            cursor.execute(
+                f"INSERT INTO swieta ({columns_sql}) VALUES ({placeholders})",
+                tuple(row),
+            )
+            inserted += 1
+
+    print(f"[OK] Seed swieta zakończony. Dodano {inserted} nowych rekordów.")
 
 def main():
     parser = argparse.ArgumentParser(description="SQLite DB schema initialization")
@@ -90,9 +116,11 @@ def main():
         # 2. Tabele statyczne / deterministyczne
         # ============================================================
         create_aggregated_data_temp_schema(cursor, params)
-        create_and_import_swieta(conn_new, params, file_path = r'C:\Users\OE00SG\CashPredictor\dev3\co i jak baza\Arkusz w C  Users OQ38TT jupiter dev3 co i jak baza co i jak baza.xls')
 
         exec_sql(conn, params.get("query_swieta"), "query_swieta")
+        seed_swieta(cursor, params)
+        conn.commit()
+        
         exec_sql(conn, params.get("query_create_group_cust_inv_days"), "query_create_group_cust_inv_days")
         exec_sql(conn, params.get("query_create_summary_client_days_tab2"), "query_create_summary_client_days_tab2")
         exec_sql(conn, params.get("query_create_dataset_tab"), "query_create_dataset_tab")
@@ -107,31 +135,20 @@ def main():
         exec_sql(conn, params.get("query_create_dataset"), "query_create_dataset")
         exec_sql(conn, params.get("query_create_invo_clhs_joined_tab_table"), "query_create_invo_clhs_joined_tab_table")
         exec_sql(conn, params.get("query_create_extended_grouped_client_days_tab_table"), "query_create_extended_grouped_client_days_tab_table")
+        exec_sql(conn, params.get("query_create_first_model_tab"), "query_create_first_model_tab")
 
         conn.commit()
 
-        # ============================================================
-        # 3. Widoki bazowe – tylko jeśli ich tabele źródłowe już istnieją
-        #    (na dziś najpewniej jeszcze nie istnieją na pustej DB)
-        # ============================================================
-        raw_tables = ["invo", "debc", "clhs", "dcmo"]
-        raw_ready = all(table_exists(cursor, t) for t in raw_tables)
-
-        if raw_ready:
-            exec_sql(conn, params.get("query_create_invo_view"), "query_create_invo_view")
-            exec_sql(conn, params.get("query_create_clhs_view"), "query_create_clhs_view")
-            exec_sql(conn, params.get("query_create_DEBC_view"), "query_create_DEBC_view")
-            exec_sql(conn, params.get("query_create_dcmo_view"), "query_create_dcmo_view")
-            exec_sql(conn, params.get("query_create_INVO_CLHS_JOINED"), "query_create_INVO_CLHS_JOINED")
-            exec_sql(conn, params.get("query_create_summary_client_days_view"), "query_create_summary_client_days_view")
-            exec_sql(conn, params.get("query_create_extended_grouped_client_days_view"), "query_create_extended_grouped_client_days_view")
-            conn.commit()
-        else:
-            print(
-                "[WARN] Pomijam tworzenie widoków bazowych, bo brakuje tabel RAW: "
-                "invo / debc / clhs / dcmo."
-            )
-
+        exec_sql(conn, params.get("query_create_invo_view"), "query_create_invo_view")
+        exec_sql(conn, params.get("query_create_clhs_view"), "query_create_clhs_view")
+        exec_sql(conn, params.get("query_create_DEBC_view"), "query_create_DEBC_view")
+        exec_sql(conn, params.get("query_create_dcmo_view"), "query_create_dcmo_view")
+        exec_sql(conn, params.get("query_create_INVO_CLHS_JOINED"), "query_create_INVO_CLHS_JOINED")
+        exec_sql(conn, params.get("query_create_summary_client_days_view"), "query_create_summary_client_days_view")
+        exec_sql(conn, params.get("query_create_extended_grouped_client_days_view"), "query_create_extended_grouped_client_days_view")
+        exec_sql(conn, params.get("query_create_stats_pivot_view"), "query_create_stats_pivot_view")
+        exec_sql(conn, params.get("query_create_dataset_raw_view"), "query_create_dataset_raw_view")
+        conn.commit()
 
         # ============================================================
         # 5. Indeksy na znanych tabelach
@@ -152,8 +169,7 @@ def main():
         cursor.execute(params['idx_summary_days_ids_dzien'])
         cursor.execute(params['idx_ext_days_ids_dzien'])
         cursor.execute(params['idx_clhs_joined_keys_datetime'])
-        cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_aggregated_data_temp_all
-ON aggregated_data_temp (DZIEN, DZIS_DZIEN_TYG, DZIS_SOBOTA, DZIS_NIEDZIELA);')
+        cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_aggregated_data_temp_all ON aggregated_data_temp (DZIEN, DZIS_DZIEN_TYG, DZIS_SOBOTA, DZIS_NIEDZIELA);')
         conn.commit()
         
         # indeksy jawnie z configu: idx_*
@@ -178,6 +194,11 @@ ON aggregated_data_temp (DZIEN, DZIS_DZIEN_TYG, DZIS_SOBOTA, DZIS_NIEDZIELA);')
 
         if table_exists(cursor, "invo"):
             cursor.execute("CREATE INDEX IF NOT EXISTS invo_idx_one_for_all ON invo (INVO_ADMNO, INVO_DEBH_NO, INVO_DEBC_NO, INVO_INVDATE);")
+
+        if table_exists(cursor, "first_model_tab"):
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_first_model_tab_runid ON first_model_tab (RunIdentifier);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_first_model_tab_client_day ON first_model_tab (INVO_CLNTNO, DZIEN);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_first_model_tab_invoice ON first_model_tab (INVO_NO);")
 
         conn.commit()
 
