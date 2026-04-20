@@ -11,6 +11,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from scipy.stats import skew, kurtosis, mode
 import matplotlib.pyplot as plt
+
 from mpl_toolkits.mplot3d import Axes3D
 from importlib import reload
 from database import read_data_from_db, write_output_to_db, read_data_from_all_db
@@ -1170,10 +1171,18 @@ def first_model(actual_model_path, test_start, test_end, train_start, train_end,
                   else row[params['clear_date']]),
             axis=1
         )
-        write_output_to_db(final_output_df, 'first_model_tab', params, original_table_name=None, currently_testing=True, create_indexes=True, index_columns=[ 'INVO_NO', 'INVO_DEBC_NO', 'INVO_INVDATE', 'DZIEN', 'INVO_FINALPAYMENTDATE', 'PREDICTED_PAYMENT_DATE'])
-        if operation_mode != 'test_to_today':
-            output_filename = f"C:/Users/OE00SG/CashPredictor/dev3/first_model_output/first_model_{params['train_client_id']}_{params['model_name']}.xlsx"
-            final_output_df.to_excel(output_filename, index=False)
-            print(f"Dane zostały zapisane do pliku Excel: {output_filename}")
-    
+        run_identifier = f"{operation_mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        final_output_df = final_output_df.copy()
+        if "RunIdentifier" not in final_output_df.columns:
+            final_output_df.insert(0, "RunIdentifier", run_identifier)
+        write_output_to_db(
+            final_output_df,
+            'first_model_tab',
+            params,
+            original_table_name="first_model_tab",
+            currently_testing=True,
+            create_indexes=False,
+            index_columns=None,
+            insert_only=True
+        )
     return avg_accuracy
