@@ -529,112 +529,79 @@ def adapt_pandas_timestamp(ts):
 def convert_pandas_timestamp(ts):
     return pd.Timestamp(ts.decode('utf-8'))
 
+def resolve_clients(all_clients, include=None, exclude=None):
+    all_clients = set(all_clients)
+    # include
+    if include is None or len(include) == 0:
+        selected = all_clients
+    else:
+        selected = set(include)
+    # exclude
+    if exclude:
+        selected -= set(exclude)
+    return sorted(selected)
+
 # Rejestracja adapterów
 sqlite3.register_adapter(datetime, adapt_datetime)
 sqlite3.register_converter('DATETIME', convert_datetime)
 sqlite3.register_adapter(pd.Timestamp, adapt_pandas_timestamp)
 sqlite3.register_converter('DATETIME', convert_pandas_timestamp)
 
-def build_dataset_db(params, t0, create_db_from_one_excel=False, skip_raw_tables=False, build_derived=True):
+def build_dataset_db(params, t0, include_clients=None, exclude_clients=None, dkip_raw_tables=False, build_derived=True):
+    
     # skip_raw_tables=False, build_derived=True -> NORMAL (RAW+DERIVED)
     # skip_raw_tables=False, build_derived=False -> ETAP 1 (RAW only)
     # skip_raw_tables=True,  build_derived=True -> ETAP 2 (DERIVED only)    
     data_end_str = _to_date_str(t0)
-    if create_db_from_one_excel:
-        # --- jeden plik z wieloma klientami ---
-        file_path = params['multi_client_excel_path']
-        df_invo_all, df_debc_all, df_clhs_all, df_dcmo_all = load_excel_sheets(file_path, params)
+    # --- jeden plik z wieloma klientami ---
+    file_path = params['multi_client_excel_path']
+    df_invo_all, df_debc_all, df_clhs_all, df_dcmo_all = load_excel_sheets(file_path, params)
 
-        print("przed client_ids = df_invo_all['INVO_CLNTNO'].dropna().unique()")
-        # ------------------------------------------------------------------
-        # 1️⃣ wszyscy klienci z Excela (jak dotychczas)
-        # ------------------------------------------------------------------
-        all_client_ids = (
-            df_invo_all['INVO_CLNTNO']
-            .dropna()
-            .unique()
-            .tolist()
-        )
-        
-        # ------------------------------------------------------------------
-        # 2️⃣ liczenie i sortowanie (TYLKO do logu + kolejności)
-        # ------------------------------------------------------------------
-        _counts = (
-            df_invo_all
-            .dropna(subset=['INVO_CLNTNO'])
-            .groupby('INVO_CLNTNO', as_index=False)
-            .size()
-            .rename(columns={'size': 'cnt'})
-        )
-        
-        _counts_sorted = _counts.sort_values('cnt', ascending=True)
-        
-        print("Kolejność przetwarzania (od najmniejszej liczby wierszy INVO):")
-        for rank, (cid, cnt) in enumerate(
-            zip(_counts_sorted['INVO_CLNTNO'], _counts_sorted['cnt']),
-            start=1
-        ):
-            print(f"{rank:>2}. klient {int(cid)} → {int(cnt)} wierszy INVO")
-        
-        # ------------------------------------------------------------------
-        # 3️⃣ zawężenie listy kategorii (NOWA LOGIKA)
-        # ------------------------------------------------------------------
-        client_ids = all_client_ids
-        
-        # 3a) jeżeli podano klientów (CLI / override config)
-        explicit_clients = params.get("train_client_id")
-        if explicit_clients:
-            explicit_clients = set(explicit_clients)
-            client_ids = [cid for cid in client_ids if cid in explicit_clients]
-        
-        # 3b) usunięcie exclude_ids (jak wcześniej)
-        exclude_ids = set(params.get("exclude_ids", []))
-        client_ids = [cid for cid in client_ids if cid not in exclude_ids]
-        
-        # ------------------------------------------------------------------
-        # 4️⃣ zachowanie kolejności wynikającej z liczby rekordów
-        # ------------------------------------------------------------------
-        client_ids = [
-            cid for cid in _counts_sorted['INVO_CLNTNO']
-            if cid in client_ids
-        ]
-        
-        print(f"[INFO] Finalna lista klientów do przetworzenia: {client_ids}")
-        
-        # czytelny wydruk: kolejność + ile rekordów ma każdy klient
-        print("Kolejność przetwarzania (od najmniejszej liczby wierszy INVO):")
-        for rank, (cid, cnt) in enumerate(zip(_counts_sorted['INVO_CLNTNO'],
-                                              _counts_sorted['cnt']), start=1):
-            print(f"{rank:>2}. klient {int(cid)} → {int(cnt)} wierszy INVO")     
-        print("po client_ids = df_invo_all['INVO_CLNTNO'].dropna().unique() order by _counts.sort_values('cnt', ascending=True)['INVO_CLNTNO']")
-
-        files_for_client = None  # w tym trybie niepotrzebne
-    else:
-        # --- wiele plików: po jednym Excelu na klienta ---
-        suffix = params["train_client_id"]
-
-        # Ujednolicenie do listy
-        if isinstance(suffix, (list, tuple, np.ndarray)):
-            client_ids = list(suffix)
-        else:
-            client_ids = [suffix]
-
-        # znajdź pliki per‑klient
-        files_for_client = {}
-        for cid in client_ids:
-            matches = glob.glob(
-                fr"C:\Users\OE00SG\CashPredictor\dev3\co i jak baza\Bartek_*_{cid}.xlsx"
-            )
-            if not matches:
-                raise FileNotFoundError(
-                    fr"Nie znaleziono pliku dopasowanego do wzorca: 'Bartek_*_{cid}.xlsx'"
-                )
-            files_for_client[cid] = matches[0]
-
-        # jeśli to był tylko jeden klient → możesz od razu wczytać,
-        # ale i tak wczytamy w pętli per‑klient (patrz niżej),
-        # żeby obsłużyć także przypadek wielu klientów.
-        df_invo_all = df_debc_all = df_clhs_all = df_dcmo_all = None
+    print("przed client_ids = df_invo_all['INVO_CLNTNO'].dropna().unique()")
+    # ------------------------------------------------------------------
+    # 1️⃣ wszyscy klienci z Excela (jak dotychczas)
+    # ------------------------------------------------------------------
+    # wszystkie klienty z danych
+    all_client_ids = (
+        df_invo_all['INVO_CLNTNO']
+        .dropna()
+        .astype(int)
+        .unique()
+        .tolist()
+    )
+    client_ids = resolve_clients(
+        all_clients=all_client_ids,
+        include=include_clients,
+        exclude=exclude_clients,
+    )
+    
+    # ------------------------------------------------------------------
+    # 2️⃣ liczenie i sortowanie (TYLKO do logu + kolejności)
+    # ------------------------------------------------------------------
+    _counts = (
+        df_invo_all
+        .dropna(subset=['INVO_CLNTNO'])
+        .groupby('INVO_CLNTNO', as_index=False)
+        .size()
+        .rename(columns={'size': 'cnt'})
+    )
+    
+    _counts_sorted = _counts.sort_values('cnt', ascending=True)
+    
+    for rank, (cid, cnt) in enumerate(
+        zip(_counts_sorted['INVO_CLNTNO'], _counts_sorted['cnt']),
+        start=1
+    ):
+        print(f"{rank:>2}. klient {int(cid)} → {int(cnt)} wierszy INVO")
+    
+    print(f"[INFO] Finalna lista klientów do przetworzenia: {client_ids}")
+    
+    # czytelny wydruk: kolejność + ile rekordów ma każdy klient
+    print("Kolejność przetwarzania (od najmniejszej liczby wierszy INVO):")
+    for rank, (cid, cnt) in enumerate(zip(_counts_sorted['INVO_CLNTNO'],
+                                          _counts_sorted['cnt']), start=1):
+        print(f"{rank:>2}. klient {int(cid)} → {int(cnt)} wierszy INVO")     
+    print("po client_ids = df_invo_all['INVO_CLNTNO'].dropna().unique() order by _counts.sort_values('cnt', ascending=True)['INVO_CLNTNO']")
 
     db_path = params['database']
     conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
@@ -644,16 +611,10 @@ def build_dataset_db(params, t0, create_db_from_one_excel=False, skip_raw_tables
         print("client_id: ", client_id)
     
         # wczytujemy dane:
-        if create_db_from_one_excel:
-            # już wczytane wyżej do *_all
-            df_invo = df_invo_all[df_invo_all['INVO_CLNTNO'] == client_id].copy()
-            df_debc = df_debc_all[df_debc_all['DEBC_CLNTNO'] == client_id].copy()
-            df_clhs = df_clhs_all[df_clhs_all['CLHS_CLNTNO'] == client_id].copy()
-            df_dcmo = df_dcmo_all[df_dcmo_all['DEBC_CLNTNO'] == client_id].copy()  # jeśli tak masz w danych
-        else:
-            # osobny plik dla każdego klienta
-            file_path = files_for_client[client_id]
-            df_invo, df_debc, df_clhs, df_dcmo = load_excel_sheets(file_path, params)
+        df_invo = df_invo_all[df_invo_all['INVO_CLNTNO'] == client_id].copy()
+        df_debc = df_debc_all[df_debc_all['DEBC_CLNTNO'] == client_id].copy()
+        df_clhs = df_clhs_all[df_clhs_all['CLHS_CLNTNO'] == client_id].copy()
+        df_dcmo = df_dcmo_all[df_dcmo_all['DEBC_CLNTNO'] == client_id].copy()
 
         validate_required_schema_for_create_database(cursor)
     
