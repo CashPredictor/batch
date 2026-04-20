@@ -267,3 +267,68 @@ ponadto mam jeszcze w config i kodzie:
     CLHS_NEXT_CHANGED_DATETIME DATETIME
     );
         exec_sql(conn, params.get("query_create_invo_clhs_joined_tab_table"), "query_create_invo_clhs_joined_tab_table")
+
+ponadto wypadałoby jeszcze wyrzucić z #build_dataset_db.py poniższe, zastanów się czy to możliwe i jak to zrobić:
+        # Pobranie danych z invo_view
+        query_invo = """
+        SELECT 
+            INVO_NO,
+            INVO_ADMNO,
+            INVO_CLNTNO,
+            INVO_DEBH_NO,
+            INVO_DEBC_NO,
+            INVO_INVDATE,
+            INVO_FINALPAYMENTDATE
+        FROM invo_view
+        WHERE INVO_INVDATE IS NOT NULL
+          AND DATE(INVO_INVDATE) >= DATE(?)
+          AND INVO_CLNTNO = ?
+        """
+tutaj trzebaby dokleić where chyba bo ma parametr?
+
+to nie wiem czy jest szczęścliwa definicja i odporna na błęd?
+        # Wstawianie danych do tabeli
+        cursor.execute("DELETE FROM group_cust_inv_days WHERE INVO_CLNTNO = ?", (client_id,))
+
+        cursor.executemany("""
+        INSERT INTO group_cust_inv_days (
+            INVO_NO, INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, INVO_INVDATE, DZIEN, ROK, MIESIAC, INVO_FINALPAYMENTDATE
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, data_to_insert)
+
+da się to zrobić jakoś lepiej? jakie byłby najlepsze praktyki?
+
+to możaby pobrać skądś?
+        # Definicja kolumn DCMO
+        dcmo_columns = [
+            "DCMO_PAIDAMOUNT", "DCMO_PAIDAMOUNTINVDATE", "DCMO_PAIDAMOUNTDUEDATE",
+            "DCMO_PAIDAMOUNTBEFOREDUEDATE", "DCMO_PAIDAMOUNTAFTDUEDAT30", "DCMO_PAIDAMOUNTAFTDUEDAT60",
+            "DCMO_PAIDAMOUNTAFTDUEDAT90", "DCMO_PAIDAMOUNTAFTDUEDAT120", "DCMO_PAIDAMOUNTAFTDUEDATG120",
+            "DCMO_PAIDNINVBEFDUEDATE", "DCMO_PAIDNINVAFTDUEDATE30", "DCMO_PAIDNINVAFTDUEDATE60",
+            "DCMO_PAIDNINVAFTDUEDATE90", "DCMO_PAIDNINVAFTDUEDATE120", "DCMO_PAIDNINVAFTDUEDATEG120",
+            "DCMO_TOTASALESDEBTNOTES", "DCMO_TOTNDEBTNOTES", "DCMO_TOTASALESCREDNOTES",
+            "DCMO_TOTNCREDNOTES", "DCMO_AVGBALANCEOUTSTANDING", "DCMO_BALANCEHI",
+            "DCMO_NDUNNINGLETTERS", "DCMO_BALANCELO", "DCMO_BALANCE",
+            "DCMO_NINVOICESOUTSTANDING", "DCMO_PAIDAMOUNTDISPUTES", "DCMO_PAIDAMOUNTPARTIALPAYM"
+        ]
+tu tak samo:
+                    # Wstawianie wyników do tabeli
+                    cursor.execute("""
+                        INSERT INTO statystyki_faktur (
+                            INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, DZIEN,
+                            SCENARIUSZ, AVG_DNI_DO_ZAPLATY, STDEV_DNI_DO_ZAPLATY,
+                            AVG_DNI_OPOZNIENIA, STDEV_DNI_OPOZNIENIA,
+                            SUM_INVO_AINITIALH, AVG_INVO_AINITIALH, STDEV_INVO_AINITIALH,
+                            ILE_FAKTUR, PARAM_Z_ILU_DNI, INSERT_TIMESTAMP
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        invo_admno, invo_clntno, invo_debh_no, invo_debc_no,
+                        na_dzien.strftime('%Y-%m-%d %H:%M:%S'),
+                        scenariusz,
+                        avg_dni_do_zaplaty, stdev_dni_do_zaplaty,
+                        avg_dni_opoznienia, stdev_dni_opoznienia,
+                        sum_invo_ainitialh, avg_invo_ainitialh, stdev_invo_ainitialh,
+                        ile_faktur, z_ilu_dni, datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    ))
+
+czy to już jest szukanie dziury w całym?
