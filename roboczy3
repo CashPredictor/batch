@@ -1,113 +1,109 @@
-mieliśmy tak:
-        offsets = [1, 2, 3, 6, 12]
+Tak to finalnie powinno wyglądać w build_dataset_db.py — z użyciem tych dwóch plików SQL i bez starych params['idx_...'].
+
+Wstaw ten fragment w miejsce całego starego bloku zaczynającego się od:
+
+offsets = [1, 2, 3, 6, 12]
+print("Rozpoczynam partiami wstawianie do 'extended_grouped_client_days_tab'...")
+...
+cursor.execute("SELECT data FROM swieta")
+holidays = {pd.Timestamp(row[0]) for row in cursor.fetchall()}
+
+Fragment do wklejenia
 
         print("Rozpoczynam partiami wstawianie do 'extended_grouped_client_days_tab'...")
-    
-        # 1. Pobieramy listę (ROK, MIESIAC) występujących w widoku
-        cursor.execute("""
+        select_year_month_sql = """
             SELECT DISTINCT ROK, MIESIAC
             FROM extended_grouped_client_days
             WHERE INVO_CLNTNO = ?
             ORDER BY ROK, MIESIAC
-        """, (client_id,))
+        """
+        insert_extended_sql = load_sql_file(f"{queries_dir}/insert_extended_grouped_client_days.sql")
+        insert_summary_sql = load_sql_file(f"{queries_dir}/insert_summary_client_days.sql")
+        # lista partii do przerobienia
+        cursor.execute(select_year_month_sql, (client_id,))
         year_month_rows = cursor.fetchall()
-
+        # odświeżenie targetów dla klienta
         cursor.execute("DELETE FROM extended_grouped_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
-        
-        # 2. Iterujemy po każdej parze (ROK, MIESIAC)
-        for (year, month) in year_month_rows:
-            insert_sql = f"""
-            INSERT INTO extended_grouped_client_days_tab
-            SELECT *
-            FROM extended_grouped_client_days
-            WHERE ROK = {year}
-              AND MIESIAC = {month}
-              AND date(DZIEN) >= {params['od_dnia']}
-              AND INVO_CLNTNO = {client_id};
-            """
-            cursor.execute(insert_sql)
-            conn.commit()  # commit po każdej partii
-        
-            # Podgląd liczby wstawionych wierszy
-            inserted_count = cursor.rowcount  # w SQLite rowcount czasem bywa -1, zależy od wersji
-            print(f"Wstawiono partię: ROK={year}, MIESIAC={month} (rowcount={inserted_count})")
-        
-        print("Wszystkie partie zostały zaimportowane.")
-        print(datetime.now().strftime("%H:%M:%S"))
-        
-        # Zatwierdzenie zmian
-        conn.commit()
-        print("Proces zakończony.")
-        
-        print("Rozpoczynam partiami wstawianie do 'summary_client_days_tab'...")
-        
-        # 3. Znajdujemy, od którego (ROK, MIESIAC) kontynuować.
-        #    Szukamy w summary_client_days_tab największego ROK,MIESIAC wstawionego
-        #    lub None, jeśli pusto.
-        
-        
         cursor.execute("DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
         conn.commit()
-        
-        cursor.execute("""
-            SELECT DISTINCT ROK, MIESIAC
-            FROM extended_grouped_client_days
-            WHERE INVO_CLNTNO = ?
-            ORDER BY ROK, MIESIAC
-        """, (client_id,))
-        all_rows = cursor.fetchall()
-        
+        # 1) extended_grouped_client_days_tab
         inserted_count = 0
-
-        for (year, month) in all_rows:
-            insert_sql = """
-                INSERT INTO summary_client_days_tab
-                SELECT *
-                FROM summary_client_days_view
-                WHERE ROK = ?
-                  AND MIESIAC = ?
-                  AND INVO_CLNTNO = ?
-            """
-            cursor.execute(insert_sql, (year, month, client_id))
+        for (year, month) in year_month_rows:
+            cursor.execute(insert_extended_sql, (year, month, params["od_dnia"], client_id))
             conn.commit()
-        
             row_count = cursor.rowcount if cursor.rowcount != -1 else 0
             inserted_count += row_count
-            print(f"Wstawiono ROK={year}, MIESIAC={month} -> {row_count} wierszy (narastająco={inserted_count})")
-        
-        print(f"Wszystkie partie zostały zaimportowane. Łącznie wstawiono (teraz) = {inserted_count}.")
+            print(f"Wstawiono extended: ROK={year}, MIESIAC={month} -> {row_count} wierszy (narastająco={inserted_count})")
+        print(f"Extended zakończone. Łącznie wstawiono = {inserted_count}.")
         print(datetime.now().strftime("%H:%M:%S"))
-
-        cursor.execute(params['idx_invo_debcno_invdate_etc'])
-        cursor.execute(params['idx_invo_debcno_invdate'])
-        cursor.execute(params['idx_summary_days_ids_dzien'])
-        cursor.execute(params['idx_ext_days_ids_dzien'])
-        cursor.execute(params['idx_clhs_joined_keys_datetime'])
-        conn.commit()
-        
+        # 2) summary_client_days_tab
+        print("Rozpoczynam partiami wstawianie do 'summary_client_days_tab'...")
+        inserted_count = 0
+        for (year, month) in year_month_rows:
+            cursor.execute(insert_summary_sql, (year, month, client_id))
+            conn.commit()
+            row_count = cursor.rowcount if cursor.rowcount != -1 else 0
+            inserted_count += row_count
+            print(f"Wstawiono summary: ROK={year}, MIESIAC={month} -> {row_count} wierszy (narastająco={inserted_count})")
+        print(f"Summary zakończone. Łącznie wstawiono = {inserted_count}.")
+        print(datetime.now().strftime("%H:%M:%S"))
         # Pobranie świąt (jeśli istnieją)
         cursor.execute("SELECT data FROM swieta")
-        holidays = {pd.Timestamp(row[0]) for row in cursor.fetchall()}
-        
-        # Parametry wejściowe
+        holidays = {pd.Timestamp(row[0]) for row in cursor.fetchall() if row[0] is not None}
 
-a teraz mamy takie pliki:
-insert_summary_client_days.sql
-INSERT INTO summary_client_days_tab
-SELECT *
-FROM summary_client_days_view
-WHERE ROK = ?
-	AND MIESIAC = ?
-	AND INVO_CLNTNO = ?
+⸻
 
-i
-insert_extended_grouped_client_days
-INSERT INTO extended_grouped_client_days_tab
-SELECT *
-FROM extended_grouped_client_days
-WHERE ROK = ?
-  AND MIESIAC = ?
-  AND DATE(DZIEN) >= DATE(?)
-  AND INVO_CLNTNO = ?
+Co z tego usuń
 
-przeanalizuj jak finalnie powinno to wyglądać z tymi plikami czyli defakto podaj mi fragment do wklejenia cały jak i gdzie.
+Usuń już całkowicie:
+
+offsets = [1, 2, 3, 6, 12]
+
+Usuń też cały blok:
+
+cursor.execute(params['idx_invo_debcno_invdate_etc'])
+cursor.execute(params['idx_invo_debcno_invdate'])
+cursor.execute(params['idx_summary_days_ids_dzien'])
+cursor.execute(params['idx_ext_days_ids_dzien'])
+cursor.execute(params['idx_clhs_joined_keys_datetime'])
+conn.commit()
+
+bo indeksy mają już być zakładane w db_init.py, nie tutaj.
+
+⸻
+
+Dlaczego tak
+
+To zachowuje starą logikę:
+
+* najpierw pobierasz listę (ROK, MIESIAC) z extended_grouped_client_days
+* potem czyścisz tabele docelowe dla klienta
+* potem lecisz partiami po miesiącach:
+    * najpierw extended_grouped_client_days_tab
+    * potem summary_client_days_tab
+
+I korzystasz już z plików:
+
+* insert_extended_grouped_client_days.sql
+* insert_summary_client_days.sql
+
+⸻
+
+Drobna uwaga
+
+To zapytanie:
+
+select_year_month_sql = """
+    SELECT DISTINCT ROK, MIESIAC
+    FROM extended_grouped_client_days
+    WHERE INVO_CLNTNO = ?
+    ORDER BY ROK, MIESIAC
+"""
+
+też możesz później wynieść do pliku, np.:
+
+select_distinct_year_month_extended_grouped_client_days.sql
+
+ale na teraz nie musisz. Ten fragment może spokojnie zostać inline.
+
+Jeśli chcesz, mogę teraz zrobić Ci jeszcze następny krok: wskazać dokładnie, które bloki w build_dataset_db.py zostały jeszcze do wyniesienia do plików SQL, a które warto już zostawić w Pythonie.
