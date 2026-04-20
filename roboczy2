@@ -1,258 +1,505 @@
-Problem jest prosty: runner przekazuje listy klientów pod złymi kluczami, a first_model.py nadal czyta je spod starych kluczy.
+Tak bym to poukładał.
 
-Dlatego filtr się nie buduje i masz:
+Jak to ma działać
 
-[first_model] Client filter: ALL (no filtering)
+Docelowo masz 3 osobne warstwy:
 
-mimo że podałeś:
+1. Bootstrap bazy
+    * jeśli plik DB nie istnieje, tworzysz pustą bazę i schema/init,
+    * jeśli istnieje, nie robisz db_init, tylko przechodzisz dalej.
+2. Build danych
+    * build_dataset_db.py tylko ładuje dane i wypełnia tabele robocze/docelowe,
+    * nie powinien decydować o tym, jak wygląda schema bazy.
+3. Trening/test
+    * korzysta z gotowej bazy,
+    * nie zna SQL-i tworzących schema.
 
---train-client-ids 10069
---test-client-ids 10069
+To jest spójne z tym, jak później zwykle układa się pipeline: osobny krok przygotowania schematu/migracji, osobny krok ładowania danych, osobny krok uruchomienia aplikacji/modelu. Microsoft dla Azure Pipelines promuje podejście oparte o YAML, szablony, parametryzację oraz powtarzalne wdrożenia; dla baz danych zaleca w szczególności podejście projektowe/DACPAC albo uporządkowane skrypty SQL wykonywane w pipeline, zamiast trzymania logiki wdrożeniowej rozproszonej po kodzie aplikacji.  ￼
 
-Co obecnie się dzieje
+1. Jak zrobić auto-init tylko gdy baza nie istnieje
 
-1. runner_batch.py
+Najprościej: nie każ użytkownikowi odpalać osobno db_init.py, tylko dodaj helper w build_client_db.py albo nowym prepare_db.py.
 
-W main() poprawnie liczysz:
+Rekomendowany wariant
 
-* resolved_train_client_ids = [10069]
-* resolved_test_client_ids = [10069]
+Niech build_client_db.py robi:
 
-To jest OK.
+* sprawdzenie os.path.exists(db_path)
+* jeśli nie istnieje: wywołanie db_init
+* jeśli istnieje: tylko log i dalej build_dataset_db
 
-2. run_phase() -> prepare_config_for_run()
+Przykład
 
-Tutaj robisz:
+# build_client_db.py
+import argparse
+import os
+import subprocess
+import sys
+from datetime import datetime
+import yaml
+import build_dataset_db
+def load_config(path="config.yaml"):
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+def parse_client_ids(raw):
+    if raw is None:
+        return None
+    vals = [int(x.strip()) for x in raw.split(",") if x.strip()]
+    return vals or None
+def ensure_db_initialized(config_path: str, db_path: str):
+    if os.path.exists(db_path):
+        print(f"[INFO] DB already exists, skipping init: {db_path}")
+        return
+    print(f"[INFO] DB does not exist, initializing: {db_path}")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "db_init.py",
+            "--config", config_path,
+            "--db-path", db_path,
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"db_init.py failed with exit code {result.returncode}")
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--t0", required=True)
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--db-path", required=True)
+    parser.add_argument("--include-clients")
+    parser.add_argument("--exclude-clients")
+    args = parser.parse_args()
+    config = load_config(args.config)
+    t0 = datetime.strptime(args.t0, "%Y-%m-%d").date()
+    ensure_db_initialized(args.config, args.db_path)
+    config["first_model_params"]["database"] = args.db_path
+    include_clients = parse_client_ids(args.include_clients)
+    exclude_clients = parse_client_ids(args.exclude_clients)
+    print(f"[INFO] include={include_clients}, exclude={exclude_clients}")
+    build_dataset_db.build_dataset_db(
+        config["first_model_params"],
+        t0,
+        include_clients=include_clients,
+        exclude_clients=exclude_clients,
+    )
+if __name__ == "__main__":
+    main()
 
-cfg["first_model_params"]["client_ids_to_train_on_one_db"] = train_client_ids
-cfg["first_model_params"]["client_ids_to_test_on_one_db"] = test_client_ids
+Dlaczego tak
 
-ale nie robisz już:
+Bo:
 
-cfg["first_model_params"]["train_client_id"] = train_client_ids
-cfg["first_model_params"]["test_client_id"] = test_client_ids
+* db_init.py zostaje single-purpose,
+* build_client_db.py staje się entrypointem operacyjnym,
+* później w pipeline łatwo to zastąpić osobnym stage/jobem.
 
-3. first_model.py
-
-A filtr w build_client_filter_sql() czyta właśnie:
-
-ids = params.get('train_client_id')
-
-albo przy teście:
-
-ids = params.get('test_client_id')
-
-czyli szuka starych pól.
-
-W efekcie:
-
-* train_client_id nie istnieje albo jest puste,
-* test_client_id nie istnieje albo jest puste,
-* więc funkcja zwraca "",
-* czyli leci ALL.
-
-To jest główna przyczyna.
-
-⸻
-
-Diagnoza
-
-Masz niespójność między warstwami:
-
-Runner zapisuje
-
-client_ids_to_train_on_one_db
-client_ids_to_test_on_one_db
-
-First model odczytuje
-
-train_client_id
-test_client_id
-
-To się nie spotyka.
-
-⸻
-
-Co trzeba zmienić
-
-Masz dwie opcje.
-
-Lepsza opcja
-
-Zostawić nowe nazwy pomocnicze, ale dodatkowo ustawiać stare, bo reszta kodu ich jeszcze używa.
-
-Popraw prepare_config_for_run() w runner_batch.py
-
-Zmień na:
-
-def prepare_config_for_run(
-    config,
-    train_client_ids,
-    test_client_ids,
-    model_path,
-    db_path,
-):
-    cfg = copy.deepcopy(config)
-    cfg["first_model_params"]["database"] = db_path
-    cfg["first_model_params"]["test_database"] = db_path
-    cfg["first_model_params"]["model_path"] = model_path
-    # klucze używane obecnie przez first_model.py
-    cfg["first_model_params"]["train_client_id"] = train_client_ids
-    cfg["first_model_params"]["test_client_id"] = test_client_ids
-    # klucze pomocnicze / nowe
-    cfg["first_model_params"]["client_ids_to_train_on_one_db"] = train_client_ids
-    cfg["first_model_params"]["client_ids_to_test_on_one_db"] = test_client_ids
-    return cfg
-
-To najważniejsza poprawka.
+Nie polecam przenosić całej logiki db_init.py do build_client_db.py, bo to miesza odpowiedzialności.
 
 ⸻
 
-Dodatkowo
+2. Co można przerzucić z build_dataset_db.py do configa, a czego nie warto
 
-Dobrze też zalogować te wartości przed wywołaniem modelu.
+Tu ważne: nie wszystko, co jest SQL-em, powinno siedzieć w configu.
 
-W run_phase() dodaj:
+Do przeniesienia z kodu do zewnętrznych plików SQL
 
-logging.info("train_client_id=%s", cfg["first_model_params"].get("train_client_id"))
-logging.info("test_client_id=%s", cfg["first_model_params"].get("test_client_id"))
-logging.info("client_ids_to_train_on_one_db=%s", cfg["first_model_params"].get("client_ids_to_train_on_one_db"))
-logging.info("client_ids_to_test_on_one_db=%s", cfg["first_model_params"].get("client_ids_to_test_on_one_db"))
+To, co opisuje schema albo powtarzalne zapytania biznesowe:
 
-Wtedy od razu zobaczysz, co naprawdę trafia do first_model.
+* CREATE TABLE ...
+* CREATE VIEW ...
+* CREATE INDEX ...
+* duże INSERT INTO ... SELECT ...
+* skomplikowane SELECT ... używane do budowy datasetu
+* pivoty, widoki pośrednie, zapytania agregujące
 
-⸻
+To są rzeczy, które dobrze żyją jako:
 
-Dlaczego teraz trenuje na wielu klientach
+* osobne pliki .sql,
+* wersjonowane w repo,
+* uruchamiane przez pipeline albo ładowane przez Pythona.
 
-Bo w preprocess_data_model1() dzieje się to:
+To jest bliższe dobrym praktykom CI/CD i późniejszej migracji do podejścia SQL project / DACPAC / migration scripts. Microsoft wskazuje SQL Database Projects jako lokalną, wersjonowaną reprezentację schematu bazy i artefakt typu .dacpac jako standardowy sposób budowania i wdrażania zmian schematu; SqlPackage jest do tego oficjalnym narzędziem i może być używany z Azure Pipelines.  ￼
 
-client_filter_sql = build_client_filter_sql(params, currently_testing=currently_testing)
-if client_filter_sql:
-    ...
-else:
-    logging.info("[first_model] Client filter: ALL (no filtering)")
+Czego nie trzymać w configu
 
-A ponieważ train_client_id / test_client_id nie zostały ustawione w configu przekazywanym do modelu, filtr jest pusty.
+Nie trzymałbym w YAML:
 
-Potem:
+* ogromnych SQL stringów inline,
+* wieloliniowych CREATE VIEW,
+* złożonych INSERT ... SELECT,
+* logiki warunkowej wdrożeń.
 
-* base_query idzie bez IN (...),
-* liczysz count po całym dataset,
-* cap liczysz po wszystkich klientach,
-* dlatego pojawia się np. klient 11437.
+YAML/config powinien zawierać raczej:
 
-To właśnie potwierdza, że trening poszedł na full dataset.
+* ścieżki do plików SQL,
+* wartości parametrów,
+* nazwy tabel,
+* przełączniki typu build_derived=true,
+* batch size, shard count, date ranges.
 
-⸻
+Dobra granica
 
-Czy jest coś jeszcze nie tak
-
-Tak, są jeszcze 3 rzeczy do poprawy lub uporządkowania.
-
-1. Literówka w build_dataset_db.py
-
-Masz funkcję:
-
-def build_dataset_db(params, t0, include_clients=None, exclude_clients=None, kip_raw_tables=False, build_derived=True):
-
-a niżej używasz:
-
-if not skip_raw_tables:
-
-Czyli parametr nazywa się kip_raw_tables, a kod używa skip_raw_tables.
-
-To wywali błąd albo będzie działać źle.
-
-Popraw definicję na:
-
-def build_dataset_db(params, t0, include_clients=None, exclude_clients=None, skip_raw_tables=False, build_derived=True):
+Config = parametry
+SQL files = definicje bazy i duże zapytania
+Python = orchestration
 
 ⸻
 
-2. run_phase() przy train ustawia też test_client_ids
+3. Jak to ujednolicić zgodnie z dobrymi praktykami
 
-To nie jest błąd krytyczny, ale mylące. W treningu testowa lista nie musi być równa liście testów końcowych. U Ciebie to jest tylko przekazywane dalej i może mieszać w logach albo w plikach wynikowych.
+Teraz masz miks:
 
-Na teraz może zostać, ale warto wiedzieć.
+* trochę SQL w configu,
+* trochę SQL inline w Pythonie,
+* trochę nazw parametrów niespójnych,
+* trochę starych reliktów flow.
+
+To bym ujednolicił tak:
+
+Struktura docelowa
+
+project/
+  config/
+    app.yaml
+  sql/
+    schema/
+      001_create_swieta.sql
+      002_create_invo.sql
+      003_create_debc.sql
+      004_create_clhs.sql
+      005_create_dcmo.sql
+      006_create_group_cust_inv_days.sql
+      007_create_grouped_client_days.sql
+      008_create_summary_client_days_tab.sql
+      009_create_extended_grouped_client_days_tab.sql
+      010_create_dataset_tab.sql
+      011_create_dataset.sql
+      012_create_first_model_tab.sql
+    views/
+      101_invo_view.sql
+      102_clhs_view.sql
+      103_debc_view.sql
+      104_dcmo_view.sql
+      105_invo_clhs_joined.sql
+      106_summary_client_days_view.sql
+      107_extended_grouped_client_days.sql
+      108_stats_pivot_view.sql
+      109_dataset_raw_view.sql
+    dml/
+      seed_swieta.sql
+    queries/
+      grouped_query.sql
+      query_stats_pivot_select.sql
+      query_dataset_raw_select.sql
+
+YAML tylko do tego
+
+first_model_params:
+  database: ""
+  multi_client_excel_path: "..."
+  od_dnia: "2024-06-22"
+  NUM_SHARDS: 8
+  dataset_batch_days: 31
+sql_paths:
+  schema_dir: "sql/schema"
+  views_dir: "sql/views"
+  query_grouped: "sql/queries/grouped_query.sql"
+  query_stats_pivot_select: "sql/queries/query_stats_pivot_select.sql"
+  query_dataset_raw_select: "sql/queries/query_dataset_raw_select.sql"
+
+To jest dużo zdrowsze.
 
 ⸻
 
-3. build_client_db.py
+4. Co konkretnie przenieść z build_dataset_db.py
 
-To już wygląda sensownie. Teraz działa zgodnie z nową logiką:
+Zostawić w Pythonie
 
-* klienci tylko z CLI,
-* include_clients i exclude_clients,
-* brak polegania na configowych train_client_id / exclude_ids.
+Bo to jest orkiestracja:
 
-To jest OK.
+* iteracja po klientach,
+* filtrowanie klientów include/exclude,
+* ładowanie Excela,
+* pętle batch/shard,
+* DELETE WHERE INVO_CLNTNO = ?,
+* parametryzowane wywołania SQL,
+* to_sql, executemany, retry/logi.
+
+Przenieść do .sql
+
+Te rzeczy szczególnie:
+
+a) query_invo
+
+To spokojnie może być plik SQL.
+
+b) insert_query do INVO_CLHS_JOINED_TAB
+
+Też plik SQL.
+
+c) remove_duplicates_query
+
+Też plik SQL.
+
+d) grouped_query
+
+Już masz częściowo w configu, ale lepiej do pliku .sql.
+
+e) stats_pivot_sql
+
+Do pliku .sql.
+
+f) dataset_raw_sql
+
+Do pliku .sql.
+
+g) query_faktury_tpl
+
+Też można dać do pliku .sql, choć tu masz sporo dynamicznego formatowania. Lepiej byłoby to przepisać na parametry ?, a nie .format(...).
 
 ⸻
 
-Minimalna poprawka, która naprawi Twój problem
+5. Jak ujednolicić przekazywanie parametrów
 
-Wystarczy ta jedna zmiana w runner_batch.py:
+Teraz masz mieszankę:
 
-cfg["first_model_params"]["train_client_id"] = train_client_ids
-cfg["first_model_params"]["test_client_id"] = test_client_ids
+* params
+* config["first_model_params"]
+* część rzeczy z CLI
+* część z configu
+* część pod starymi nazwami
 
-bez tego first_model.py nie ma skąd wziąć filtrów.
+To bym uprościł do jednej zasady:
 
-⸻
+Zasada
 
-Jak sprawdzić, że już działa
+* CLI: tylko runtime
+* config/app.yaml: tylko ustawienia domyślne i techniczne
+* SQL files: tylko SQL
+* Python params object: jeden spójny obiekt wejściowy
 
-Po poprawce uruchom:
+Czyli:
 
-python runner_batch.py ^
-  --t0 2026-01-01 ^
-  --run-train ^
-  --train-client-ids 10069 ^
-  --test-client-ids 10069 ^
-  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db ^
-  --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+CLI:
 
-I w logu powinieneś zobaczyć coś w tym stylu:
+* --db-path
+* --include-clients
+* --exclude-clients
+* --t0
 
-train_client_id=[10069]
-test_client_id=[10069]
-[first_model] Using client filter: AND INVO_CLNTNO IN (10069)
+Config:
 
-a nie:
+* multi_client_excel_path
+* NUM_SHARDS
+* dataset_batch_days
+* nazwy kolumn
+* batch sizes
+* ścieżki do plików SQL
 
-[first_model] Client filter: ALL (no filtering)
-
-I nie powinien się już pojawiać klient 11437 w capach.
-
-⸻
-
-Podsumowanie
-
-Problem
-
-runner_batch.py przestał ustawiać:
+Nie trzymać już w configu:
 
 * train_client_id
 * test_client_id
+* exclude_ids
 
-a first_model.py nadal ich używa do budowania filtra SQL.
+To już sam ustaliłeś i to jest dobry kierunek.
 
-Skutek
+⸻
 
-Model trenuje i testuje na wszystkich klientach.
+6. Najlepsza praktyka pod Azure Pipelines
 
-Rozwiązanie
+Patrząc pod przyszłe Azure Pipelines, masz dwa dobre warianty:
 
-W prepare_config_for_run() przywrócić:
+Wariant A — przejściowy, najbezpieczniejszy teraz
 
-cfg["first_model_params"]["train_client_id"] = train_client_ids
-cfg["first_model_params"]["test_client_id"] = test_client_ids
+* Python dalej steruje buildem danych,
+* schema i views są w plikach .sql,
+* db_init.py tylko wykonuje katalog sql/schema i sql/views,
+* pipeline uruchamia:
+    1. init/migrations
+    2. build_dataset_db
+    3. train/test
 
-Dodatkowo popraw
+To jest na dziś najmniej ryzykowne.
 
-W build_dataset_db.py literówkę:
+Wariant B — docelowy, bardziej enterprise
 
-kip_raw_tables -> skip_raw_tables
+* schema bazy jako SQL Database Project
+* build do .dacpac
+* deploy przez SqlPackage lub zadania Azure Pipelines
+* Python już nie tworzy schematu, tylko używa gotowej bazy
 
-Jeśli chcesz, w następnym kroku mogę Ci od razu podać gotowe, finalne wersje runner_batch.py i build_dataset_db.py po tych poprawkach.
+Microsoft wprost wskazuje SQL Database Projects i DACPAC jako standardowy, powtarzalny model wdrażania zmian bazy; tutoriale i dokumentacja pokazują budowę projektu SQL, budowę artefaktu i wdrażanie go w zautomatyzowanym flow.  ￼
+
+Co bym wybrał u Ciebie
+
+Teraz: wariant A
+Docelowo: przygotować kod tak, żeby łatwo przejść do wariantu B
+
+Czyli:
+
+* już teraz wyciągnąć SQL z YAML do plików,
+* utrzymać Python jako orchestrator,
+* nie pakować więcej DDL do kodu.
+
+⸻
+
+7. Konkretna rekomendacja architektury
+
+Etap 1 — teraz
+
+1. db_init.py
+    * nie bierze DDL z YAML jako stringów,
+    * tylko czyta folder sql/schema/*.sql i sql/views/*.sql w ustalonej kolejności.
+2. build_dataset_db.py
+    * nie ma CREATE TABLE ani CREATE VIEW,
+    * ma tylko DML / SELECT / orchestration,
+    * większe SELECT-y ładuje z plików .sql.
+3. build_client_db.py
+    * robi auto-init, jeśli DB nie istnieje,
+    * przekazuje tylko include_clients, exclude_clients.
+
+Etap 2
+
+* wydzielić katalog sql/queries
+* dać helper:
+
+def load_sql(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+Etap 3
+
+* rozważyć SQL Database Project / DACPAC dla samej schemy.
+
+⸻
+
+8. Kod do ładowania SQL z plików
+
+Helper
+
+from pathlib import Path
+def load_sql_file(path: str) -> str:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"SQL file not found: {path}")
+    return p.read_text(encoding="utf-8")
+
+W db_init.py
+
+from pathlib import Path
+def exec_sql_file(conn, path: str):
+    sql = Path(path).read_text(encoding="utf-8")
+    conn.executescript(sql)
+def exec_sql_dir(conn, dir_path: str):
+    for path in sorted(Path(dir_path).glob("*.sql")):
+        print(f"[INFO] Executing {path}")
+        exec_sql_file(conn, str(path))
+
+I potem:
+
+schema_dir = cfg["sql_paths"]["schema_dir"]
+views_dir = cfg["sql_paths"]["views_dir"]
+exec_sql_dir(conn, schema_dir)
+exec_sql_dir(conn, views_dir)
+
+⸻
+
+9. Które obecne relikty jeszcze bym usunął
+
+Z obecnej logiki już nie pasują:
+
+* train_client_id / test_client_id w configu
+* exclude_ids w configu
+* stary drugi tryb z osobnymi plikami per klient
+* mieszanie DDL i DML w jednym miejscu
+* SQL inline, który opisuje stałą strukturę bazy
+* nazwy typu kip_raw_tables zamiast skip_raw_tables
+* duplikowane logi typu „kolejność przetwarzania” drukowane dwa razy
+
+⸻
+
+10. Co bym poprawił od razu w build_dataset_db.py
+
+a) sygnatura
+
+Masz:
+
+def build_dataset_db(params, t0, include_clients=None, exclude_clients=None, kip_raw_tables=False, build_derived=True):
+
+powinno być:
+
+def build_dataset_db(
+    params,
+    t0,
+    include_clients=None,
+    exclude_clients=None,
+    skip_raw_tables=False,
+    build_derived=True,
+):
+
+b) usuń zbędne logi
+
+Masz duble drukowania kolejności klientów.
+
+c) walidacja klientów
+
+Dodaj:
+
+if not client_ids:
+    print("[WARN] No clients selected after include/exclude filtering.")
+    conn.close()
+    return
+
+d) nie zamykaj połączenia w środku pętli
+
+Masz:
+
+if not build_derived:
+    conn.commit()
+    conn.close()
+    continue
+
+To jest złe. Po conn.close() nie powinieneś robić continue.
+
+Zmień na:
+
+if not build_derived:
+    logging.info("[build_dataset_db] build_derived=False -> RAW only completed.")
+    continue
+
+a zamknięcie tylko na końcu funkcji.
+
+e) przerób zapytania .format(...)
+
+Tam gdzie masz dynamiczne SQL przez .format(...), przechodź stopniowo na:
+
+* plik SQL
+* placeholdery
+* parametry do cursor.execute(...)
+
+To będzie bezpieczniejsze i czytelniejsze.
+
+⸻
+
+11. Finalna odpowiedź na Twoje trzy główne tematy
+
+A. Auto-init gdy baza nie stoi
+
+Tak, zrób to w entrypoincie operacyjnym (build_client_db.py), nie w build_dataset_db.py.
+
+B. Co przenieść z build_dataset_db.py
+
+Duże SQL-e i definicje bazy przenieść do plików .sql, nie do YAML stringów.
+
+C. Jak ujednolicić parametry
+
+* runtime z CLI
+* ustawienia techniczne z YAML
+* SQL z plików
+* Python tylko składa flow
+
+To jest najzdrowsze dziś i najbliższe temu, co potem łatwo podłączyć pod Azure Pipelines. YAML templates, parametry i etapy/stages są w Azure Pipelines pierwszorzędnym mechanizmem organizacji powtarzalnych wdrożeń; dla bazy najlepiej mieć osobny artefakt lub osobny zestaw skryptów, a nie logikę schematu schowaną w configu aplikacji.  ￼
+
+Jeżeli chcesz, następnym krokiem rozpiszę Ci od razu docelową strukturę katalogów + gotowy refactor plan dla db_init.py, build_client_db.py i build_dataset_db.py krok po kroku.
