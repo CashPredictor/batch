@@ -1,110 +1,143 @@
-dla: query_dataset_raw_select.sql
-trzeba to dodać w pythonie, bo wyciąłem to z query:
--- Dołączenie danych z statystyki_faktur
+Dobra — to co wrzuciłeś to jest bardzo dobry moment na refactor, ale też widać dokładnie gdzie masz jeszcze „stary świat” (config + string SQL + ręczne inserty).
+
+Zrobię Ci to konkretnie i systemowo, bez filozofii.
+
+⸻
+
+🧠 1. JOIN + {stats_pivot_select} — jak to zrobić poprawnie
+
+Masz teraz:
+
 LEFT JOIN (
 {stats_pivot_select}
-) pivot 
- on pivot.INVO_CLNTNO = i.INVO_CLNTNO
-	AND pivot.INVO_ADMNO = i.INVO_ADMNO 
-	AND (i.INVO_DEBH_NO = pivot.INVO_DEBH_NO AND i.INVO_DEBC_NO = pivot.INVO_DEBC_NO)
-	AND DATE(g.DZIEN) = DATE(pivot.DZIEN)      
+) pivot
+
+👉 i problem: w środku masz WHERE + GROUP BY
+
+❌ NIE rób składania stringów SQL w Pythonie
+
+⸻
+
+✅ POPRAWNE ROZWIĄZANIE
+
+👉 zrób z tego CTE (WITH)
+
+query_dataset_raw_select.sql
+
+WITH pivot AS (
+    SELECT *
+    FROM stats_pivot_view
+)
+SELECT ...
+FROM invo i
+LEFT JOIN pivot
+  ON pivot.INVO_CLNTNO = i.INVO_CLNTNO
+ AND pivot.INVO_ADMNO = i.INVO_ADMNO
+ AND (i.INVO_DEBH_NO = pivot.INVO_DEBH_NO AND i.INVO_DEBC_NO = pivot.INVO_DEBC_NO)
+ AND DATE(g.DZIEN) = DATE(pivot.DZIEN)
 WHERE 1=1
-  {client_filter}
-  AND {shard_condition}
 
-tutaj nie wiem czy można coś zrobić:
-query_stats_pivot_select.sql
+⸻
 
-bo mamy:
-FROM 
-	group_cust_inv_days g
--- Dołączenie danych z statystyki_faktur
+👉 a to przenieś do:
+
+views/stats_pivot_view.sql
+
+CREATE VIEW stats_pivot_view AS
+SELECT
+    g.INVO_ADMNO,
+    g.INVO_CLNTNO,
+    g.INVO_DEBH_NO,
+    g.INVO_DEBC_NO,
+    g.DZIEN,
+    ...
+FROM group_cust_inv_days g
 LEFT JOIN statystyki_faktur stats_pivot
-ON g.INVO_ADMNO = stats_pivot.INVO_ADMNO
-   AND g.INVO_CLNTNO = stats_pivot.INVO_CLNTNO
-   AND g.INVO_DEBH_NO = stats_pivot.INVO_DEBH_NO
-   AND (g.INVO_DEBH_NO = stats_pivot.INVO_DEBH_NO AND g.INVO_DEBC_NO = stats_pivot.INVO_DEBC_NO)
-   AND DATE(g.DZIEN) = DATE(stats_pivot.DZIEN)
-WHERE {shard_condition}
-{client_filter}
-GROUP BY
-	g.INVO_ADMNO,
-	g.INVO_CLNTNO,
-	g.INVO_DEBH_NO,
-	g.INVO_DEBC_NO,
-	g.DZIEN
+  ON ...
+GROUP BY ...
 
-czyli po where jest group by, chyba że dokleimy to wszystko? cjeżeli jest jakieś lepsze wyjście zeby mieć to w pliku sql to zasugeruj, a jeżeli nie to co amm zrobić aby to dokleić?
+⸻
 
-zaktualizowałem pliki, dlatego przejrzyj co i jak zaminić żeby pobierałm z plików zamiast configa
-ponato zastanów się czy coś robić z swietami, bo teraz mam to tak:
-  swieta_columns: ["nazwa", "rodzaj", "data", "rok", "mies", "dzien", "dzien_tyg"]
-  swieta_rows:
-    - ["Nowy Rok", "stałe", "2022-01-01", 2022, 1, 1, "sobota"]
-    - ["Trzech Króli", "stałe", "2022-01-06", 2022, 1, 6, "czwartek"]
-...
-czy moze też to wrzucić do pliku, tylko jakiego i w jakiej formie?
+🔥 efekt:
 
+* ❌ zero {stats_pivot_select}
+* ❌ zero string concatenation
+* ✔️ czysty SQL
+* ✔️ reusable
 
+⸻
 
+🧠 2. {client_filter} i {shard_condition}
 
-no i indeksy:
-  idx_clhs_joined_keys_datetime: |
-    CREATE INDEX IF NOT EXISTS idx_clhs_joined_keys_datetime
-    ON INVO_CLHS_JOINED_TAB (
-        INVO_ADMNO,
-        INVO_CLNTNO,
-        INVO_NO,
-        INVO_DEBH_NO,
-        INVO_DEBC_NO,
-        CLHS_CHANGED_DATETIME
-    );  
-  idx_group_cust_inv_days_one_for_all: |
-    CREATE INDEX IF NOT EXISTS idx_group_cust_inv_days_one_for_all
-    ON group_cust_inv_days (
-    DZIEN,
-    INVO_ADMNO,
-    INVO_CLNTNO,
-    INVO_DEBC_NO,
-    INVO_DEBH_NO
-    );
-  idx_ext_days_ids_dzien: |
-    CREATE INDEX IF NOT EXISTS idx_ext_days_ids_dzien
-    ON extended_grouped_client_days_tab (
-        INVO_ADMNO,
-        INVO_CLNTNO,
-        INVO_DEBH_NO,
-        INVO_DEBC_NO,
-        DZIEN
-    );  
-  idx_summary_days_ids_dzien: |
-    CREATE INDEX IF NOT EXISTS idx_summary_days_ids_dzien
-    ON summary_client_days_tab (
-        INVO_CLNTNO,
-        INVO_DEBH_NO,
-        INVO_DEBC_NO,
-        DZIEN
-    );  
-  idx_statystyki_keys_day_param_scen: |
-    CREATE INDEX IF NOT EXISTS idx_statystyki_keys_day_param_scen
-    ON statystyki_faktur (
-        INVO_ADMNO,
-        INVO_CLNTNO,
-        INVO_DEBH_NO,
-        INVO_DEBC_NO,
-        DZIEN,
-        PARAM_Z_ILU_DNI,
-        SCENARIUSZ
-    );  
-  idx_invo_debcno_invdate: |
-    CREATE INDEX IF NOT EXISTS idx_invo_debcno_invdate
-    ON invo (INVO_DEBC_NO, INVO_INVDATE);  
-  idx_invo_debcno_invdate_etc: |
-    CREATE INDEX IF NOT EXISTS idx_invo_debcno_invdate_etc
-    ON invo (INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, INVO_INVDATE);  
-  idx_statystyki_faktur_one_for_all: |
-    CREATE INDEX IF NOT EXISTS statystyki_faktur_idx_one_for_all
-    ON statystyki_faktur (
+❌ wywal to z SQL
+
+⸻
+
+✅ w Pythonie:
+
+sql = load_sql("query_dataset_raw_select.sql")
+conditions = []
+params = []
+if client_ids:
+    conditions.append(f"INVO_CLNTNO IN ({','.join(map(str, client_ids))})")
+if shard_condition:
+    conditions.append(shard_condition)
+if conditions:
+    sql += " AND " + " AND ".join(conditions)
+
+⸻
+
+🧠 3. query_stats_pivot_select.sql — co zrobić?
+
+👉 Odpowiedź: zamienić na VIEW
+
+Nie próbuj tego sklejać.
+
+⸻
+
+🧠 4. Święta (swieta_rows)
+
+Masz to w YAML — to jest anty-pattern dla danych
+
+⸻
+
+✅ poprawnie:
+
+opcja A (najlepsza)
+
+📄 data/swieta.csv
+
+nazwa,rodzaj,data,rok,mies,dzien,dzien_tyg
+Nowy Rok,stałe,2022-01-01,2022,1,1,sobota
+
+⸻
+
+Python:
+
+df = pd.read_csv("data/swieta.csv")
+df.to_sql("swieta", conn, if_exists="replace", index=False)
+
+⸻
+
+❌ NIE trzymaj tego w configu
+
+⸻
+
+🧠 5. INDEKSY — gdzie i jak
+
+📁 struktura:
+
+sql/
+  indexes/
+    idx_statystyki_faktur_one_for_all.sql
+    idx_group_cust_inv_days.sql
+
+⸻
+
+📄 przykład:
+
+CREATE INDEX IF NOT EXISTS idx_statystyki_faktur_one_for_all
+ON statystyki_faktur (
     DZIEN,
     INVO_ADMNO,
     INVO_CLNTNO,
@@ -112,223 +145,246 @@ no i indeksy:
     INVO_DEBH_NO,
     PARAM_Z_ILU_DNI,
     SCENARIUSZ
-    );    
+);
 
-do jakich plików te indeksy, i jak je wywołać a raczej zastąpić obecne wywołanie? nazwałem je jak w przykładzie: create_idx_statystyki_faktur_one_for_all.sql
+⸻
 
-ponadto mam jeszcze w config i kodzie:
-  grouped_query: |
-    SELECT 
-        g.INVO_ADMNO,
-        g.INVO_CLNTNO,
-        g.INVO_DEBH_NO,
-        g.INVO_DEBC_NO,
-        g.DZIEN,
-        g.MIESIAC,
-        g.ROK
-    FROM 
-        group_cust_inv_days g
-    WHERE
-        g.INVO_CLNTNO = ?
-    GROUP BY 
-        g.INVO_ADMNO,
-        g.INVO_CLNTNO,
-        g.INVO_DEBH_NO,
-        g.INVO_DEBC_NO,
-        g.DZIEN,
-        g.MIESIAC,
-        g.ROK;  
-        # Pobranie danych z group_cust_inv_days z grupowaniem
-        grouped_query = params['grouped_query']
-        
-        # Wczytanie danych do DataFrame
-        df = pd.read_sql_query(grouped_query, conn, params=(client_id,))
+Python:
 
-  statystyki_faktur: |
-    CREATE TABLE IF NOT EXISTS statystyki_faktur (
-        INVO_ADMNO TEXT,
-        INVO_CLNTNO TEXT,
-        INVO_DEBH_NO TEXT,
-        INVO_DEBC_NO TEXT,
-        DZIEN DATETIME,
-        SCENARIUSZ TEXT,
-        AVG_DNI_DO_ZAPLATY REAL,
-        STDEV_DNI_DO_ZAPLATY REAL,
-        AVG_DNI_OPOZNIENIA REAL,
-        STDEV_DNI_OPOZNIENIA REAL,
-        SUM_INVO_AINITIALH REAL,
-        AVG_INVO_AINITIALH REAL,
-        STDEV_INVO_AINITIALH REAL,
-        ILE_FAKTUR INTEGER,
-        PARAM_Z_ILU_DNI INTEGER,
-        INSERT_TIMESTAMP DATETIME
-    );  
-        exec_sql(conn, params.get("statystyki_faktur"), "statystyki_faktur")
+execute_sql_file(conn, "sql/indexes/idx_statystyki_faktur_one_for_all.sql")
 
-  shard_condition: "" - nie wiem czy to jest jeszcze potrzebne w nowej wersji?
+⸻
 
-        exec_sql(conn, params.get("query_create_invo_clhs_joined_tab_table"), "query_create_invo_clhs_joined_tab_table")
-  query_create_invo_clhs_joined_tab_table: |
-    CREATE TABLE INVO_CLHS_JOINED_TAB (
-    INVO_NO INTEGER,
-    INVO_ADMNO INTEGER,
-    INVO_CLNTNO INTEGER,
-    INVO_DEBH_NO INTEGER,
-    INVO_DEBC_NO INTEGER,
-    INVO_INVDATE DATETIME,
-    INVO_VALUEDATE DATETIME,
-    INVO_DUEDATE DATETIME,
-    INVO_MARKCODESPECDATE DATETIME,
-    INVO_MARKCODETEXTDATE DATETIME,
-    INVO_FINALPAYMENTDATE DATETIME,
-    INVO_BOOKINGDATE DATETIME,
-    INVO_CURRENCY TEXT,
-    INVO_AINITIALH REAL,
-    INVO_AINITIALC REAL,
-    INVO_MARKCODESPEC INTEGER,
-    INVO_MAXFINANCETIMPASSED DATETIME,
-    INVO_DATSTARTDELCREDEREINVST DATETIME,
-    INVO_NETDAYS INTEGER,
-    INVO_INVO_INVOICENO TEXT,
-    INVO_TEXT TEXT,
-    INVO_HOLDCODE TEXT,
-    INVO_DUMMY TEXT,
-    CLHS_CHANGED_DATETIME DATETIME,
-    CLHS_DATVALID DATETIME,
-    CLHS_DATPRINTED DATETIME,
-    CLHS_LIMITOLD REAL,
-    CLHS_CURRENCYOLD TEXT,
-    CLHS_LIMITNEW REAL,
-    CLHS_CURRENCYNEW TEXT,
-    CLHS_TEXTCODE1 TEXT,
-    CLHS_TEXTCODE2 TEXT,
-    CLHS_TEXTCODE3 TEXT,
-    CLHS_VARIABLETEXT1 TEXT,
-    CLHS_VARIABLETEXT2 TEXT,
-    CLHS_USRID TEXT,
-    CLHS_AUTOMATICDECISION TEXT,
-    CLHS_NEWDEBTOR TEXT,
-    CLHS_NEXT_CHANGED_DATETIME DATETIME
-    );
+❌ usuń z configa
 
-  query_aggregated_data_temp: |
-    CREATE TABLE aggregated_data_temp (
-    DZIEN DATE NOT NULL,
-    DZIS_DZIEN_TYG INTEGER NOT NULL,
-    DZIS_SOBOTA INTEGER NOT NULL,
-    DZIS_NIEDZIELA INTEGER NOT NULL
-    );    
-    cursor.execute(params.get("query_aggregated_data_temp"))
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_ag_day
-        ON aggregated_data_temp (DZIEN);
-    """)
+⸻
 
-  query_create_invo_clhs_joined_tab_table: |
-    CREATE TABLE INVO_CLHS_JOINED_TAB (
-    INVO_NO INTEGER,
-    INVO_ADMNO INTEGER,
-    INVO_CLNTNO INTEGER,
-    INVO_DEBH_NO INTEGER,
-    INVO_DEBC_NO INTEGER,
-    INVO_INVDATE DATETIME,
-    INVO_VALUEDATE DATETIME,
-    INVO_DUEDATE DATETIME,
-    INVO_MARKCODESPECDATE DATETIME,
-    INVO_MARKCODETEXTDATE DATETIME,
-    INVO_FINALPAYMENTDATE DATETIME,
-    INVO_BOOKINGDATE DATETIME,
-    INVO_CURRENCY TEXT,
-    INVO_AINITIALH REAL,
-    INVO_AINITIALC REAL,
-    INVO_MARKCODESPEC INTEGER,
-    INVO_MAXFINANCETIMPASSED DATETIME,
-    INVO_DATSTARTDELCREDEREINVST DATETIME,
-    INVO_NETDAYS INTEGER,
-    INVO_INVO_INVOICENO TEXT,
-    INVO_TEXT TEXT,
-    INVO_HOLDCODE TEXT,
-    INVO_DUMMY TEXT,
-    CLHS_CHANGED_DATETIME DATETIME,
-    CLHS_DATVALID DATETIME,
-    CLHS_DATPRINTED DATETIME,
-    CLHS_LIMITOLD REAL,
-    CLHS_CURRENCYOLD TEXT,
-    CLHS_LIMITNEW REAL,
-    CLHS_CURRENCYNEW TEXT,
-    CLHS_TEXTCODE1 TEXT,
-    CLHS_TEXTCODE2 TEXT,
-    CLHS_TEXTCODE3 TEXT,
-    CLHS_VARIABLETEXT1 TEXT,
-    CLHS_VARIABLETEXT2 TEXT,
-    CLHS_USRID TEXT,
-    CLHS_AUTOMATICDECISION TEXT,
-    CLHS_NEWDEBTOR TEXT,
-    CLHS_NEXT_CHANGED_DATETIME DATETIME
-    );
-        exec_sql(conn, params.get("query_create_invo_clhs_joined_tab_table"), "query_create_invo_clhs_joined_tab_table")
+🧠 6. grouped_query → plik SQL
 
-ponadto wypadałoby jeszcze wyrzucić z #build_dataset_db.py poniższe, zastanów się czy to możliwe i jak to zrobić:
-        # Pobranie danych z invo_view
-        query_invo = """
-        SELECT 
-            INVO_NO,
-            INVO_ADMNO,
-            INVO_CLNTNO,
-            INVO_DEBH_NO,
-            INVO_DEBC_NO,
-            INVO_INVDATE,
-            INVO_FINALPAYMENTDATE
-        FROM invo_view
-        WHERE INVO_INVDATE IS NOT NULL
-          AND DATE(INVO_INVDATE) >= DATE(?)
-          AND INVO_CLNTNO = ?
-        """
-tutaj trzebaby dokleić where chyba bo ma parametr?
+📄 queries/grouped_query.sql
 
-to nie wiem czy jest szczęścliwa definicja i odporna na błęd?
-        # Wstawianie danych do tabeli
-        cursor.execute("DELETE FROM group_cust_inv_days WHERE INVO_CLNTNO = ?", (client_id,))
+SELECT 
+    g.INVO_ADMNO,
+    g.INVO_CLNTNO,
+    g.INVO_DEBH_NO,
+    g.INVO_DEBC_NO,
+    g.DZIEN,
+    g.MIESIAC,
+    g.ROK
+FROM group_cust_inv_days g
+WHERE g.INVO_CLNTNO = ?
+GROUP BY ...
 
-        cursor.executemany("""
-        INSERT INTO group_cust_inv_days (
-            INVO_NO, INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, INVO_INVDATE, DZIEN, ROK, MIESIAC, INVO_FINALPAYMENTDATE
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, data_to_insert)
+⸻
 
-da się to zrobić jakoś lepiej? jakie byłby najlepsze praktyki?
+Python:
 
-to możaby pobrać skądś?
-        # Definicja kolumn DCMO
-        dcmo_columns = [
-            "DCMO_PAIDAMOUNT", "DCMO_PAIDAMOUNTINVDATE", "DCMO_PAIDAMOUNTDUEDATE",
-            "DCMO_PAIDAMOUNTBEFOREDUEDATE", "DCMO_PAIDAMOUNTAFTDUEDAT30", "DCMO_PAIDAMOUNTAFTDUEDAT60",
-            "DCMO_PAIDAMOUNTAFTDUEDAT90", "DCMO_PAIDAMOUNTAFTDUEDAT120", "DCMO_PAIDAMOUNTAFTDUEDATG120",
-            "DCMO_PAIDNINVBEFDUEDATE", "DCMO_PAIDNINVAFTDUEDATE30", "DCMO_PAIDNINVAFTDUEDATE60",
-            "DCMO_PAIDNINVAFTDUEDATE90", "DCMO_PAIDNINVAFTDUEDATE120", "DCMO_PAIDNINVAFTDUEDATEG120",
-            "DCMO_TOTASALESDEBTNOTES", "DCMO_TOTNDEBTNOTES", "DCMO_TOTASALESCREDNOTES",
-            "DCMO_TOTNCREDNOTES", "DCMO_AVGBALANCEOUTSTANDING", "DCMO_BALANCEHI",
-            "DCMO_NDUNNINGLETTERS", "DCMO_BALANCELO", "DCMO_BALANCE",
-            "DCMO_NINVOICESOUTSTANDING", "DCMO_PAIDAMOUNTDISPUTES", "DCMO_PAIDAMOUNTPARTIALPAYM"
-        ]
-tu tak samo:
-                    # Wstawianie wyników do tabeli
-                    cursor.execute("""
-                        INSERT INTO statystyki_faktur (
-                            INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, DZIEN,
-                            SCENARIUSZ, AVG_DNI_DO_ZAPLATY, STDEV_DNI_DO_ZAPLATY,
-                            AVG_DNI_OPOZNIENIA, STDEV_DNI_OPOZNIENIA,
-                            SUM_INVO_AINITIALH, AVG_INVO_AINITIALH, STDEV_INVO_AINITIALH,
-                            ILE_FAKTUR, PARAM_Z_ILU_DNI, INSERT_TIMESTAMP
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        invo_admno, invo_clntno, invo_debh_no, invo_debc_no,
-                        na_dzien.strftime('%Y-%m-%d %H:%M:%S'),
-                        scenariusz,
-                        avg_dni_do_zaplaty, stdev_dni_do_zaplaty,
-                        avg_dni_opoznienia, stdev_dni_opoznienia,
-                        sum_invo_ainitialh, avg_invo_ainitialh, stdev_invo_ainitialh,
-                        ile_faktur, z_ilu_dni, datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    ))
+sql = load_sql("queries/grouped_query.sql")
+df = pd.read_sql_query(sql, conn, params=(client_id,))
 
-czy to już jest szukanie dziury w całym?
+⸻
+
+🧠 7. CREATE TABLE → pliki
+
+📄 schema/statystyki_faktur.sql
+
+👉 przenieś 1:1
+
+⸻
+
+Python:
+
+execute_sql_file(conn, "sql/schema/statystyki_faktur.sql")
+
+⸻
+
+🧠 8. query_invo — TAK, też do SQL
+
+📄 queries/invo_select.sql
+
+SELECT ...
+FROM invo_view
+WHERE INVO_INVDATE IS NOT NULL
+  AND DATE(INVO_INVDATE) >= DATE(?)
+  AND INVO_CLNTNO = ?
+
+⸻
+
+🧠 9. DELETE + INSERT — czy można lepiej?
+
+Masz:
+
+DELETE ...
+INSERT executemany
+
+⸻
+
+✅ LEPIEJ (SQL-based):
+
+INSERT INTO group_cust_inv_days (...)
+SELECT ...
+FROM ...
+WHERE ...
+
+👉 bez Pandasa, bez Python loop
+
+⸻
+
+🔥 to jest DUŻY upgrade wydajności
+
+⸻
+
+🧠 10. dcmo_columns
+
+👉 to jest schema → do SQL
+
+📄 schema/dcmo_columns.sql
+
+lub część CREATE TABLE
+
+⸻
+
+❌ nie trzymaj tego w Pythonie
+
+⸻
+
+🧠 11. INSERT statystyki_faktur
+
+👉 to co robisz:
+
+cursor.execute(...)
+
+jest OK jeśli:
+
+* to jest wynik modelu
+* nie da się zrobić SQL-em
+
+👉 więc:
+
+✔️ zostaw
+❌ nie over-engineeruj
+
+⸻
+
+🧠 12. shard_condition
+
+👉 pytanie: czy używasz shardingu?
+
+jeśli NIE:
+
+❌ usuń całkowicie
+
+⸻
+
+🧠 13. DUPLIKAT create table
+
+Masz 2x:
+
+query_create_invo_clhs_joined_tab_table
+
+👉 to jest błąd
+
+⸻
+
+✅ poprawka:
+
+* jeden plik SQL
+* jedno wywołanie
+
+⸻
+
+🧠 14. INIT DB tylko jeśli nie istnieje
+
+Python:
+
+def ensure_db(conn):
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='statystyki_faktur'")
+    exists = cursor.fetchone()
+    if not exists:
+        run_db_init(conn)
+
+⸻
+
+🧠 15. FINALNY PLAN (co masz zrobić)
+
+🔥 KROK PO KROKU
+
+1. usuń z config:
+
+* query_*
+* create_*
+* indexes
+* swieta_rows
+
+⸻
+
+2. utwórz strukturę:
+
+sql/
+  schema/
+  queries/
+  views/
+  indexes/
+data/
+  swieta.csv
+
+⸻
+
+3. przenieś:
+
+co	gdzie
+CREATE TABLE	schema
+SELECT	queries
+JOIN pivot	view
+indeksy	indexes
+święta	CSV
+
+⸻
+
+4. dodaj helper:
+
+def load_sql(path):
+    with open(path, "r") as f:
+        return f.read()
+
+⸻
+
+5. zamień wszystkie:
+
+params.get(...)
+
+na:
+
+load_sql(...)
+
+⸻
+
+🚨 NAJWAŻNIEJSZE DECYZJE
+
+✔️ pivot → VIEW
+✔️ święta → CSV
+✔️ indeksy → SQL files
+✔️ delete+insert → SQL SELECT (jeśli możliwe)
+✔️ config → tylko config, nie SQL
+
+⸻
+
+📌 czy „szukasz dziury w całym”?
+
+👉 NIE
+
+👉 robisz dokładnie to, co trzeba zrobić przed GCP / pipeline
+
+⸻
+
+👉 Następny krok
+
+Jak chcesz, to:
+
+👉 mogę Ci rozpisać dokładnie każdy plik SQL na podstawie Twojego kodu
+👉 albo zrobić diff: co usunąć z build_dataset_db.py linia po linii
+
+Powiedz tylko:
+
+👉 „zrób mi refactor build_dataset_db konkretnie”
