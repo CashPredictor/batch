@@ -1,0 +1,46 @@
+dla: query_dataset_raw_select.sql
+trzeba to dodać w pythonie, bo wyciąłem to z query:
+-- Dołączenie danych z statystyki_faktur
+LEFT JOIN (
+{stats_pivot_select}
+) pivot 
+ on pivot.INVO_CLNTNO = i.INVO_CLNTNO
+	AND pivot.INVO_ADMNO = i.INVO_ADMNO 
+	AND (i.INVO_DEBH_NO = pivot.INVO_DEBH_NO AND i.INVO_DEBC_NO = pivot.INVO_DEBC_NO)
+	AND DATE(g.DZIEN) = DATE(pivot.DZIEN)      
+WHERE 1=1
+  {client_filter}
+  AND {shard_condition}
+
+tutaj nie wiem czy można coś zrobić:
+query_stats_pivot_select.sql
+
+bo mamy:
+FROM 
+	group_cust_inv_days g
+-- Dołączenie danych z statystyki_faktur
+LEFT JOIN statystyki_faktur stats_pivot
+ON g.INVO_ADMNO = stats_pivot.INVO_ADMNO
+   AND g.INVO_CLNTNO = stats_pivot.INVO_CLNTNO
+   AND g.INVO_DEBH_NO = stats_pivot.INVO_DEBH_NO
+   AND (g.INVO_DEBH_NO = stats_pivot.INVO_DEBH_NO AND g.INVO_DEBC_NO = stats_pivot.INVO_DEBC_NO)
+   AND DATE(g.DZIEN) = DATE(stats_pivot.DZIEN)
+WHERE {shard_condition}
+{client_filter}
+GROUP BY
+	g.INVO_ADMNO,
+	g.INVO_CLNTNO,
+	g.INVO_DEBH_NO,
+	g.INVO_DEBC_NO,
+	g.DZIEN
+
+czyli po where jest group by, chyba że dokleimy to wszystko? cjeżeli jest jakieś lepsze wyjście zeby mieć to w pliku sql to zasugeruj, a jeżeli nie to co amm zrobić aby to dokleić?
+
+zaktualizowałem pliki, dlatego przejrzyj co i jak zaminić żeby pobierałm z plików zamiast configa
+ponato zastanów się czy coś robić z swietami, bo teraz mam to tak:
+  swieta_columns: ["nazwa", "rodzaj", "data", "rok", "mies", "dzien", "dzien_tyg"]
+  swieta_rows:
+    - ["Nowy Rok", "stałe", "2022-01-01", 2022, 1, 1, "sobota"]
+    - ["Trzech Króli", "stałe", "2022-01-06", 2022, 1, 6, "czwartek"]
+...
+czy moze też to wrzucić do pliku, tylko jakiego i w jakiej formie?
