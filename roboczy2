@@ -1,509 +1,151 @@
-Przejrzałem Twoje poprawki. Kierunek jest dobry, ale w obecnym stanie nowe parametry są jeszcze tylko częściowo dodane. Są miejsca, gdzie kod się nie skompiluje, miejsca gdzie parametry są ignorowane, i jedno ważne miejsce, gdzie logika treningu/testu filtruje nie tę listę klientów, co trzeba.
-
-Najważniejsze wnioski są takie:
-
-1. runner_batch.py jeszcze nie obsługuje realnie include/exclude
-    Dodałeś argumenty --exclude-train-client-ids i --exclude-test-client-ids, ale:
-    * są parsowane tylko przez argparse,
-    * nigdzie dalej nie są używane,
-    * resolve_clients() jest zdefiniowane, ale też nigdzie nie jest użyte,
-    * nie ma pobrania listy wszystkich klientów z bazy.
-2. build_dataset_db.py ma wstawione fragmenty nowej logiki, ale w tej chwili jest zepsuty
-    Masz tam:
-
-client_ids = resolve_clients(all_clients, include, exclude)
-
-    ale:
-    * resolve_clients nie jest zdefiniowane w tym pliku,
-    * all_clients nie istnieje,
-    * include nie istnieje,
-    * exclude nie istnieje.
-    Czyli ten fragment w obecnej postaci po prostu nie zadziała.
-3. Najpoważniejszy problem: first_model.py filtruje trening po test_client_id
-    Funkcja:
-
-def build_client_filter_sql(params):
-    col = params.get('test_client_id_column')
-    ids = params.get('test_client_id')
-
-    jest używana zarówno przy treningu, jak i teście.
-    To oznacza, że:
-    * dla testu jest to w miarę logiczne,
-    * dla treningu to jest błędne,
-    * przy run-train + run-test z różnymi listami klientów trening może zostać odfiltrowany po złej liście.
-    To jest teraz najważniejsza rzecz do poprawy.
-
-⸻
-
-Co już działa
-
-Z tego co widzę, działa już:
-
-* jedna wspólna baza --db-path,
-* testowanie wielu klientów na jednej bazie przez pętlę,
-* dopisywanie do first_model_tab przez insert_only=True,
-* podstawowa obsługa list klientów jako csv,
-* brak DROP TABLE przy first_model_tab,
-* db_init.py jako osobny etap,
-* build_dataset_db jako osobny etap budowy danych.
-
-To jest już spójne z Twoim nowym flow.
-
-⸻
-
-Co jeszcze nie zadziała albo zadziała źle
-
-1. runner_batch.py — brak realnej obsługi ALL / include / exclude
-
-Masz parser:
-
-parser.add_argument("--train-client-ids", ...)
-parser.add_argument("--test-client-ids", ...)
-parser.add_argument("--exclude-train-client-ids", ...)
-parser.add_argument("--exclude-test-client-ids", ...)
-
-Ale potem w main() robisz tylko:
-
-train_client_ids = parse_client_ids(args.train_client_ids)
-test_client_ids = parse_client_ids(args.test_client_ids)
-
-i koniec.
-
-Nie ma:
-
-* exclude_train_client_ids = parse_client_ids(...)
-* exclude_test_client_ids = parse_client_ids(...)
-* pobrania wszystkich klientów z bazy,
-* złożenia list przez resolve_clients(...).
-
-Czyli obecnie:
-
-* brak --train-client-ids oznacza None,
-* brak --test-client-ids oznacza None,
-* ale to nie jest jeszcze świadomie przeliczone na “wszyscy klienci z bazy”.
-
-⸻
-
-2. runner_batch.py — test bez listy klientów nie przejdzie per klient
-
-Obecnie:
-
-if isinstance(test_client_ids, list):
-    run_test_for_each_client_on_shared_db(...)
-else:
-    run_phase(...)
-
-Czyli gdy:
-
-* nie podasz --test-client-ids,
-* test_client_ids == None,
-
-to test pójdzie jednym runem na wszystkich klientach naraz, a nie w pętli po klientach.
-
-To może być OK tylko wtedy, jeśli tego właśnie chcesz. Ale z Twojego opisu wynika raczej, że:
-
-* trening może iść na zbiorze klientów,
-* test powinien iść klient po kliencie.
-
-Więc docelowo musisz najpierw rozwiązać listę klientów z bazy, a potem testować po tej liście.
-
-⸻
-
-3. first_model.py — zły filtr dla train
-
-To jest teraz najważniejsza poprawka logiczna.
-
-Masz:
-
-def build_client_filter_sql(params):
-    col = params.get('test_client_id_column')
-    ids = params.get('test_client_id')
-    if col and ids:
-        ids_sql = ",".join(str(i) for i in ids)
-        return f" AND {col} IN ({ids_sql})"
-    return ""
-
-A potem:
-
-client_filter_sql = build_client_filter_sql(params)
-
-To działa zawsze po test_client_id.
-
-Powinno być rozdzielone na:
-
-* filtr treningowy: train_client_id,
-* filtr testowy: test_client_id.
-
-Najprościej:
-
-def build_client_filter_sql(params, currently_testing=False):
-    if currently_testing:
-        col = params.get('test_client_id_column')
-        ids = params.get('test_client_id')
-    else:
-        col = params.get('train_client_id_column', params.get('test_client_id_column'))
-        ids = params.get('train_client_id')
-    if col and ids:
-        if not isinstance(ids, list):
-            ids = [ids]
-        ids_sql = ",".join(str(i) for i in ids)
-        return f" AND {col} IN ({ids_sql})"
-    return ""
-
-i potem:
-
-client_filter_sql = build_client_filter_sql(params, currently_testing=currently_testing)
-
-To jest konieczne.
-
-⸻
-
-4. build_dataset_db.py — nowa logika klientów jest niedokończona
-
-W tym fragmencie:
-
-client_ids = resolve_clients(all_clients, include, exclude)
-
-masz placeholder, ale nie masz żadnego flow do jego obsługi.
-
-Docelowo powinieneś tam zrobić coś takiego:
-
-def resolve_clients(all_clients, include=None, exclude=None):
-    all_clients = set(all_clients)
-    if include:
-        selected = set(include)
-    else:
-        selected = all_clients
-    if exclude:
-        selected -= set(exclude)
-    return sorted(selected)
-
-A w build_dataset_db(...):
-
-include_clients = params.get("train_client_id")
-exclude_clients = params.get("exclude_ids")
-all_client_ids = (
-    df_invo_all['INVO_CLNTNO']
-    .dropna()
-    .astype(int)
-    .unique()
-    .tolist()
-)
-client_ids = resolve_clients(
-    all_clients=all_client_ids,
-    include=include_clients,
-    exclude=exclude_clients,
-)
-
-I wtedy usuwasz już ten dodatkowy blok:
-
-explicit_clients = params.get("train_client_id")
-...
-exclude_ids = set(params.get("exclude_ids", []))
-...
-
-bo to będzie dublowanie.
-
-⸻
-
-Czego brakuje jeszcze funkcjonalnie
-
-A. helpera do pobrania wszystkich klientów z jednej bazy
-
-Do runner_batch.py dodaj:
-
-import sqlite3
-
-i:
-
-def get_all_clients_from_db(db_path: str, table_name: str = "dataset") -> list[int]:
-    conn = sqlite3.connect(db_path)
-    try:
-        query = f"""
-            SELECT DISTINCT INVO_CLNTNO
-            FROM {table_name}
-            WHERE INVO_CLNTNO IS NOT NULL
-            ORDER BY INVO_CLNTNO
-        """
-        df = pd.read_sql_query(query, conn)
-        return df["INVO_CLNTNO"].astype(int).tolist()
-    finally:
-        conn.close()
-
-Najlepiej z dataset, ewentualnie fallback do invo.
-
-⸻
-
-B. przeliczenia include/exclude w runner_batch.py
-
-Po parsowaniu argumentów:
-
-train_include = parse_client_ids(args.train_client_ids)
-test_include = parse_client_ids(args.test_client_ids)
-train_exclude = parse_client_ids(args.exclude_train_client_ids)
-test_exclude = parse_client_ids(args.exclude_test_client_ids)
-
-Potem:
-
-all_clients = get_all_clients_from_db(db_path, table_name="dataset")
-resolved_train_client_ids = resolve_clients(
-    all_clients=all_clients,
-    include=train_include,
-    exclude=train_exclude,
-)
-resolved_test_client_ids = resolve_clients(
-    all_clients=all_clients,
-    include=test_include,
-    exclude=test_exclude,
-)
-
-I od tego momentu wszędzie używasz już:
-
-* resolved_train_client_ids
-* resolved_test_client_ids
-
-a nie surowych train_client_ids / test_client_ids.
-
-⸻
-
-C. decyzji co ma znaczyć “test bez listy”
-
-Ja bym przyjął:
-
-* train bez listy → wszyscy,
-* test bez listy → wszyscy,
-* ale test zawsze per klient, jeśli lista resolved ma więcej niż 1 klienta.
-
-Czyli warunek powinien być oparty nie o to, czy użytkownik podał listę w CLI, tylko o to, ile klientów finalnie wyszło po resolve.
-
-Zamiast:
-
-if isinstance(test_client_ids, list):
-
-daj:
-
-if len(resolved_test_client_ids) > 1:
-
-⸻
-
-Co bym poprawił w Twoim runner_batch.py
-
-Minimalny zestaw zmian
-
-1. dodać:
-
-* get_all_clients_from_db
-* parsowanie exclude
-* resolve_clients(...) użyte realnie
-
-2. używać resolved list zamiast surowych argumentów
-3. poprawić effective_test_ids_for_train
-
-Teraz masz:
-
-effective_test_ids_for_train = test_client_ids if test_client_ids is not None else train_client_ids
-
-Po poprawce powinno być raczej:
-
-effective_test_ids_for_train = resolved_test_client_ids if resolved_test_client_ids else resolved_train_client_ids
-
-ale po poprawieniu first_model.py i tak trening powinien używać własnego filtra treningowego, więc to straci znaczenie.
-
-⸻
-
-Co bym poprawił w build_dataset_db.py
-
-1. dokończyć logikę include/exclude,
-2. nie używać niezdefiniowanych zmiennych,
-3. trzymać nazewnictwo spójne:
-
-* include_clients
-* exclude_clients
-* all_client_ids
-* client_ids
-
-4. dla budowy z jednej bazy/excela przyjąć:
-
-* brak include → wszyscy,
-* brak exclude → nikt nie jest wykluczony,
-* include + exclude → include minus exclude.
-
-⸻
-
-Zaktualizowane przykłady wywołań
-
-Zakładam docelową logikę:
-
-* brak --train-client-ids = wszyscy,
-* brak --exclude-train-client-ids = brak wykluczeń,
-* brak --test-client-ids = wszyscy,
-* brak --exclude-test-client-ids = brak wykluczeń.
-
-Test — wskazani klienci
-
-conda activate cpdev50
-cd C:\Users\OE00SG\CashPredictor\dev3\gcp batch
-python runner_batch.py ^
-  --t0 2026-01-01 ^
-  --run-test ^
-  --test-client-ids 13581,10095,6089,8964,8989 ^
-  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db ^
-  --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
-
-Test — wszyscy klienci
-
-conda activate cpdev50
-cd C:\Users\OE00SG\CashPredictor\dev3\gcp batch
-python runner_batch.py ^
-  --t0 2026-01-01 ^
-  --run-test ^
-  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db ^
-  --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
-
-Test — wszyscy oprócz wybranych
-
-conda activate cpdev50
-cd C:\Users\OE00SG\CashPredictor\dev3\gcp batch
-python runner_batch.py ^
-  --t0 2026-01-01 ^
-  --run-test ^
-  --exclude-test-client-ids 13581,10095 ^
-  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db ^
-  --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
-
-Test — include minus exclude
-
-conda activate cpdev50
-cd C:\Users\OE00SG\CashPredictor\dev3\gcp batch
-python runner_batch.py ^
-  --t0 2026-01-01 ^
-  --run-test ^
-  --test-client-ids 13581,10095,6089,8964 ^
-  --exclude-test-client-ids 10095,8964 ^
-  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db ^
-  --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
-
-Train — wskazani klienci
-
-conda activate cpdev50
-cd C:\Users\OE00SG\CashPredictor\dev3\gcp batch
-python runner_batch.py ^
-  --t0 2026-01-01 ^
-  --run-train ^
-  --train-client-ids 10069,9320,13581 ^
-  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db ^
-  --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
-
-Train — wszyscy
-
-conda activate cpdev50
-cd C:\Users\OE00SG\CashPredictor\dev3\gcp batch
-python runner_batch.py ^
-  --t0 2026-01-01 ^
-  --run-train ^
-  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db ^
-  --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
-
-Train — wszyscy oprócz wybranych
-
-conda activate cpdev50
-cd C:\Users\OE00SG\CashPredictor\dev3\gcp batch
-python runner_batch.py ^
-  --t0 2026-01-01 ^
-  --run-train ^
-  --exclude-train-client-ids 10069,9320 ^
-  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db ^
-  --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
-
-Train + Test — różne listy
-
-conda activate cpdev50
-cd C:\Users\OE00SG\CashPredictor\dev3\gcp batch
-python runner_batch.py ^
-  --t0 2026-01-01 ^
-  --run-train ^
-  --run-test ^
-  --train-client-ids 10069,9320,13581 ^
-  --test-client-ids 13581,10095,6089 ^
-  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db ^
-  --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
-
-Train + Test — train all, test all except some
-
-conda activate cpdev50
-cd C:\Users\OE00SG\CashPredictor\dev3\gcp batch
-python runner_batch.py ^
-  --t0 2026-01-01 ^
-  --run-train ^
-  --run-test ^
-  --exclude-test-client-ids 13581,10095 ^
-  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db ^
-  --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
-
-Build dataset — wskazani klienci
-
-Jeśli dodasz analogiczne parametry do build_client_db.py, to np.:
-
-conda activate cpdev50
-cd C:\Users\OE00SG\CashPredictor\dev3\gcp batch
-python build_client_db.py ^
-  --t0 2026-03-02 ^
-  --build-clients 13581,10095,6089,8964,8989 ^
-  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
-
-Build dataset — wszyscy
-
-conda activate cpdev50
-cd C:\Users\OE00SG\CashPredictor\dev3\gcp batch
-python build_client_db.py ^
-  --t0 2026-03-02 ^
-  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
-
-Build dataset — wszyscy oprócz wybranych
-
-Po dodaniu np. --exclude-build-clients:
-
-conda activate cpdev50
-cd C:\Users\OE00SG\CashPredictor\dev3\gcp batch
-python build_client_db.py ^
-  --t0 2026-03-02 ^
-  --exclude-build-clients 13581,10095 ^
-  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
-
-⸻
-
-Najkrótsza lista tego, co teraz jeszcze musisz zrobić
-
-Krytyczne
-
-1. Naprawić first_model.py, żeby train filtrował po train_client_id, a test po test_client_id.
-2. Dokończyć runner_batch.py, żeby realnie używał include/exclude i pobierał ALL z bazy.
-3. Naprawić build_dataset_db.py, bo obecny fragment z resolve_clients(all_clients, include, exclude) nie zadziała.
-
-Ważne
-
-4. Ujednolicić tę samą logikę klientów także w build_client_db.py.
-5. Zdecydować, czy test bez listy ma iść jednym runem na wszystkich, czy per klient. Z Twojego flow lepsze będzie per klient.
-
-⸻
-
-Ocena obecnego stanu
-
-Obecne poprawki są już blisko, ale jeszcze nie domykają celu.
-W tej chwili powiedziałbym:
-
-* architektura: na dobrym torze
-* zapis wyników: naprawiony
-* jedna baza: wdrożona
-* ALL/include/exclude: jeszcze niegotowe
-* build_dataset_db: ma niedokończone fragmenty
-* train/test filtering: ma istotny błąd logiczny
-
-Jeśli chcesz, w następnym kroku mogę Ci przygotować gotowy poprawiony kod runner_batch.py pod:
-
-* shared DB,
-* ALL/include/exclude,
-* trening,
-* test per klient,
-* train+test,
-* bez tych obecnych luk.
+(cpdev50)C:\Users\OE00SG\CashPredictor\dev3\gcp batch>python runner_batch.py ^
+More?   --t0 2026-01-01 ^
+More?   --run-train ^
+More?   --run-test ^
+More?   --train-client-ids 10069,9320,13581 ^
+More?   --test-client-ids 13581,10095,6089 ^
+More?   --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db ^
+More?   --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+2026-04-20 10:27:58,815 - INFO - === START phase train ===
+2026-04-20 10:27:58,815 - INFO - train_client_id=[9320, 10069, 13581]
+2026-04-20 10:27:58,815 - INFO - test_client_id=[6089, 10095, 13581]
+2026-04-20 10:27:58,815 - INFO - database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-20 10:27:58,816 - INFO - test_database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-20 10:27:58,816 - INFO - model_path=C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+2026-04-20 10:28:02,965 - ERROR - Train failed: name 'client_filter_sql' is not defined
+Traceback (most recent call last):
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\runner_batch.py", line 220, in main
+    run_phase(
+    ~~~~~~~~~^
+        config=config,
+        ^^^^^^^^^^^^^^
+    ...<6 lines>...
+        results_file=args.results_file,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\runner_batch.py", line 129, in run_phase
+    avg_acc = first_model.first_model(
+        actual_model_path,
+    ...<8 lines>...
+        retrain_period,
+    )
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\first_model.py", line 1093, in first_model
+    train_dataloader, test_dataloader, mean, std, input_size, model_id, invoice_date_column_positions = prepare_for_training(train_start, train_end, operation_mode, params, device)
+                                                                                                        ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\first_model.py", line 426, in prepare_for_training
+    X_train_np, y_train_np, input_size, additional_data, feature_names, invoice_date_column_positions = preprocess_data_model1(train_start, train_end, params, operation_mode=operation_mode,currently_testing=False, train_on_all=False)
+                                                                                                        ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\first_model.py", line 208, in preprocess_data_model1
+    if client_filter_sql:
+       ^^^^^^^^^^^^^^^^^
+NameError: name 'client_filter_sql' is not defined. Did you mean: 'cclient_filter_sql'?
+2026-04-20 10:28:02,968 - INFO - === START single-client test on shared DB: 6089 ===
+2026-04-20 10:28:02,969 - INFO - === START phase test_today ===
+2026-04-20 10:28:02,969 - INFO - train_client_id=[9320, 10069, 13581]
+2026-04-20 10:28:02,969 - INFO - test_client_id=6089
+2026-04-20 10:28:02,970 - INFO - database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-20 10:28:02,970 - INFO - test_database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-20 10:28:02,970 - INFO - model_path=C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+2026-04-20 10:28:02,975 - ERROR - Test failed for client 6089: name 'client_filter_sql' is not defined
+Traceback (most recent call last):
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\runner_batch.py", line 158, in run_test_for_each_client_on_shared_db
+    run_phase(
+    ~~~~~~~~~^
+        config=config,
+        ^^^^^^^^^^^^^^
+    ...<6 lines>...
+        results_file=results_file,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\runner_batch.py", line 129, in run_phase
+    avg_acc = first_model.first_model(
+        actual_model_path,
+    ...<8 lines>...
+        retrain_period,
+    )
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\first_model.py", line 1113, in first_model
+    test_dataloader, additional_data, input_size, model_id, feature_names, invoice_date_column_positions = prepare_for_testing(test_start, test_end, operation_mode, params, device)
+                                                                                                           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\first_model.py", line 457, in prepare_for_testing
+    X_test_np, y_test_np, input_size, additional_data, feature_names, invoice_date_column_positions = preprocess_data_model1(test_start, test_end, params, operation_mode=operation_mode, currently_testing=True)
+                                                                                                      ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\first_model.py", line 208, in preprocess_data_model1
+    if client_filter_sql:
+       ^^^^^^^^^^^^^^^^^
+NameError: name 'client_filter_sql' is not defined. Did you mean: 'cclient_filter_sql'?
+2026-04-20 10:28:02,978 - INFO - === END single-client test on shared DB: 6089 ===
+2026-04-20 10:28:02,978 - INFO - === START single-client test on shared DB: 10095 ===
+2026-04-20 10:28:02,979 - INFO - === START phase test_today ===
+2026-04-20 10:28:02,979 - INFO - train_client_id=[9320, 10069, 13581]
+2026-04-20 10:28:02,979 - INFO - test_client_id=10095
+2026-04-20 10:28:02,979 - INFO - database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-20 10:28:02,979 - INFO - test_database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-20 10:28:02,979 - INFO - model_path=C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+2026-04-20 10:28:02,983 - ERROR - Test failed for client 10095: name 'client_filter_sql' is not defined
+Traceback (most recent call last):
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\runner_batch.py", line 158, in run_test_for_each_client_on_shared_db
+    run_phase(
+    ~~~~~~~~~^
+        config=config,
+        ^^^^^^^^^^^^^^
+    ...<6 lines>...
+        results_file=results_file,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\runner_batch.py", line 129, in run_phase
+    avg_acc = first_model.first_model(
+        actual_model_path,
+    ...<8 lines>...
+        retrain_period,
+    )
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\first_model.py", line 1113, in first_model
+    test_dataloader, additional_data, input_size, model_id, feature_names, invoice_date_column_positions = prepare_for_testing(test_start, test_end, operation_mode, params, device)
+                                                                                                           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\first_model.py", line 457, in prepare_for_testing
+    X_test_np, y_test_np, input_size, additional_data, feature_names, invoice_date_column_positions = preprocess_data_model1(test_start, test_end, params, operation_mode=operation_mode, currently_testing=True)
+                                                                                                      ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\first_model.py", line 208, in preprocess_data_model1
+    if client_filter_sql:
+       ^^^^^^^^^^^^^^^^^
+NameError: name 'client_filter_sql' is not defined. Did you mean: 'cclient_filter_sql'?
+2026-04-20 10:28:02,985 - INFO - === END single-client test on shared DB: 10095 ===
+2026-04-20 10:28:02,986 - INFO - === START single-client test on shared DB: 13581 ===
+2026-04-20 10:28:02,987 - INFO - === START phase test_today ===
+2026-04-20 10:28:02,987 - INFO - train_client_id=[9320, 10069, 13581]
+2026-04-20 10:28:02,987 - INFO - test_client_id=13581
+2026-04-20 10:28:02,987 - INFO - database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-20 10:28:02,987 - INFO - test_database=C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor2.db
+2026-04-20 10:28:02,987 - INFO - model_path=C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
+2026-04-20 10:28:02,991 - ERROR - Test failed for client 13581: name 'client_filter_sql' is not defined
+Traceback (most recent call last):
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\runner_batch.py", line 158, in run_test_for_each_client_on_shared_db
+    run_phase(
+    ~~~~~~~~~^
+        config=config,
+        ^^^^^^^^^^^^^^
+    ...<6 lines>...
+        results_file=results_file,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\runner_batch.py", line 129, in run_phase
+    avg_acc = first_model.first_model(
+        actual_model_path,
+    ...<8 lines>...
+        retrain_period,
+    )
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\first_model.py", line 1113, in first_model
+    test_dataloader, additional_data, input_size, model_id, feature_names, invoice_date_column_positions = prepare_for_testing(test_start, test_end, operation_mode, params, device)
+                                                                                                           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\first_model.py", line 457, in prepare_for_testing
+    X_test_np, y_test_np, input_size, additional_data, feature_names, invoice_date_column_positions = preprocess_data_model1(test_start, test_end, params, operation_mode=operation_mode, currently_testing=True)
+                                                                                                      ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\first_model.py", line 208, in preprocess_data_model1
+    if client_filter_sql:
+       ^^^^^^^^^^^^^^^^^
+NameError: name 'client_filter_sql' is not defined. Did you mean: 'cclient_filter_sql'?
+2026-04-20 10:28:02,993 - INFO - === END single-client test on shared DB: 13581 ===
+Run finished with failures in phases: ['train', 'test:6089', 'test:10095', 'test:13581']
