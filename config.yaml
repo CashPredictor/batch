@@ -5,7 +5,7 @@ common_params: &common_params
   database_template: 'C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictorT_{client_id}.db'  
   # database_test_one_for_all: 'C:/Users/OE00SG/CashPredictor/dev3/databases/CashPredictorT_one_for_all.db'
   # database_test_one_for_all: 'C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictorT_one_for_all.db' #2025-09-15
-  train_client_id: '10069'
+  train_client_id:
   test_client_id: 
   model_name: 'ING'
   invoice_id: 'INVO_NO'
@@ -55,7 +55,7 @@ first_model_params:
     loss_weight: 0.3
     loss_type: "huber"              # huber|mae|mse
   remove_tables: False
-  multi_client_excel_path: 'C:/Users/OE00SG/CashPredictor/dev3/co i jak baza/Bartek_dane_20260228_ograniczony.xlsx' # dane_20250721.xlsx # Bartek_dane_20251223
+  multi_client_excel_path: 'C:/Users/OE00SG/CashPredictor/dev3/co i jak baza/Bartek_dane_20260228.xlsx' # dane_20250721.xlsx # Bartek_dane_20251223
   id_columns: ['INVO_NO', 'INVO_DEBH_NO','INVO_FINALPAYMENTDATE']
   platnik_column: ['INVO_DEBH_NO']
   non_numeric_cols: ['INVO_NO', 'INVO_ADMNO', 'INVO_CLNTNO', 'INVO_DEBH_NO', 'INVO_DEBC_NO', 'INVO_INVDATE', 'DZIEN', 'INVO_DUEDATE', 'INVO_FINALPAYMENTDATE']
@@ -1047,7 +1047,7 @@ first_model_params:
         g.INVO_CLNTNO,
         g.INVO_DEBH_NO,
         g.INVO_DEBC_NO,
-        g.DZIEN;
+        g.DZIEN
 
   query_dataset_raw_select: |
     SELECT 
@@ -1675,14 +1675,16 @@ first_model_params:
         AND DATE(g.DZIEN) = DATE(s.DZIEN)
     
     -- Dołączenie danych z statystyki_faktur
-    LEFT JOIN stats_pivot_view pivot
-    ON g.INVO_ADMNO = pivot.INVO_ADMNO
-       AND g.INVO_CLNTNO = pivot.INVO_CLNTNO
-       AND g.INVO_DEBH_NO = pivot.INVO_DEBH_NO
-       AND (g.INVO_DEBH_NO = pivot.INVO_DEBH_NO AND g.INVO_DEBC_NO = pivot.INVO_DEBC_NO)
-       AND DATE(g.DZIEN) = DATE(pivot.DZIEN)
-    WHERE {shard_condition}
-    {client_filter};
+    LEFT JOIN (
+    {stats_pivot_select}
+    ) pivot 
+     on pivot.INVO_CLNTNO = i.INVO_CLNTNO
+        AND pivot.INVO_ADMNO = i.INVO_ADMNO 
+        AND (i.INVO_DEBH_NO = pivot.INVO_DEBH_NO AND i.INVO_DEBC_NO = pivot.INVO_DEBC_NO)
+        AND DATE(g.DZIEN) = DATE(pivot.DZIEN)      
+    WHERE 1=1
+      {client_filter}
+      AND {shard_condition}
        
   query_create_dataset_tab: |
     CREATE TABLE dataset_tab (
@@ -2551,6 +2553,7 @@ first_model_params:
   
   query_create_dcmo_table: |
     CREATE TABLE dcmo (
+    DCMO_DEBC_NO INTEGER,
     DCMO_YEAR INTEGER,
     DCMO_MONTH INTEGER,
     DCMO_CURRENCY TEXT,
@@ -4545,3 +4548,351 @@ first_model_params:
     AND d12.DCMO_YEAR  = CAST(strftime('%Y'    , date(g.DZIEN,'start of month','-1 day', '-' || 12 || ' months')) AS INTEGER)
     AND d12.DCMO_MONTH = CAST(strftime('%m'    , date(g.DZIEN,'start of month','-1 day', '-' || 12 || ' months')) AS INTEGER)
         ;
+        
+  swieta_columns: ["nazwa", "rodzaj", "data", "rok", "mies", "dzien", "dzien_tyg"]
+  swieta_rows:
+    - ["Nowy Rok", "stałe", "2022-01-01", 2022, 1, 1, "sobota"]
+    - ["Trzech Króli", "stałe", "2022-01-06", 2022, 1, 6, "czwartek"]
+    - ["Wielkanoc", "ruchome", "2022-04-17", 2022, 4, 17, "niedziela"]
+    - ["Poniedziałek Wielkanocny", "ruchome", "2022-04-18", 2022, 4, 18, "poniedziałek"]
+    - ["Święto Pracy", "stałe", "2022-05-01", 2022, 5, 1, "niedziela"]
+    - ["Święto Konstytucji 3 Maja", "stałe", "2022-05-03", 2022, 5, 3, "wtorek"]
+    - ["Zielone Świątki", "ruchome", "2022-06-05", 2022, 6, 5, "niedziela"]
+    - ["Boże Ciało", "ruchome", "2022-06-16", 2022, 6, 16, "czwartek"]
+    - ["Wniebowzięcie Najświętszej Maryi Panny", "stałe", "2022-08-15", 2022, 8, 15, "poniedziałek"]
+    - ["Wszystkich Świętych", "stałe", "2022-11-01", 2022, 11, 1, "wtorek"]
+    - ["Narodowe Święto Niepodległości", "stałe", "2022-11-11", 2022, 11, 11, "piątek"]
+    - ["Boże Narodzenie", "stałe", "2022-12-25", 2022, 12, 25, "niedziela"]
+    - ["Drugi dzień Bożego Narodzenia", "stałe", "2022-12-26", 2022, 12, 26, "poniedziałek"]
+    - ["Nowy Rok", "stałe", "2023-01-01", 2023, 1, 1, "niedziela"]
+    - ["Trzech Króli", "stałe", "2023-01-06", 2023, 1, 6, "piątek"]
+    - ["Wielkanoc", "ruchome", "2023-04-09", 2023, 4, 9, "niedziela"]
+    - ["Poniedziałek Wielkanocny", "ruchome", "2023-04-10", 2023, 4, 10, "poniedziałek"]
+    - ["Święto Pracy", "stałe", "2023-05-01", 2023, 5, 1, "poniedziałek"]
+    - ["Święto Konstytucji 3 Maja", "stałe", "2023-05-03", 2023, 5, 3, "środa"]
+    - ["Zielone Świątki", "ruchome", "2023-05-28", 2023, 5, 28, "niedziela"]
+    - ["Boże Ciało", "ruchome", "2023-06-08", 2023, 6, 8, "czwartek"]
+    - ["Wniebowzięcie Najświętszej Maryi Panny", "stałe", "2023-08-15", 2023, 8, 15, "wtorek"]
+    - ["Wszystkich Świętych", "stałe", "2023-11-01", 2023, 11, 1, "środa"]
+    - ["Narodowe Święto Niepodległości", "stałe", "2023-11-11", 2023, 11, 11, "sobota"]
+    - ["Boże Narodzenie", "stałe", "2023-12-25", 2023, 12, 25, "poniedziałek"]
+    - ["Drugi dzień Bożego Narodzenia", "stałe", "2023-12-26", 2023, 12, 26, "wtorek"]
+    - ["Nowy Rok", "stałe", "2024-01-01", 2024, 1, 1, "poniedziałek"]
+    - ["Trzech Króli", "stałe", "2024-01-06", 2024, 1, 6, "sobota"]
+    - ["Wielkanoc", "ruchome", "2024-03-31", 2024, 3, 31, "niedziela"]
+    - ["Poniedziałek Wielkanocny", "ruchome", "2024-04-01", 2024, 4, 1, "poniedziałek"]
+    - ["Święto Pracy", "stałe", "2024-05-01", 2024, 5, 1, "środa"]
+    - ["Święto Konstytucji 3 Maja", "stałe", "2024-05-03", 2024, 5, 3, "piątek"]
+    - ["Zielone Świątki", "ruchome", "2024-05-19", 2024, 5, 19, "niedziela"]
+    - ["Boże Ciało", "ruchome", "2024-05-30", 2024, 5, 30, "czwartek"]
+    - ["Wniebowzięcie Najświętszej Maryi Panny", "stałe", "2024-08-15", 2024, 8, 15, "czwartek"]
+    - ["Wszystkich Świętych", "stałe", "2024-11-01", 2024, 11, 1, "piątek"]
+    - ["Narodowe Święto Niepodległości", "stałe", "2024-11-11", 2024, 11, 11, "poniedziałek"]
+    - ["Boże Narodzenie", "stałe", "2024-12-25", 2024, 12, 25, "środa"]
+    - ["Drugi dzień Bożego Narodzenia", "stałe", "2024-12-26", 2024, 12, 26, "czwartek"]
+    - ["Nowy Rok", "stałe", "2025-01-01", 2025, 1, 1, "środa"]
+    - ["Trzech Króli", "stałe", "2025-01-06", 2025, 1, 6, "poniedziałek"]
+    - ["Wielkanoc", "ruchome", "2025-04-20", 2025, 4, 20, "niedziela"]
+    - ["Poniedziałek Wielkanocny", "ruchome", "2025-04-21", 2025, 4, 21, "poniedziałek"]
+    - ["Święto Pracy", "stałe", "2025-05-01", 2025, 5, 1, "czwartek"]
+    - ["Święto Konstytucji 3 Maja", "stałe", "2025-05-03", 2025, 5, 3, "sobota"]
+    - ["Zielone Świątki", "ruchome", "2025-06-08", 2025, 6, 8, "niedziela"]
+    - ["Boże Ciało", "ruchome", "2025-06-19", 2025, 6, 19, "czwartek"]
+    - ["Wniebowzięcie Najświętszej Maryi Panny", "stałe", "2025-08-15", 2025, 8, 15, "piątek"]
+    - ["Wszystkich Świętych", "stałe", "2025-11-01", 2025, 11, 1, "sobota"]
+    - ["Narodowe Święto Niepodległości", "stałe", "2025-11-11", 2025, 11, 11, "wtorek"]
+    - ["Boże Narodzenie", "stałe", "2025-12-25", 2025, 12, 25, "czwartek"]
+    - ["Drugi dzień Bożego Narodzenia", "stałe", "2025-12-26", 2025, 12, 26, "piątek"]
+    - ["Nowy Rok", "stałe", "2026-01-01", 2026, 1, 1, "czwartek"]
+    - ["Trzech Króli", "stałe", "2026-01-06", 2026, 1, 6, "wtorek"]
+    - ["Wielkanoc", "ruchome", "2026-04-05", 2026, 4, 5, "niedziela"]
+    - ["Poniedziałek Wielkanocny", "ruchome", "2026-04-06", 2026, 4, 6, "poniedziałek"]
+    - ["Święto Pracy", "stałe", "2026-05-01", 2026, 5, 1, "piątek"]
+    - ["Święto Konstytucji 3 Maja", "stałe", "2026-05-03", 2026, 5, 3, "niedziela"]
+    - ["Zielone Świątki", "ruchome", "2026-05-24", 2026, 5, 24, "niedziela"]
+    - ["Boże Ciało", "ruchome", "2026-06-04", 2026, 6, 4, "czwartek"]
+    - ["Wniebowzięcie Najświętszej Maryi Panny", "stałe", "2026-08-15", 2026, 8, 15, "sobota"]
+    - ["Wszystkich Świętych", "stałe", "2026-11-01", 2026, 11, 1, "niedziela"]
+    - ["Narodowe Święto Niepodległości", "stałe", "2026-11-11", 2026, 11, 11, "środa"]
+    - ["Boże Narodzenie", "stałe", "2026-12-25", 2026, 12, 25, "piątek"]
+    - ["Drugi dzień Bożego Narodzenia", "stałe", "2026-12-26", 2026, 12, 26, "sobota"]
+    - ["Nowy Rok", "stałe", "2027-01-01", 2027, 1, 1, "piątek"]
+    - ["Trzech Króli", "stałe", "2027-01-06", 2027, 1, 6, "środa"]
+    - ["Wielkanoc", "ruchome", "2027-03-28", 2027, 3, 28, "niedziela"]
+    - ["Poniedziałek Wielkanocny", "ruchome", "2027-03-29", 2027, 3, 29, "poniedziałek"]
+    - ["Święto Pracy", "stałe", "2027-05-01", 2027, 5, 1, "sobota"]
+    - ["Święto Konstytucji 3 Maja", "stałe", "2027-05-03", 2027, 5, 3, "poniedziałek"]
+    - ["Zielone Świątki", "ruchome", "2027-05-16", 2027, 5, 16, "niedziela"]
+    - ["Boże Ciało", "ruchome", "2027-05-27", 2027, 5, 27, "czwartek"]
+    - ["Wniebowzięcie Najświętszej Maryi Panny", "stałe", "2027-08-15", 2027, 8, 15, "niedziela"]
+    - ["Wszystkich Świętych", "stałe", "2027-11-01", 2027, 11, 1, "poniedziałek"]
+    - ["Narodowe Święto Niepodległości", "stałe", "2027-11-11", 2027, 11, 11, "czwartek"]
+    - ["Boże Narodzenie", "stałe", "2027-12-25", 2027, 12, 25, "sobota"]
+    - ["Drugi dzień Bożego Narodzenia", "stałe", "2027-12-26", 2027, 12, 26, "niedziela"]
+    - ["Nowy Rok", "stałe", "2028-01-01", 2028, 1, 1, "sobota"]
+    - ["Trzech Króli", "stałe", "2028-01-06", 2028, 1, 6, "czwartek"]
+    - ["Wielkanoc", "ruchome", "2028-04-16", 2028, 4, 16, "niedziela"]
+    - ["Poniedziałek Wielkanocny", "ruchome", "2028-04-17", 2028, 4, 17, "poniedziałek"]
+    - ["Święto Pracy", "stałe", "2028-05-01", 2028, 5, 1, "poniedziałek"]
+    - ["Święto Konstytucji 3 Maja", "stałe", "2028-05-03", 2028, 5, 3, "środa"]
+    - ["Zielone Świątki", "ruchome", "2028-06-04", 2028, 6, 4, "niedziela"]
+    - ["Boże Ciało", "ruchome", "2028-06-15", 2028, 6, 15, "czwartek"]
+    - ["Wniebowzięcie Najświętszej Maryi Panny", "stałe", "2028-08-15", 2028, 8, 15, "wtorek"]
+    - ["Wszystkich Świętych", "stałe", "2028-11-01", 2028, 11, 1, "środa"]
+    - ["Narodowe Święto Niepodległości", "stałe", "2028-11-11", 2028, 11, 11, "sobota"]
+    - ["Boże Narodzenie", "stałe", "2028-12-25", 2028, 12, 25, "poniedziałek"]
+    - ["Drugi dzień Bożego Narodzenia", "stałe", "2028-12-26", 2028, 12, 26, "wtorek"]
+    - ["Nowy Rok", "stałe", "2029-01-01", 2029, 1, 1, "poniedziałek"]
+    - ["Trzech Króli", "stałe", "2029-01-06", 2029, 1, 6, "sobota"]
+    - ["Wielkanoc", "ruchome", "2029-04-01", 2029, 4, 1, "niedziela"]
+    - ["Poniedziałek Wielkanocny", "ruchome", "2029-04-02", 2029, 4, 2, "poniedziałek"]
+    - ["Święto Pracy", "stałe", "2029-05-01", 2029, 5, 1, "wtorek"]
+    - ["Święto Konstytucji 3 Maja", "stałe", "2029-05-03", 2029, 5, 3, "czwartek"]
+    - ["Zielone Świątki", "ruchome", "2029-05-20", 2029, 5, 20, "niedziela"]
+    - ["Boże Ciało", "ruchome", "2029-05-31", 2029, 5, 31, "czwartek"]
+    - ["Wniebowzięcie Najświętszej Maryi Panny", "stałe", "2029-08-15", 2029, 8, 15, "środa"]
+    - ["Wszystkich Świętych", "stałe", "2029-11-01", 2029, 11, 1, "czwartek"]
+    - ["Narodowe Święto Niepodległości", "stałe", "2029-11-11", 2029, 11, 11, "niedziela"]
+    - ["Boże Narodzenie", "stałe", "2029-12-25", 2029, 12, 25, "wtorek"]
+    - ["Drugi dzień Bożego Narodzenia", "stałe", "2029-12-26", 2029, 12, 26, "środa"]
+    - ["Nowy Rok", "stałe", "2030-01-01", 2030, 1, 1, "wtorek"]
+    - ["Trzech Króli", "stałe", "2030-01-06", 2030, 1, 6, "niedziela"]
+    - ["Wielkanoc", "ruchome", "2030-04-21", 2030, 4, 21, "niedziela"]
+    - ["Poniedziałek Wielkanocny", "ruchome", "2030-04-22", 2030, 4, 22, "poniedziałek"]
+    - ["Święto Pracy", "stałe", "2030-05-01", 2030, 5, 1, "środa"]
+    - ["Święto Konstytucji 3 Maja", "stałe", "2030-05-03", 2030, 5, 3, "piątek"]
+    - ["Zielone Świątki", "ruchome", "2030-06-09", 2030, 6, 9, "niedziela"]
+    - ["Boże Ciało", "ruchome", "2030-06-20", 2030, 6, 20, "czwartek"]
+    - ["Wniebowzięcie Najświętszej Maryi Panny", "stałe", "2030-08-15", 2030, 8, 15, "czwartek"]
+    - ["Wszystkich Świętych", "stałe", "2030-11-01", 2030, 11, 1, "piątek"]
+    - ["Narodowe Święto Niepodległości", "stałe", "2030-11-11", 2030, 11, 11, "poniedziałek"]
+    - ["Boże Narodzenie", "stałe", "2030-12-25", 2030, 12, 25, "środa"]
+    - ["Drugi dzień Bożego Narodzenia", "stałe", "2030-12-26", 2030, 12, 26, "czwartek"]
+    - ["Nowy Rok", "stałe", "2031-01-01", 2031, 1, 1, "środa"]
+    - ["Trzech Króli", "stałe", "2031-01-06", 2031, 1, 6, "poniedziałek"]
+    - ["Wielkanoc", "ruchome", "2031-04-13", 2031, 4, 13, "niedziela"]
+    - ["Poniedziałek Wielkanocny", "ruchome", "2031-04-14", 2031, 4, 14, "poniedziałek"]
+    - ["Święto Pracy", "stałe", "2031-05-01", 2031, 5, 1, "czwartek"]
+    - ["Święto Konstytucji 3 Maja", "stałe", "2031-05-03", 2031, 5, 3, "sobota"]
+    - ["Zielone Świątki", "ruchome", "2031-06-01", 2031, 6, 1, "niedziela"]
+    - ["Boże Ciało", "ruchome", "2031-06-12", 2031, 6, 12, "czwartek"]
+    - ["Wniebowzięcie Najświętszej Maryi Panny", "stałe", "2031-08-15", 2031, 8, 15, "piątek"]
+    - ["Wszystkich Świętych", "stałe", "2031-11-01", 2031, 11, 1, "sobota"]
+    - ["Narodowe Święto Niepodległości", "stałe", "2031-11-11", 2031, 11, 11, "wtorek"]
+    - ["Boże Narodzenie", "stałe", "2031-12-25", 2031, 12, 25, "czwartek"]
+    - ["Drugi dzień Bożego Narodzenia", "stałe", "2031-12-26", 2031, 12, 26, "piątek"]
+    - ["Nowy Rok", "stałe", "2032-01-01", 2032, 1, 1, "czwartek"]
+    - ["Trzech Króli", "stałe", "2032-01-06", 2032, 1, 6, "wtorek"]
+    - ["Wielkanoc", "ruchome", "2032-03-28", 2032, 3, 28, "niedziela"]
+    - ["Poniedziałek Wielkanocny", "ruchome", "2032-03-29", 2032, 3, 29, "poniedziałek"]
+    - ["Święto Pracy", "stałe", "2032-05-01", 2032, 5, 1, "sobota"]
+    - ["Święto Konstytucji 3 Maja", "stałe", "2032-05-03", 2032, 5, 3, "poniedziałek"]
+    - ["Zielone Świątki", "ruchome", "2032-05-16", 2032, 5, 16, "niedziela"]
+    - ["Boże Ciało", "ruchome", "2032-05-27", 2032, 5, 27, "czwartek"]
+    - ["Wniebowzięcie Najświętszej Maryi Panny", "stałe", "2032-08-15", 2032, 8, 15, "niedziela"]
+    - ["Wszystkich Świętych", "stałe", "2032-11-01", 2032, 11, 1, "poniedziałek"]
+    - ["Narodowe Święto Niepodległości", "stałe", "2032-11-11", 2032, 11, 11, "czwartek"]
+    - ["Boże Narodzenie", "stałe", "2032-12-25", 2032, 12, 25, "sobota"]
+    - ["Drugi dzień Bożego Narodzenia", "stałe", "2032-12-26", 2032, 12, 26, "niedziela"]
+  query_create_first_model_tab: |
+    CREATE TABLE IF NOT EXISTS first_model_tab (
+    RunIdentifier TEXT,
+    INVO_NO TEXT,
+    INVO_ADMNO TEXT,
+    INVO_CLNTNO TEXT,
+    INVO_DEBH_NO TEXT,
+    INVO_DEBC_NO TEXT,
+    INVO_INVDATE DATETIME,
+    DZIEN DATETIME,
+    INVO_DUEDATE DATETIME,
+    INVO_AINITIALH REAL,
+    INVO_FINALPAYMENTDATE DATETIME,
+    INVO_FINALPAYMENTDATE_DAYS_DIFF REAL,
+    predicted_INVO_FINALPAYMENTDATE REAL,
+    PREDICTED_PAYMENT_DATE DATETIME,
+    p_day_0 REAL,
+    p_day_1 REAL,
+    p_day_2 REAL,
+    p_day_3 REAL,
+    p_day_4 REAL,
+    p_day_5 REAL,
+    p_day_6 REAL,
+    p_day_7 REAL,
+    p_day_8 REAL,
+    p_day_9 REAL,
+    p_day_10 REAL,
+    p_day_11 REAL,
+    p_day_12 REAL,
+    p_day_13 REAL,
+    p_day_14 REAL,
+    p_day_15 REAL,
+    p_day_16 REAL,
+    p_day_17 REAL,
+    p_day_18 REAL,
+    p_day_19 REAL,
+    p_day_20 REAL,
+    p_day_21 REAL,
+    p_day_22 REAL,
+    p_day_23 REAL,
+    p_day_24 REAL,
+    p_day_25 REAL,
+    p_day_26 REAL,
+    p_day_27 REAL,
+    p_day_28 REAL,
+    p_day_29 REAL,
+    p_day_30 REAL,
+    p_day_31 REAL,
+    p_day_32 REAL,
+    p_day_33 REAL,
+    p_day_34 REAL,
+    p_day_35 REAL,
+    p_day_36 REAL,
+    p_day_37 REAL,
+    p_day_38 REAL,
+    p_day_39 REAL,
+    p_day_40 REAL,
+    p_day_41 REAL,
+    p_day_42 REAL,
+    p_day_43 REAL,
+    p_day_44 REAL,
+    p_day_45 REAL,
+    p_day_46 REAL,
+    p_day_47 REAL,
+    p_day_48 REAL,
+    p_day_49 REAL,
+    p_day_50 REAL,
+    p_day_51 REAL,
+    p_day_52 REAL,
+    p_day_53 REAL,
+    p_day_54 REAL,
+    p_day_55 REAL,
+    p_day_56 REAL,
+    p_day_57 REAL,
+    p_day_58 REAL,
+    p_day_59 REAL,
+    p_day_60 REAL,
+    p_day_61 REAL,
+    p_day_62 REAL,
+    p_day_63 REAL,
+    p_day_64 REAL,
+    p_day_65 REAL,
+    p_day_66 REAL,
+    p_day_67 REAL,
+    p_day_68 REAL,
+    p_day_69 REAL,
+    p_day_70 REAL,
+    p_day_71 REAL,
+    p_day_72 REAL,
+    p_day_73 REAL,
+    p_day_74 REAL,
+    p_day_75 REAL,
+    p_day_76 REAL,
+    p_day_77 REAL,
+    p_day_78 REAL,
+    p_day_79 REAL,
+    p_day_80 REAL,
+    p_day_81 REAL,
+    p_day_82 REAL,
+    p_day_83 REAL,
+    p_day_84 REAL,
+    p_day_85 REAL,
+    p_day_86 REAL,
+    p_day_87 REAL,
+    p_day_88 REAL,
+    p_day_89 REAL,
+    p_day_90 REAL,
+    p_day_91 REAL,
+    p_day_92 REAL,
+    p_day_93 REAL,
+    p_day_94 REAL,
+    p_day_95 REAL,
+    p_day_96 REAL,
+    p_day_97 REAL,
+    p_day_98 REAL,
+    p_day_99 REAL,
+    p_day_100 REAL,
+    p_day_101 REAL,
+    p_day_102 REAL,
+    p_day_103 REAL,
+    p_day_104 REAL,
+    p_day_105 REAL,
+    p_day_106 REAL,
+    p_day_107 REAL,
+    p_day_108 REAL,
+    p_day_109 REAL,
+    p_day_110 REAL,
+    p_day_111 REAL,
+    p_day_112 REAL,
+    p_day_113 REAL,
+    p_day_114 REAL,
+    p_day_115 REAL,
+    p_day_116 REAL,
+    p_day_117 REAL,
+    p_day_118 REAL,
+    p_day_119 REAL,
+    p_day_120 REAL,
+    p_day_121 REAL,
+    p_day_122 REAL,
+    p_day_123 REAL,
+    p_day_124 REAL,
+    p_day_125 REAL,
+    p_day_126 REAL,
+    p_day_127 REAL,
+    p_day_128 REAL,
+    p_day_129 REAL,
+    p_day_130 REAL,
+    p_day_131 REAL,
+    p_day_132 REAL,
+    p_day_133 REAL,
+    p_day_134 REAL,
+    p_day_135 REAL,
+    p_day_136 REAL,
+    p_day_137 REAL,
+    p_day_138 REAL,
+    p_day_139 REAL,
+    p_day_140 REAL,
+    p_day_141 REAL,
+    p_day_142 REAL,
+    p_day_143 REAL,
+    p_day_144 REAL,
+    p_day_145 REAL,
+    p_day_146 REAL,
+    p_day_147 REAL,
+    p_day_148 REAL,
+    p_day_149 REAL,
+    p_day_150 REAL,
+    p_day_151 REAL,
+    p_day_152 REAL,
+    p_day_153 REAL,
+    p_day_154 REAL,
+    p_day_155 REAL,
+    p_day_156 REAL,
+    p_day_157 REAL,
+    p_day_158 REAL,
+    p_day_159 REAL,
+    p_day_160 REAL,
+    p_day_161 REAL,
+    p_day_162 REAL,
+    p_day_163 REAL,
+    p_day_164 REAL,
+    p_day_165 REAL,
+    p_day_166 REAL,
+    p_day_167 REAL,
+    p_day_168 REAL,
+    p_day_169 REAL,
+    p_day_170 REAL,
+    p_day_171 REAL,
+    p_day_172 REAL,
+    p_day_173 REAL,
+    p_day_174 REAL,
+    p_day_175 REAL,
+    p_day_176 REAL,
+    p_day_177 REAL,
+    p_day_178 REAL,
+    p_day_179 REAL,
+    p_day_180_plus REAL,
+    expected_payment_day REAL,
+    median_payment_day INTEGER,
+    p_paid_within_7 REAL,
+    p_paid_within_30 REAL
+    );
