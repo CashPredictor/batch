@@ -1,103 +1,107 @@
-Dobra — zrobiłeś duży krok w dobrą stronę, ale masz jeszcze kilka miejsc, gdzie:
+mieliśmy tak:
+        offsets = [1, 2, 3, 6, 12]
 
-* wraca stary styl (SQL w Pythonie),
-* są błędy techniczne,
-* albo tracisz spójność architektury.
+        print("Rozpoczynam partiami wstawianie do 'extended_grouped_client_days_tab'...")
+    
+        # 1. Pobieramy listę (ROK, MIESIAC) występujących w widoku
+        cursor.execute("""
+            SELECT DISTINCT ROK, MIESIAC
+            FROM extended_grouped_client_days
+            WHERE INVO_CLNTNO = ?
+            ORDER BY ROK, MIESIAC
+        """, (client_id,))
+        year_month_rows = cursor.fetchall()
 
-Poniżej masz konkretną listę poprawek (bez lania wody) + nazwy plików/obiektów, żebyś mógł to od razu wdrożyć.
+        cursor.execute("DELETE FROM extended_grouped_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
+        
+        # 2. Iterujemy po każdej parze (ROK, MIESIAC)
+        for (year, month) in year_month_rows:
+            insert_sql = f"""
+            INSERT INTO extended_grouped_client_days_tab
+            SELECT *
+            FROM extended_grouped_client_days
+            WHERE ROK = {year}
+              AND MIESIAC = {month}
+              AND date(DZIEN) >= {params['od_dnia']}
+              AND INVO_CLNTNO = {client_id};
+            """
+            cursor.execute(insert_sql)
+            conn.commit()  # commit po każdej partii
+        
+            # Podgląd liczby wstawionych wierszy
+            inserted_count = cursor.rowcount  # w SQLite rowcount czasem bywa -1, zależy od wersji
+            print(f"Wstawiono partię: ROK={year}, MIESIAC={month} (rowcount={inserted_count})")
+        
+        print("Wszystkie partie zostały zaimportowane.")
+        print(datetime.now().strftime("%H:%M:%S"))
+        
+        # Zatwierdzenie zmian
+        conn.commit()
+        print("Proces zakończony.")
+        
+        print("Rozpoczynam partiami wstawianie do 'summary_client_days_tab'...")
+        
+        # 3. Znajdujemy, od którego (ROK, MIESIAC) kontynuować.
+        #    Szukamy w summary_client_days_tab największego ROK,MIESIAC wstawionego
+        #    lub None, jeśli pusto.
+        
+        
+        cursor.execute("DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
+        conn.commit()
+        
+        cursor.execute("""
+            SELECT DISTINCT ROK, MIESIAC
+            FROM extended_grouped_client_days
+            WHERE INVO_CLNTNO = ?
+            ORDER BY ROK, MIESIAC
+        """, (client_id,))
+        all_rows = cursor.fetchall()
+        
+        inserted_count = 0
 
-⸻
+        for (year, month) in all_rows:
+            insert_sql = """
+                INSERT INTO summary_client_days_tab
+                SELECT *
+                FROM summary_client_days_view
+                WHERE ROK = ?
+                  AND MIESIAC = ?
+                  AND INVO_CLNTNO = ?
+            """
+            cursor.execute(insert_sql, (year, month, client_id))
+            conn.commit()
+        
+            row_count = cursor.rowcount if cursor.rowcount != -1 else 0
+            inserted_count += row_count
+            print(f"Wstawiono ROK={year}, MIESIAC={month} -> {row_count} wierszy (narastająco={inserted_count})")
+        
+        print(f"Wszystkie partie zostały zaimportowane. Łącznie wstawiono (teraz) = {inserted_count}.")
+        print(datetime.now().strftime("%H:%M:%S"))
 
-🔴 1. BŁĄD: load_sql_file("{queries_dir}/...")
+        cursor.execute(params['idx_invo_debcno_invdate_etc'])
+        cursor.execute(params['idx_invo_debcno_invdate'])
+        cursor.execute(params['idx_summary_days_ids_dzien'])
+        cursor.execute(params['idx_ext_days_ids_dzien'])
+        cursor.execute(params['idx_clhs_joined_keys_datetime'])
+        conn.commit()
+        
+        # Pobranie świąt (jeśli istnieją)
+        cursor.execute("SELECT data FROM swieta")
+        holidays = {pd.Timestamp(row[0]) for row in cursor.fetchall()}
+        
+        # Parametry wejściowe
 
-Masz:
-
-query_invo = load_sql_file("{queries_dir}/grouped_query.sql")
-
-❌ To NIE działa – masz string literal
-
-⸻
-
-✅ popraw:
-
-query_invo = load_sql_file(f"{queries_dir}/invo_select.sql")
-
-⸻
-
-🔴 2. grouped_query.sql używasz dwa razy do różnych rzeczy
-
-Masz:
-
-* raz jako query_invo
-* raz jako grouped_query
-
-❌ To jest błąd semantyczny
-
-⸻
-
-✅ rozdziel:
-
-📄 queries/invo_select.sql
-
-SELECT 
-    INVO_NO,
-    INVO_ADMNO,
-    INVO_CLNTNO,
-    INVO_DEBH_NO,
-    INVO_DEBC_NO,
-    INVO_INVDATE,
-    INVO_FINALPAYMENTDATE
-FROM invo_view
-WHERE INVO_INVDATE IS NOT NULL
-  AND DATE(INVO_INVDATE) >= DATE(?)
-  AND INVO_CLNTNO = ?
-
-⸻
-
-📄 queries/grouped_client_days_select.sql
-
-SELECT 
-    g.INVO_ADMNO,
-    g.INVO_CLNTNO,
-    g.INVO_DEBH_NO,
-    g.INVO_DEBC_NO,
-    g.DZIEN,
-    g.MIESIAC,
-    g.ROK
-FROM group_cust_inv_days g
-WHERE g.INVO_CLNTNO = ?
-GROUP BY ...
-
-⸻
-
-🔴 3. MASZ SQL w Pythonie (extended + summary)
-
-❌ to:
-
-insert_sql = f"""
-INSERT INTO extended_grouped_client_days_tab
+a teraz mamy takie pliki:
+insert_summary_client_days.sql
+INSERT INTO summary_client_days_tab
 SELECT *
-FROM extended_grouped_client_days
-WHERE ROK = {year}
-  AND MIESIAC = {month}
-  AND date(DZIEN) >= {params['od_dnia']}
-  AND INVO_CLNTNO = {client_id};
-"""
+FROM summary_client_days_view
+WHERE ROK = ?
+	AND MIESIAC = ?
+	AND INVO_CLNTNO = ?
 
-⸻
-
-❌ PROBLEM
-
-* SQL injection
-* brak param binding
-* łamiesz własne zasady
-
-⸻
-
-✅ popraw:
-
-📄 queries/insert_extended_grouped_client_days.sql
-
+i
+insert_extended_grouped_client_days
 INSERT INTO extended_grouped_client_days_tab
 SELECT *
 FROM extended_grouped_client_days
@@ -106,274 +110,4 @@ WHERE ROK = ?
   AND DATE(DZIEN) >= DATE(?)
   AND INVO_CLNTNO = ?
 
-⸻
-
-Python:
-
-sql = load_sql_file(f"{queries_dir}/insert_extended_grouped_client_days.sql")
-cursor.execute(sql, (year, month, params['od_dnia'], client_id))
-
-⸻
-
-🔴 4. summary_client_days_tab — to samo
-
-📄 queries/insert_summary_client_days.sql
-
-INSERT INTO summary_client_days_tab
-SELECT *
-FROM summary_client_days_view
-WHERE ROK = ?
-  AND MIESIAC = ?
-  AND INVO_CLNTNO = ?
-
-⸻
-
-🔴 5. INDEKSY – nadal w configu ❌
-
-Masz:
-
-cursor.execute(params['idx_invo_debcno_invdate_etc'])
-
-⸻
-
-✅ popraw:
-
-📁 sql/indexes/
-
-create_idx_invo_debcno_invdate.sql
-create_idx_invo_debcno_invdate_etc.sql
-create_idx_summary_days_ids_dzien.sql
-create_idx_ext_days_ids_dzien.sql
-create_idx_clhs_joined_keys_datetime.sql
-
-⸻
-
-Python:
-
-for idx_file in [
-    "create_idx_invo_debcno_invdate.sql",
-    "create_idx_invo_debcno_invdate_etc.sql",
-    "create_idx_summary_days_ids_dzien.sql",
-    "create_idx_ext_days_ids_dzien.sql",
-    "create_idx_clhs_joined_keys_datetime.sql",
-]:
-    sql = load_sql_file(f"{indexes_dir}/{idx_file}")
-    cursor.execute(sql)
-
-⸻
-
-🔴 6. query_faktury_tpl – NAJGORSZY FRAGMENT ❌
-
-Masz:
-
-query_faktury_tpl = """ ... {end_day} {start_day} ... """
-query_faktury = query_faktury_tpl.format(...)
-
-⸻
-
-❌ PROBLEM
-
-* string SQL
-* brak param binding
-* ciężkie do utrzymania
-
-⸻
-
-✅ popraw:
-
-📄 queries/select_faktury.sql
-
-WITH invo_base AS (
-  SELECT
-      INVO_ADMNO,
-      INVO_CLNTNO,
-      INVO_DEBH_NO,
-      INVO_DEBC_NO,
-      INVO_AINITIALH,
-      INVO_INVDATE,
-      CASE
-        WHEN INVO_FINALPAYMENTDATE IS NOT NULL
-         AND DATE(INVO_FINALPAYMENTDATE) < DATE(?)
-        THEN INVO_FINALPAYMENTDATE
-        ELSE NULL
-      END AS INVO_FINALPAYMENTDATE,
-      INVO_DUEDATE
-  FROM invo_view
-  WHERE INVO_ADMNO = ?
-    AND INVO_CLNTNO = ?
-    AND INVO_DEBH_NO = ?
-    AND INVO_DEBC_NO = ?
-)
-SELECT *
-FROM invo_base
-WHERE
-      (INVO_DUEDATE IS NOT NULL AND DATE(INVO_DUEDATE) BETWEEN DATE(?) AND DATE(?))
-   OR (INVO_FINALPAYMENTDATE IS NOT NULL AND DATE(INVO_FINALPAYMENTDATE) BETWEEN DATE(?) AND DATE(?))
-
-⸻
-
-Python:
-
-sql = load_sql_file(f"{queries_dir}/select_faktury.sql")
-faktury = pd.read_sql_query(
-    sql,
-    conn,
-    params=(
-        end_day,
-        invo_admno,
-        invo_clntno,
-        invo_debh_no,
-        invo_debc_no,
-        start_day,
-        end_day,
-        start_day,
-        end_day,
-    )
-)
-
-⸻
-
-🔴 7. dcmo_columns ❌
-
-Masz listę w Pythonie.
-
-⸻
-
-✅ przenieś do:
-
-📄 schema/dcmo_schema.sql
-
-(albo jako część CREATE TABLE)
-
-👉 Python nie powinien znać schemy
-
-⸻
-
-🔴 8. generate_days + insert (duży temat)
-
-To:
-
-generate_days + executemany
-
-⸻
-
-🟡 OK NA TERAZ
-
-👉 nie ruszaj
-
-ALE docelowo:
-
-✔️ zrobić jako SQL (recursive CTE)
-
-⸻
-
-🔴 9. client_filter DUPLIKAT
-
-Masz:
-
-client_filter = """ AND g.INVO_CLNTNO = ? ... """
-
-i jednocześnie:
-
-build_client_filter_sql()
-
-⸻
-
-❌ usuń:
-
-client_filter = """..."""
-
-⸻
-
-🔴 10. load_sql_file – używasz względnych ścieżek ❌
-
-Masz:
-
-load_sql_file("queries/...")
-
-⸻
-
-✅ popraw:
-
-load_sql_file(f"{queries_dir}/...")
-
-⸻
-
-🟡 11. shard_condition – OK
-
-Tu zrobiłeś dobrze 👍
-
-⸻
-
-🟡 12. stats_pivot + dataset_raw — OK
-
-To jest dokładnie dobry kompromis
-
-✔️ zostaw
-
-⸻
-
-🟡 13. refill_dataset_for_client — OK
-
-To jest poprawne 👍
-
-⸻
-
-🔥 FINALNA STRUKTURA (NAZWY OBIEKTÓW)
-
-📁 sql/queries/
-
-invo_select.sql
-grouped_client_days_select.sql
-insert_extended_grouped_client_days.sql
-insert_summary_client_days.sql
-select_faktury.sql
-query_dataset_raw_select.sql
-query_stats_pivot_select.sql
-
-⸻
-
-📁 sql/indexes/
-
-create_idx_invo_debcno_invdate.sql
-create_idx_invo_debcno_invdate_etc.sql
-create_idx_summary_days_ids_dzien.sql
-create_idx_ext_days_ids_dzien.sql
-create_idx_clhs_joined_keys_datetime.sql
-
-⸻
-
-📁 sql/schema/
-
-create_statystyki_faktur.sql
-create_group_cust_inv_days.sql
-create_dcmo.sql
-...
-
-⸻
-
-🚨 NAJWAŻNIEJSZE POPRAWKI (TOP 5)
-
-1. ❌ {queries_dir} → f-string
-2. ❌ grouped_query używany jako invo → rozdziel
-3. ❌ SQL z f-string (extended, summary) → pliki + ?
-4. ❌ query_faktury_tpl → do SQL + parametry
-5. ❌ indeksy w config → do plików
-
-⸻
-
-🧠 OCENA TWOJEGO REFAKTORU
-
-👉 jesteś na ~80% dobrego designu
-👉 zostały głównie „legacy w Pythonie”
-
-⸻
-
-👉 Jeśli chcesz następny krok
-
-Mogę Ci zrobić:
-
-✅ gotowy db_layer.py (execute_sql, execute_file, batch insert)
-✅ albo pełny refactor build_dataset_db do 50% krótszego kodu
-
-Powiedz tylko.
+przeanalizuj jak finalnie powinno to wyglądać z tymi plikami czyli defakto podaj mi fragment do wklejenia cały jak i gdzie.
