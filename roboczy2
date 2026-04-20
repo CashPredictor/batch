@@ -1,42 +1,274 @@
-ok, przenoszę wszystkie queries i skrypty z configa do plików tych któe mi podałeś, odtworzyłem je w tej samej strukturze, tylko zastanów się
-czy to się obsłuży:
-AND {shard_condition}
-albo:
-    LEFT JOIN (
-    {stats_pivot_select}
-    ) pivot 
-a wywołanie:
-            stats_pivot_sql = params['query_stats_pivot_select'] \
-                .replace("{shard_condition}", shard_condition) \
-                .replace("{client_filter}", client_filter)
+Super — to jest dokładnie ten moment, gdzie warto się zatrzymać i zrobić porządną normalizację podejścia, bo inaczej będziesz łatał to w nieskończoność.
 
-            dataset_raw_sql = params['query_dataset_raw_select'] \
-                .replace("{stats_pivot_select}", stats_pivot_sql) \
-                .replace("{shard_condition}", shard_condition) \
-                .replace("{client_filter}", client_filter)
+Zanim przejdziemy do konkretnej listy zmian, najpierw ustawmy jasny model docelowy, a potem powiem Ci co mam od Ciebie potrzebować, żeby zrobić refactor „na czysto”.
 
-czy mam coś jeszcze zmienić? ponadto przyjrzyj się, czy obecnie przekazujemy paramtry poprawnie, bo czasami mamy jak tutaj:
-            stats_pivot_sql = params['query_stats_pivot_select'] \
-                .replace("{shard_condition}", shard_condition) \
-                .replace("{client_filter}", client_filter)
+⸻
 
-            dataset_raw_sql = params['query_dataset_raw_select'] \
-                .replace("{stats_pivot_select}", stats_pivot_sql) \
-                .replace("{shard_condition}", shard_condition) \
-                .replace("{client_filter}", client_filter)
-w {}
+🔴 KLUCZOWY PROBLEM, KTÓRY ROZWIĄZUJEMY
 
-a czasami ?
-        chunk_df = pd.read_sql_query(
-            f"""
-            SELECT *
-            FROM {source_table}
-            WHERE INVO_CLNTNO = ?
-              AND DATE(DZIEN) >= DATE(?)
-              AND DATE(DZIEN) <= DATE(?)
-            ORDER BY DZIEN, INVO_NO
-            """,
-            conn,
-            params=(client_id, current_date.strftime("%Y-%m-%d"), next_date.strftime("%Y-%m-%d"))
+Masz teraz 3 sposoby używania SQL:
 
-czy nie4 trzeba tego jakoś ujednoliscić i czy to zadziała z plikami? podaj mi co konkretnie rpzenieść i do jakich plików i czy to będzie grało i jak przekazywać tam te parametry?
+1. ❌ SQL w config.yaml (stringi)
+2. ❌ SQL w Pythonie (.format(...))
+3. ❌ SQL z parametrami ?
+4. ❌ SQL z {param} (string formatting)
+
+To jest chaos.
+
+⸻
+
+🧠 DOCELOWY MODEL (NAJWAŻNIEJSZE)
+
+1. Rozdział odpowiedzialności
+
+Warstwa	Co robi
+SQL files	definiują logikę (SELECT, CREATE, INSERT)
+Python	steruje (loop, batching, clients)
+Config	tylko ścieżki + parametry
+
+⸻
+
+2. JEDEN sposób parametryzacji
+
+Masz dwa:
+
+* ? (SQLite param binding) ✅
+* {param} (string format) ❌ NIE dla runtime
+
+📌 Zasada:
+
+Typ SQL	Parametry
+SELECT / INSERT runtime	?
+CREATE VIEW / TABLE	brak lub .format() tylko przy ładowaniu
+dynamiczne WHERE	składane w Pythonie
+
+⸻
+
+⚠️ NAJWAŻNIEJSZA DECYZJA
+
+👉 Nie próbuj robić uniwersalnych SQL-i z {param}
+
+To się źle skaluje i jest niebezpieczne.
+
+Zamiast tego:
+
+✔️ SQL jest statyczny
+
+✔️ Python dokleja WHERE / filtr klienta
+
+⸻
+
+🧱 JAK TO BĘDZIE DZIAŁAĆ
+
+SQL file (bez parametrów):
+
+SELECT *
+FROM dataset
+WHERE 1=1
+
+Python:
+
+sql = load_sql("dataset.sql")
+if client_ids:
+    sql += f" AND INVO_CLNTNO IN ({','.join(map(str, client_ids))})"
+
+👉 TAK budujesz filtr klienta
+👉 NIE przez {client_ids} w SQL
+
+⸻
+
+📦 PARAMETRY – 3 KATEGORIE
+
+1. Runtime (z CLI)
+
+* clients
+* exclude_clients
+* t0
+* db_path
+
+👉 tylko w Pythonie
+
+⸻
+
+2. Techniczne (config)
+
+* batch size
+* shard count
+* paths
+
+👉 YAML
+
+⸻
+
+3. SQL logic
+
+👉 tylko .sql files
+
+⸻
+
+🔥 TERAZ KLUCZOWE PYTANIE Z TWOJEGO PROMPTU
+
+„czy te pliki będą działać z parametrami?”
+
+Odpowiedź:
+
+👉 TAK, ale tylko jeśli:
+
+* SQL nie ma {param}
+* SQL używa ?
+* dynamiczne rzeczy robisz w Pythonie
+
+⸻
+
+🧪 DWA POPRAWNE WZORCE
+
+✔️ Wzorzec 1 — parametry (bezpieczny)
+
+SELECT *
+FROM invo
+WHERE INVO_DATE BETWEEN ? AND ?
+cursor.execute(sql, (start_date, end_date))
+
+⸻
+
+✔️ Wzorzec 2 — dynamiczny fragment
+
+if client_ids:
+    sql += f" AND INVO_CLNTNO IN ({','.join(map(str, client_ids))})"
+
+⸻
+
+❌ NIE RÓB TAK
+
+WHERE INVO_CLNTNO IN ({client_ids})
+sql.format(client_ids="1,2,3")
+
+👉 to jest anty-pattern
+
+⸻
+
+📌 TERAZ — CO MUSISZ MI DOSTARCZYĆ
+
+Żebym zrobił Ci dokładny refactor, potrzebuję:
+
+1. Aktualne pliki (po Twoich zmianach)
+
+🔹 MUST HAVE:
+
+* db_init.py
+* build_client_db.py
+* build_dataset_db.py
+* runner_batch.py
+* config.yaml
+
+⸻
+
+2. Aktualne SQL-e z configa
+
+czyli:
+
+* wszystkie query_*
+* wszystkie CREATE
+* wszystkie INSERT
+* wszystkie VIEW
+
+👉 nawet jeśli są w YAML jako stringi
+
+⸻
+
+3. Odpowiedź na 2 pytania (ważne!)
+
+❓1. Czy chcesz:
+
+A. minimum zmian (refactor bez zmiany logiki)
+B. clean architecture (trochę większy refactor, ale docelowo czysto)
+
+👉 polecam B
+
+⸻
+
+❓2. Czy planujesz PostgreSQL w Etapie 5?
+
+(bo to wpływa na SQL)
+
+⸻
+
+🧭 CO JA CI DAM W NASTĘPNYM KROKU
+
+Jak wrzucisz pliki, dostaniesz:
+
+🔧 1. Dokładną strukturę katalogów
+
+sql/
+  schema/
+  views/
+  queries/
+
+⸻
+
+🔧 2. KONKRETNY podział
+
+Dla każdego SQL powiem:
+
+* gdzie idzie (plik)
+* czy ma parametry
+* jak go wywołać
+
+⸻
+
+🔧 3. GOTOWE funkcje
+
+* load_sql()
+* execute_sql_file()
+* execute_query_with_params()
+
+⸻
+
+🔧 4. PRZERÓBKĘ build_dataset_db
+
+* co usunąć
+* co zostawić
+* co zmienić
+
+⸻
+
+🔧 5. FINALNY FLOW
+
+build_client_db
+    ↓
+ensure_db
+    ↓
+db_init (jeśli trzeba)
+    ↓
+build_dataset_db
+    ↓
+runner_batch
+
+⸻
+
+🔚 TL;DR
+
+Najważniejsze:
+
+❌ nie trzymaj SQL w configu
+❌ nie używaj {param} w SQL
+❌ nie mieszaj 3 stylów
+
+✔️ SQL → pliki
+✔️ parametry → Python (?)
+✔️ logika → Python
+
+⸻
+
+👉 Następny krok
+
+Wrzuć:
+
+* aktualne pliki
+* SQL-e z configa
+
+i powiedz:
+
+👉 „idziemy w clean architecture”
+
+a ja zrobię Ci konkretny refactor 1:1 pod Twój kod (bez zgadywania).
