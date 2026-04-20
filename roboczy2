@@ -1,297 +1,318 @@
-Te kolumny DCMO nie powstają w dataset “same z siebie”. Ich lineage jest taki:
+Super — to jest bardzo dobra decyzja architektoniczna, bo to ujednolica cały pipeline.
 
-dcmo → dcmo_view → extended_grouped_client_days → extended_grouped_client_days_tab → query_dataset_raw_select / dataset_tab → process_dataset_tab() / dataset.
+Zrobię to w 3 krokach:
 
-Najważniejsze miejsca:
+1. Jak jest teraz (gdzie są problemy)
+2. Jak ma działać (docelowa logika)
+3. Konkretnie: co zmienić w kodzie + gotowe snippet’y
+4. Przykładowe wywołania CLI (wszystkie scenariusze)
 
-dcmo_view bierze z tabeli dcmo po jednym rekordzie na klucz (DEBC_ADMNO, DEBC_NO, DEBC_DEBH, DEBC_CLNTNO, DCMO_YEAR, DCMO_MONTH) wybierając MAX(DCMO_ID). Jeśli w dwóch bazach są inne duplikaty lub inne DCMO_ID, to różnice zaczną się już tutaj.  ￼
+⸻
 
-extended_grouped_client_days buduje kolumny typu *_M, *_M1, *_M2, *_M3, *_M6, *_M12 przez dołączanie dcmo_view dla poprzedniego miesiąca oraz miesięcy przesuniętych o 1, 2, 3, 6 i 12.
+1. Jak jest teraz (problemy)
 
-Kolumny typu *_D1_3M, *_D2_3M, *_D1_6M, *_D2_6M są liczone jako różnice między wartościami z d, d1, d2. Przykład dla DCMO_PAIDAMOUNT:
-D1_* = d - d1
-D2_* = (d - d1) - (d1 - d2).
-To było wcześniej generowane dynamicznie, a teraz jest zaszyte statycznie w configu.
+runner_batch.py
 
-Potem build_dataset_db.py kasuje dane klienta z extended_grouped_client_days_tab i wstawia je ponownie z widoku extended_grouped_client_days, miesiąc po miesiącu. Analogicznie robi dalej z kolejnymi tabelami pośrednimi.
+Masz:
 
-Na końcu dataset nie jest prostą kopią dataset_tab. refill_dataset_for_client() czyta dataset_tab, a process_dataset_tab():
+* --train-client-ids
+* --test-client-ids
+* fallbacki
+* walidacje typu:
 
-* bierze wszystkie kolumny liczbowe z dataset_tab,
-* przelicza kolumny datowe,
-* generuje dodatkowe cechy,
-* sanitizuje nazwy kolumn,
-* usuwa duplicate case-insensitive,
-* dopiero wtedy inseruje do dataset. Czyli jeśli różnica jest już w dataset_tab, to przejdzie dalej; jeśli powstaje dopiero przez przetwarzanie typów / dat / kolizje nazw, zobaczysz ją dopiero w dataset.
+if args.run_train and train_client_ids is None:
+    raise SystemExit(...)
 
-Bardzo ważna uwaga: sufiks __OLD nie pochodzi z flow budowania bazy. To wygląda na sufiks z Twojego raportu porównawczego albo z merge’a danych porównawczych. W samej bazie źródłowe kolumny są bez __OLD; flow operuje na nazwach typu DCMO_PAIDAMOUNT_M, DCMO_PAIDAMOUNT_M1 itd.
+👉 Problem:
 
-Gdzie najpewniej powstają różnice
+* brak listy = błąd (a ma być ALL)
+* brak obsługi excluded_clients
+* brak wspólnej funkcji rozstrzygającej „kogo bierzemy”
 
-Dla tych kolumn najbardziej prawdopodobne źródła są cztery:
+⸻
 
-1. dcmo ma inne rekordy wejściowe między bazami.
-2. dcmo_view wybiera inny rekord przez MAX(DCMO_ID) dla tego samego miesiąca i klucza.  ￼
-3. extended_grouped_client_days inaczej dopasowuje miesiące do DZIEN przez logikę start of month, -1 day, -n months.  ￼
-4. dataset_tab lub dataset różni się przez dalsze joiny albo przez process_dataset_tab().
+CreateDatabase.py / build_dataset_db.py
 
-Na jakich tabelach puścić skrypt ASOF vs FULL
+Masz:
 
-Dla tego problemu puść porównanie w tej kolejności:
+explicit_clients = params.get("train_client_id")
+if explicit_clients:
+    filter
 
-1. dcmo
-2. dcmo_view
-3. grouped_client_days
-4. extended_grouped_client_days_tab
-5. summary_client_days_tab
-6. statystyki_faktur
-7. dataset_tab
-8. dataset
+👉 Problem:
 
-To da Ci zawężanie binarne:
+* tylko include
+* brak exclude
+* brak spójności z runnerem
 
-* jeśli różnica jest już w dcmo, problem jest wejściowy,
-* jeśli dcmo jest OK, a dcmo_view nie, problem jest w deduplikacji / MAX(DCMO_ID),
-* jeśli dcmo_view jest OK, a extended_grouped_client_days_tab nie, problem jest w mapowaniu miesięcy,
-* jeśli extended_* jest OK, a dataset_tab nie, problem jest w query_dataset_raw_select,
-* jeśli dataset_tab jest OK, a dataset nie, problem jest w process_dataset_tab() / insert do dataset.
+⸻
 
-Jak porównywać te tabele
+first_model.py
 
-Dla każdej z nich użyj innych kluczy:
+Masz filtr:
 
-dcmo
+build_client_filter_sql(params)
 
-* klucz: DEBC_ADMNO, DEBC_CLNTNO, DEBC_DEBH, DEBC_NO, DCMO_YEAR, DCMO_MONTH
-* dodatkowo pokaż DCMO_ID
+👉 działa dobrze dla:
 
-dcmo_view
+* None → ALL
+* lista → filtr
 
-* ten sam klucz
+👉 ale:
 
-grouped_client_days
+* brak exclude
+* brak kombinacji include + exclude
 
-* klucz: INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, DZIEN
+⸻
 
-extended_grouped_client_days_tab
+2. Docelowa logika (jedna dla całego systemu)
 
-* klucz: INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, DZIEN
+Chcemy jedną regułę:
 
-summary_client_days_tab
+INPUT:
 
-* klucz: INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, DZIEN
+* include_clients
+* exclude_clients
 
-statystyki_faktur
+REGUŁY:
 
-* klucz: INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, DZIEN, PARAM_Z_ILU_DNI, SCENARIUSZ
+include	exclude	wynik
+None	None	ALL
+[]	[]	ALL
+[A,B]	None	A,B
+None	[A,B]	ALL - A,B
+[A,B,C]	[B]	A,C
 
-dataset_tab
+⸻
 
-* klucz: INVO_NO, INVO_CLNTNO, DZIEN
+3. ZMIANY W KODZIE
 
-dataset
+3.1. NOWA funkcja centralna (KLUCZOWA)
 
-* klucz: INVO_NO, INVO_CLNTNO, DZIEN
+Dodaj np. do utils_clients.py (albo runnera na start):
 
-Kierunkowe SQL-e, które najbardziej pomogą
+def resolve_clients(all_clients, include=None, exclude=None):
+    """
+    all_clients: iterable (np. z DB)
+    include: list | None
+    exclude: list | None
+    """
+    all_clients = set(all_clients)
+    if include:
+        clients = set(include)
+    else:
+        clients = all_clients
+    if exclude:
+        clients = clients - set(exclude)
+    return sorted(list(clients))
 
-Poniżej SQL-e do puszczenia osobno na obu bazach i porównania wyników.
+⸻
 
-1. Czy problem jest już w dcmo
+3.2. PARSOWANIE CLI
 
-Dla konkretnego klienta:
-
-SELECT
-    DEBC_ADMNO,
-    DEBC_CLNTNO,
-    DEBC_DEBH,
-    DEBC_NO,
-    DCMO_YEAR,
-    DCMO_MONTH,
-    COUNT(*) AS cnt,
-    MIN(DCMO_ID) AS min_id,
-    MAX(DCMO_ID) AS max_id
-FROM dcmo
-WHERE DEBC_CLNTNO = 13581
-GROUP BY
-    DEBC_ADMNO, DEBC_CLNTNO, DEBC_DEBH, DEBC_NO, DCMO_YEAR, DCMO_MONTH
-HAVING COUNT(*) > 1
-ORDER BY DCMO_YEAR, DCMO_MONTH, DEBC_DEBH, DEBC_NO;
-
-To powie, czy masz duplikaty, które potem dcmo_view musi rozstrzygać przez MAX(DCMO_ID).
-
-2. Jaki rekord wybiera dcmo_view
-
-SELECT
-    DEBC_ADMNO,
-    DEBC_CLNTNO,
-    DEBC_DEBH,
-    DEBC_NO,
-    DCMO_YEAR,
-    DCMO_MONTH,
-    DCMO_ID,
-    DCMO_PAIDAMOUNT,
-    DCMO_PAIDAMOUNTINVDATE,
-    DCMO_PAIDAMOUNTDUEDATE,
-    DCMO_PAIDAMOUNTBEFOREDUEDATE,
-    DCMO_PAIDAMOUNTPARTIALPAYM
-FROM dcmo_view
-WHERE DEBC_CLNTNO = 13581
-ORDER BY DCMO_YEAR, DCMO_MONTH, DEBC_DEBH, DEBC_NO;
-
-Jeśli tu są już różnice, nie ma sensu iść dalej bez wyjaśnienia.
-
-3. Czy różni się baza dni, na które potem mapujesz DCMO
-
-SELECT
-    INVO_ADMNO,
-    INVO_CLNTNO,
-    INVO_DEBH_NO,
-    INVO_DEBC_NO,
-    MIN(DATE(DZIEN)) AS min_dzien,
-    MAX(DATE(DZIEN)) AS max_dzien,
-    COUNT(*) AS cnt
-FROM grouped_client_days
-WHERE INVO_CLNTNO = 13581
-GROUP BY INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO
-ORDER BY cnt DESC;
-
-Jeśli grouped_client_days różni się między bazami, cała reszta też się rozjedzie.
-
-4. Czy różnice pojawiają się w extended_grouped_client_days_tab
-
-SELECT
-    INVO_ADMNO,
-    INVO_CLNTNO,
-    INVO_DEBH_NO,
-    INVO_DEBC_NO,
-    DATE(DZIEN) AS DZIEN,
-    DCMO_PAIDAMOUNT_M,
-    DCMO_PAIDAMOUNT_M1,
-    DCMO_PAIDAMOUNT_M2,
-    DCMO_PAIDAMOUNT_M3,
-    DCMO_PAIDAMOUNT_M6,
-    DCMO_PAIDAMOUNT_M12,
-    DCMO_PAIDAMOUNT_D1_3M,
-    DCMO_PAIDAMOUNT_D2_3M,
-    DCMO_PAIDAMOUNT_D1_6M,
-    DCMO_PAIDAMOUNT_D2_6M
-FROM extended_grouped_client_days_tab
-WHERE INVO_CLNTNO = 13581
-ORDER BY DZIEN, INVO_DEBH_NO, INVO_DEBC_NO
-LIMIT 500;
-
-To jest pierwszy punkt, gdzie zobaczysz bezpośrednio te kolumny.
-
-5. Czy join do dataset_tab coś jeszcze psuje
-
-SELECT
-    INVO_NO,
-    INVO_CLNTNO,
-    DATE(DZIEN) AS DZIEN,
-    DCMO_PAIDAMOUNT_M,
-    DCMO_PAIDAMOUNTINVDATE_M,
-    DCMO_PAIDAMOUNTDUEDATE_M,
-    DCMO_PAIDAMOUNTBEFOREDUEDATE_M,
-    DCMO_PAIDAMOUNTAFTDUEDAT30_M,
-    DCMO_PAIDAMOUNTPARTIALPAYM_M,
-    DCMO_PAIDAMOUNT_M1,
-    DCMO_PAIDAMOUNT_M12,
-    DCMO_PAIDAMOUNT_D1_3M,
-    DCMO_PAIDAMOUNT_D2_3M,
-    DCMO_PAIDAMOUNT_D1_6M,
-    DCMO_PAIDAMOUNT_D2_6M,
-    DCMO_PAIDAMOUNT_NOW,
-    DCMO_PAIDAMOUNTINVDATE_NOW,
-    DCMO_PAIDAMOUNTDUEDAT_NOW,
-    DCMO_PAIDAMOUNTBEFOREDUEDATE_NOW
-FROM dataset_tab
-WHERE INVO_CLNTNO = 13581
-ORDER BY DZIEN, INVO_NO
-LIMIT 500;
-
-Jeśli extended_* jest OK, a dataset_tab już nie, problem siedzi w query_dataset_raw_select. Kolumny *_NOW są liczone właśnie tam, jako suma e.*_M plus agregaty z summary_client_days_tab.  ￼
-
-6. Czy problem pojawia się dopiero w dataset
-
-SELECT
-    INVO_NO,
-    INVO_CLNTNO,
-    DATE(DZIEN) AS DZIEN,
-    DCMO_PAIDAMOUNT_M,
-    DCMO_PAIDAMOUNTINVDATE_M,
-    DCMO_PAIDAMOUNTDUEDATE_M,
-    DCMO_PAIDAMOUNTBEFOREDUEDATE_M,
-    DCMO_PAIDAMOUNTPARTIALPAYM_M,
-    DCMO_PAIDAMOUNT_M1,
-    DCMO_PAIDAMOUNT_M12,
-    DCMO_PAIDAMOUNT_D1_3M,
-    DCMO_PAIDAMOUNT_D2_3M,
-    DCMO_PAIDAMOUNT_D1_6M,
-    DCMO_PAIDAMOUNT_D2_6M,
-    DCMO_PAIDAMOUNT_NOW
-FROM dataset
-WHERE INVO_CLNTNO = 13581
-ORDER BY DZIEN, INVO_NO
-LIMIT 500;
-
-Jeśli dataset_tab = OK, a dataset ≠ OK, to patrz w refill_dataset_for_client() i process_dataset_tab().
-
-7. Najbardziej użyteczne porównanie mapowania miesiąca DCMO do dnia
-
-To jest bardzo dobre do ręcznej walidacji logiki czasu:
-
-SELECT
-    g.INVO_ADMNO,
-    g.INVO_CLNTNO,
-    g.INVO_DEBH_NO,
-    g.INVO_DEBC_NO,
-    DATE(g.DZIEN) AS dzien,
-    strftime('%Y', date(g.DZIEN,'start of month','-1 day')) AS expected_year_m,
-    strftime('%m', date(g.DZIEN,'start of month','-1 day')) AS expected_month_m,
-    strftime('%Y', date(g.DZIEN,'start of month','-1 day','-1 months')) AS expected_year_m1,
-    strftime('%m', date(g.DZIEN,'start of month','-1 day','-1 months')) AS expected_month_m1,
-    strftime('%Y', date(g.DZIEN,'start of month','-1 day','-12 months')) AS expected_year_m12,
-    strftime('%m', date(g.DZIEN,'start of month','-1 day','-12 months')) AS expected_month_m12
-FROM grouped_client_days g
-WHERE g.INVO_CLNTNO = 13581
-ORDER BY g.DZIEN
-LIMIT 100;
-
-To pozwala sprawdzić, czy dla tego samego DZIEN obie bazy powinny trafiać w te same miesiące DCMO.
-
-8. Czy różnice są skupione w konkretnych miesiącach
-
-SELECT
-    substr(DZIEN, 1, 7) AS yyyy_mm,
-    COUNT(*) AS cnt,
-    SUM(CASE WHEN DCMO_PAIDAMOUNT_M IS NOT NULL THEN 1 ELSE 0 END) AS has_m,
-    SUM(CASE WHEN DCMO_PAIDAMOUNT_M1 IS NOT NULL THEN 1 ELSE 0 END) AS has_m1,
-    SUM(CASE WHEN DCMO_PAIDAMOUNT_M12 IS NOT NULL THEN 1 ELSE 0 END) AS has_m12
-FROM extended_grouped_client_days_tab
-WHERE INVO_CLNTNO = 13581
-GROUP BY substr(DZIEN, 1, 7)
-ORDER BY yyyy_mm;
-
-Bardzo szybko pokaże, czy problem dotyczy np. tylko początku historii, tylko M12, albo tylko miesięcy bez danych wstecz.
-
-Co sprawdzałbym najpierw
-
-Najkrótsza ścieżka diagnostyczna:
-
-1. dcmo — duplikaty i DCMO_ID
-2. dcmo_view — czy wybrany rekord jest ten sam
-3. extended_grouped_client_days_tab — czy same kolumny DCMO już się różnią
-4. dataset_tab — czy join do finalnego raw datasetu coś zmienia
-5. dataset — czy różnica nie jest dopiero po process_dataset_tab()
-
-Podejrzane miejsca w obecnym flow
-
-Najbardziej podejrzane są:
-
-* wybór MAX(DCMO_ID) w dcmo_view, jeśli masz wiele rekordów miesięcznych na ten sam klucz,  ￼
-* logika przypisywania DZIEN do poprzedniego miesiąca i offsetów -1/-2/-3/-6/-12 months,  ￼
-* query_dataset_raw_select, bo tam dochodzą jeszcze *_NOW i dodatkowe joiny,  ￼
-* końcowy refill dataset, ale raczej jako etap wtórny, nie główne źródło różnic DCMO.
-
-Najpraktyczniej zacząć od dcmo_view i extended_grouped_client_days_tab, bo to jest najbliżej źródła problemu i jeszcze przed zalaniem wszystkiego przez dataset_tab i dataset.
+Zmień parser w runner_batch.py:
+
+DODAJ:
+
+parser.add_argument("--train-client-ids", type=str)
+parser.add_argument("--test-client-ids", type=str)
+parser.add_argument("--exclude-train-client-ids", type=str)
+parser.add_argument("--exclude-test-client-ids", type=str)
+
+⸻
+
+UPDATE parse:
+
+def parse_client_ids(s):
+    if not s:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    return [int(x) for x in s.split(",") if x.strip()]
+
+👉 to już masz, ale upewnij się że:
+
+* “” → None
+* brak → None
+
+⸻
+
+3.3. USUŃ WALIDACJE (ważne)
+
+Usuń:
+
+if args.run_train and train_client_ids is None:
+    raise SystemExit(...)
+if args.run_test and test_client_ids is None:
+    raise SystemExit(...)
+
+⸻
+
+3.4. POBRANIE ALL CLIENTS Z DB
+
+Dodaj helper:
+
+def get_all_clients(conn):
+    q = "SELECT DISTINCT INVO_CLNTNO FROM dataset_tab"
+    return [row[0] for row in conn.execute(q).fetchall()]
+
+(jeśli jeszcze nie masz dataset_tab → możesz użyć grouped_client_days)
+
+⸻
+
+3.5. ROZSTRZYGANIE LISTY KLIENTÓW
+
+W runner_batch.py:
+
+train_include = parse_client_ids(args.train_client_ids)
+train_exclude = parse_client_ids(args.exclude_train_client_ids)
+test_include = parse_client_ids(args.test_client_ids)
+test_exclude = parse_client_ids(args.exclude_test_client_ids)
+all_clients = get_all_clients(conn)
+train_clients = resolve_clients(all_clients, train_include, train_exclude)
+test_clients  = resolve_clients(all_clients, test_include, test_exclude)
+
+⸻
+
+3.6. PRZEKAZANIE DO CONFIG
+
+Zamiast:
+
+config["first_model_params"]["train_client_id"] = train_client_ids
+
+daj:
+
+config["first_model_params"]["train_client_id"] = train_clients
+config["first_model_params"]["test_client_id"] = test_clients
+
+⸻
+
+3.7. FIRST MODEL — SQL FILTER
+
+Rozszerz:
+
+def build_client_filter_sql(params):
+    col = params.get('test_client_id_column')
+    ids = params.get('test_client_id')
+    if col and ids:
+        ids_sql = ",".join(str(i) for i in ids)
+        return f" AND {col} IN ({ids_sql})"
+    return ""
+
+👉 To już działa dla include/exclude bo lista jest już resolved wcześniej
+
+⸻
+
+3.8. BUILD DATASET / INSERT
+
+W build_dataset_db.py:
+
+Masz:
+
+client_ids = get_clients()
+
+Zmień na:
+
+client_ids = resolve_clients(all_clients, include, exclude)
+
+⸻
+
+4. PRZYKŁADOWE WYWOŁANIA
+
+4.1. WSZYSCY (default)
+
+python runner_batch.py --run-train
+
+👉 train = ALL
+👉 test = ALL
+
+⸻
+
+4.2. TYLKO WYBRANI
+
+python runner_batch.py --run-train --train-client-ids 1001,1002
+
+👉 train = [1001,1002]
+
+⸻
+
+4.3. WSZYSCY OPRÓCZ
+
+python runner_batch.py --run-train --exclude-train-client-ids 1001,1002
+
+👉 train = ALL - [1001,1002]
+
+⸻
+
+4.4. INCLUDE + EXCLUDE
+
+python runner_batch.py \
+  --run-train \
+  --train-client-ids 1001,1002,1003 \
+  --exclude-train-client-ids 1002
+
+👉 wynik = [1001,1003]
+
+⸻
+
+4.5. TEST ONLY
+
+python runner_batch.py --run-test
+
+👉 ALL
+
+⸻
+
+4.6. TRAIN + TEST różne listy
+
+python runner_batch.py \
+  --run-train \
+  --run-test \
+  --train-client-ids 1001,1002 \
+  --test-client-ids 2001,2002
+
+⸻
+
+4.7. TRAIN ALL, TEST FILTER
+
+python runner_batch.py \
+  --run-train \
+  --run-test \
+  --exclude-test-client-ids 3001,3002
+
+⸻
+
+4.8. BUILD DATASET
+
+python build_dataset_db.py
+
+👉 ALL
+
+python build_dataset_db.py --clients 1001,1002
+
+👉 tylko te
+
+⸻
+
+5. Najważniejszy efekt
+
+Po tych zmianach masz:
+
+* JEDEN model sterowania klientami
+* brak duplikacji logiki
+* brak ifów typu „jak brak → error”
+* pełna elastyczność
+
+⸻
+
+6. Jeśli chcesz kolejny krok
+
+Mogę Ci:
+
+* spiąć to w gotowy diff pod runner_batch.py
+* albo zrobić wersję “production ready” z loggingiem typu:
+
+[INFO] Train clients resolved: 128 clients (exclude: 5)
+
+To bardzo pomaga później debugować 👍
