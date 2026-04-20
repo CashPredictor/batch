@@ -46,4 +46,224 @@ ponato zastanów się czy coś robić z swietami, bo teraz mam to tak:
 czy moze też to wrzucić do pliku, tylko jakiego i w jakiej formie?
 
 
-podaj mi db_init po zmianach
+
+
+no i indeksy:
+  idx_clhs_joined_keys_datetime: |
+    CREATE INDEX IF NOT EXISTS idx_clhs_joined_keys_datetime
+    ON INVO_CLHS_JOINED_TAB (
+        INVO_ADMNO,
+        INVO_CLNTNO,
+        INVO_NO,
+        INVO_DEBH_NO,
+        INVO_DEBC_NO,
+        CLHS_CHANGED_DATETIME
+    );  
+  idx_group_cust_inv_days_one_for_all: |
+    CREATE INDEX IF NOT EXISTS idx_group_cust_inv_days_one_for_all
+    ON group_cust_inv_days (
+    DZIEN,
+    INVO_ADMNO,
+    INVO_CLNTNO,
+    INVO_DEBC_NO,
+    INVO_DEBH_NO
+    );
+  idx_ext_days_ids_dzien: |
+    CREATE INDEX IF NOT EXISTS idx_ext_days_ids_dzien
+    ON extended_grouped_client_days_tab (
+        INVO_ADMNO,
+        INVO_CLNTNO,
+        INVO_DEBH_NO,
+        INVO_DEBC_NO,
+        DZIEN
+    );  
+  idx_summary_days_ids_dzien: |
+    CREATE INDEX IF NOT EXISTS idx_summary_days_ids_dzien
+    ON summary_client_days_tab (
+        INVO_CLNTNO,
+        INVO_DEBH_NO,
+        INVO_DEBC_NO,
+        DZIEN
+    );  
+  idx_statystyki_keys_day_param_scen: |
+    CREATE INDEX IF NOT EXISTS idx_statystyki_keys_day_param_scen
+    ON statystyki_faktur (
+        INVO_ADMNO,
+        INVO_CLNTNO,
+        INVO_DEBH_NO,
+        INVO_DEBC_NO,
+        DZIEN,
+        PARAM_Z_ILU_DNI,
+        SCENARIUSZ
+    );  
+  idx_invo_debcno_invdate: |
+    CREATE INDEX IF NOT EXISTS idx_invo_debcno_invdate
+    ON invo (INVO_DEBC_NO, INVO_INVDATE);  
+  idx_invo_debcno_invdate_etc: |
+    CREATE INDEX IF NOT EXISTS idx_invo_debcno_invdate_etc
+    ON invo (INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, INVO_INVDATE);  
+  idx_statystyki_faktur_one_for_all: |
+    CREATE INDEX IF NOT EXISTS statystyki_faktur_idx_one_for_all
+    ON statystyki_faktur (
+    DZIEN,
+    INVO_ADMNO,
+    INVO_CLNTNO,
+    INVO_DEBC_NO,
+    INVO_DEBH_NO,
+    PARAM_Z_ILU_DNI,
+    SCENARIUSZ
+    );    
+
+do jakich plików te indeksy, i jak je wywołać a raczej zastąpić obecne wywołanie? nazwałem je jak w przykładzie: create_idx_statystyki_faktur_one_for_all.sql
+
+ponadto mam jeszcze w config i kodzie:
+  grouped_query: |
+    SELECT 
+        g.INVO_ADMNO,
+        g.INVO_CLNTNO,
+        g.INVO_DEBH_NO,
+        g.INVO_DEBC_NO,
+        g.DZIEN,
+        g.MIESIAC,
+        g.ROK
+    FROM 
+        group_cust_inv_days g
+    WHERE
+        g.INVO_CLNTNO = ?
+    GROUP BY 
+        g.INVO_ADMNO,
+        g.INVO_CLNTNO,
+        g.INVO_DEBH_NO,
+        g.INVO_DEBC_NO,
+        g.DZIEN,
+        g.MIESIAC,
+        g.ROK;  
+        # Pobranie danych z group_cust_inv_days z grupowaniem
+        grouped_query = params['grouped_query']
+        
+        # Wczytanie danych do DataFrame
+        df = pd.read_sql_query(grouped_query, conn, params=(client_id,))
+
+  statystyki_faktur: |
+    CREATE TABLE IF NOT EXISTS statystyki_faktur (
+        INVO_ADMNO TEXT,
+        INVO_CLNTNO TEXT,
+        INVO_DEBH_NO TEXT,
+        INVO_DEBC_NO TEXT,
+        DZIEN DATETIME,
+        SCENARIUSZ TEXT,
+        AVG_DNI_DO_ZAPLATY REAL,
+        STDEV_DNI_DO_ZAPLATY REAL,
+        AVG_DNI_OPOZNIENIA REAL,
+        STDEV_DNI_OPOZNIENIA REAL,
+        SUM_INVO_AINITIALH REAL,
+        AVG_INVO_AINITIALH REAL,
+        STDEV_INVO_AINITIALH REAL,
+        ILE_FAKTUR INTEGER,
+        PARAM_Z_ILU_DNI INTEGER,
+        INSERT_TIMESTAMP DATETIME
+    );  
+        exec_sql(conn, params.get("statystyki_faktur"), "statystyki_faktur")
+
+  shard_condition: "" - nie wiem czy to jest jeszcze potrzebne w nowej wersji?
+
+        exec_sql(conn, params.get("query_create_invo_clhs_joined_tab_table"), "query_create_invo_clhs_joined_tab_table")
+  query_create_invo_clhs_joined_tab_table: |
+    CREATE TABLE INVO_CLHS_JOINED_TAB (
+    INVO_NO INTEGER,
+    INVO_ADMNO INTEGER,
+    INVO_CLNTNO INTEGER,
+    INVO_DEBH_NO INTEGER,
+    INVO_DEBC_NO INTEGER,
+    INVO_INVDATE DATETIME,
+    INVO_VALUEDATE DATETIME,
+    INVO_DUEDATE DATETIME,
+    INVO_MARKCODESPECDATE DATETIME,
+    INVO_MARKCODETEXTDATE DATETIME,
+    INVO_FINALPAYMENTDATE DATETIME,
+    INVO_BOOKINGDATE DATETIME,
+    INVO_CURRENCY TEXT,
+    INVO_AINITIALH REAL,
+    INVO_AINITIALC REAL,
+    INVO_MARKCODESPEC INTEGER,
+    INVO_MAXFINANCETIMPASSED DATETIME,
+    INVO_DATSTARTDELCREDEREINVST DATETIME,
+    INVO_NETDAYS INTEGER,
+    INVO_INVO_INVOICENO TEXT,
+    INVO_TEXT TEXT,
+    INVO_HOLDCODE TEXT,
+    INVO_DUMMY TEXT,
+    CLHS_CHANGED_DATETIME DATETIME,
+    CLHS_DATVALID DATETIME,
+    CLHS_DATPRINTED DATETIME,
+    CLHS_LIMITOLD REAL,
+    CLHS_CURRENCYOLD TEXT,
+    CLHS_LIMITNEW REAL,
+    CLHS_CURRENCYNEW TEXT,
+    CLHS_TEXTCODE1 TEXT,
+    CLHS_TEXTCODE2 TEXT,
+    CLHS_TEXTCODE3 TEXT,
+    CLHS_VARIABLETEXT1 TEXT,
+    CLHS_VARIABLETEXT2 TEXT,
+    CLHS_USRID TEXT,
+    CLHS_AUTOMATICDECISION TEXT,
+    CLHS_NEWDEBTOR TEXT,
+    CLHS_NEXT_CHANGED_DATETIME DATETIME
+    );
+
+  query_aggregated_data_temp: |
+    CREATE TABLE aggregated_data_temp (
+    DZIEN DATE NOT NULL,
+    DZIS_DZIEN_TYG INTEGER NOT NULL,
+    DZIS_SOBOTA INTEGER NOT NULL,
+    DZIS_NIEDZIELA INTEGER NOT NULL
+    );    
+    cursor.execute(params.get("query_aggregated_data_temp"))
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ag_day
+        ON aggregated_data_temp (DZIEN);
+    """)
+
+  query_create_invo_clhs_joined_tab_table: |
+    CREATE TABLE INVO_CLHS_JOINED_TAB (
+    INVO_NO INTEGER,
+    INVO_ADMNO INTEGER,
+    INVO_CLNTNO INTEGER,
+    INVO_DEBH_NO INTEGER,
+    INVO_DEBC_NO INTEGER,
+    INVO_INVDATE DATETIME,
+    INVO_VALUEDATE DATETIME,
+    INVO_DUEDATE DATETIME,
+    INVO_MARKCODESPECDATE DATETIME,
+    INVO_MARKCODETEXTDATE DATETIME,
+    INVO_FINALPAYMENTDATE DATETIME,
+    INVO_BOOKINGDATE DATETIME,
+    INVO_CURRENCY TEXT,
+    INVO_AINITIALH REAL,
+    INVO_AINITIALC REAL,
+    INVO_MARKCODESPEC INTEGER,
+    INVO_MAXFINANCETIMPASSED DATETIME,
+    INVO_DATSTARTDELCREDEREINVST DATETIME,
+    INVO_NETDAYS INTEGER,
+    INVO_INVO_INVOICENO TEXT,
+    INVO_TEXT TEXT,
+    INVO_HOLDCODE TEXT,
+    INVO_DUMMY TEXT,
+    CLHS_CHANGED_DATETIME DATETIME,
+    CLHS_DATVALID DATETIME,
+    CLHS_DATPRINTED DATETIME,
+    CLHS_LIMITOLD REAL,
+    CLHS_CURRENCYOLD TEXT,
+    CLHS_LIMITNEW REAL,
+    CLHS_CURRENCYNEW TEXT,
+    CLHS_TEXTCODE1 TEXT,
+    CLHS_TEXTCODE2 TEXT,
+    CLHS_TEXTCODE3 TEXT,
+    CLHS_VARIABLETEXT1 TEXT,
+    CLHS_VARIABLETEXT2 TEXT,
+    CLHS_USRID TEXT,
+    CLHS_AUTOMATICDECISION TEXT,
+    CLHS_NEWDEBTOR TEXT,
+    CLHS_NEXT_CHANGED_DATETIME DATETIME
+    );
+        exec_sql(conn, params.get("query_create_invo_clhs_joined_tab_table"), "query_create_invo_clhs_joined_tab_table")
