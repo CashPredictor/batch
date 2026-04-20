@@ -1,3 +1,178 @@
+
+Tak — dobrze myślisz.
+
+W SQLite CTE może być potraktowane jako materiał do optymalizacji albo jako „optimization fence”, zależnie od formy i decyzji planera. SQLite dokumentuje, że MATERIALIZED działa właśnie jako bariera optymalizacyjna, a NOT MATERIALIZED pozwala na flattening i push-down; jednocześnie planner i tak może wybrać materializację, jeśli uzna to za lepsze. Czyli jeśli Tobie zależy, żeby filtr był „jak najbliżej źródła” przed GROUP BY, to składanie zapytania w Pythonie ma tu sens.  ￼
+
+W Twoim przypadku najlepszy wariant to nie CTE, tylko:
+
+1. trzymać bazowe SQL-e w plikach,
+2. zostawić w nich placeholdery tekstowe typu {client_filter} i {shard_condition},
+3. składać finalny SQL w Pythonie,
+4. wartości przekazywać przez ?, a nie przez interpolację do SQL.
+
+Czyli dokładnie tak, jak chciałeś — ale uporządkowanie.
+
+⸻
+
+Jak to zrobić
+
+query_stats_pivot_select.sql
+
+Zostawiasz:
+
+...
+FROM 
+    group_cust_inv_days g
+LEFT JOIN statystyki_faktur stats_pivot
+ON g.INVO_ADMNO = stats_pivot.INVO_ADMNO
+   AND g.INVO_CLNTNO = stats_pivot.INVO_CLNTNO
+   AND g.INVO_DEBH_NO = stats_pivot.INVO_DEBH_NO
+   AND (g.INVO_DEBH_NO = stats_pivot.INVO_DEBH_NO AND g.INVO_DEBC_NO = stats_pivot.INVO_DEBC_NO)
+   AND DATE(g.DZIEN) = DATE(stats_pivot.DZIEN)
+WHERE 1=1
+{client_filter}
+AND {shard_condition}
+GROUP BY
+    g.INVO_ADMNO,
+    g.INVO_CLNTNO,
+    g.INVO_DEBH_NO,
+    g.INVO_DEBC_NO,
+    g.DZIEN
+
+query_dataset_raw_select.sql
+
+Zostawiasz:
+
+...
+LEFT JOIN (
+{stats_pivot_select}
+) pivot
+  ON pivot.INVO_CLNTNO = i.INVO_CLNTNO
+ AND pivot.INVO_ADMNO = i.INVO_ADMNO 
+ AND (i.INVO_DEBH_NO = pivot.INVO_DEBH_NO AND i.INVO_DEBC_NO = pivot.INVO_DEBC_NO)
+ AND DATE(g.DZIEN) = DATE(pivot.DZIEN)
+WHERE 1=1
+  {client_filter}
+  AND {shard_condition}
+
+⸻
+
+Python — składanie poprawne
+
+Zrób helper:
+
+from pathlib import Path
+def load_sql(path: str) -> str:
+    return Path(path).read_text(encoding="utf-8")
+def build_client_filter_sql(alias: str = "g", use_range: bool = True) -> str:
+    parts = [f"AND {alias}.INVO_CLNTNO = ?"]
+    if use_range:
+        parts.append(f"AND DATE({alias}.DZIEN) >= DATE(?)")
+        parts.append(f"AND DATE({alias}.DZIEN) <= DATE(?)")
+    return "\n".join(parts)
+def build_shard_condition_sql(num_shards: int, shard: int) -> str:
+    if shard < num_shards:
+        return f"""
+(
+    { "g" }.INVO_DEBC_NO IS NOT NULL
+    AND { "g" }.INVO_DEBC_NO NOT GLOB '*[^0-9]*'
+    AND (CAST({ "g" }.INVO_DEBC_NO AS INTEGER) % {num_shards}) = {shard}
+)
+""".strip()
+    return """
+(
+    g.INVO_DEBC_NO IS NULL
+    OR g.INVO_DEBC_NO GLOB '*[^0-9]*'
+)
+""".strip()
+
+I potem:
+
+stats_pivot_sql = load_sql("sql/queries/query_stats_pivot_select.sql")
+dataset_raw_sql = load_sql("sql/queries/query_dataset_raw_select.sql")
+client_filter_sql = build_client_filter_sql(alias="g", use_range=True)
+shard_condition_sql = build_shard_condition_sql(NUM_SHARDS, shard)
+stats_pivot_sql = stats_pivot_sql.format(
+    client_filter=client_filter_sql,
+    shard_condition=shard_condition_sql,
+)
+dataset_raw_sql = dataset_raw_sql.format(
+    stats_pivot_select=stats_pivot_sql,
+    client_filter=client_filter_sql,
+    shard_condition=shard_condition_sql,
+)
+
+A wykonanie zostaje parametryzowane:
+
+cursor.execute(
+    f"INSERT INTO dataset_tab {dataset_raw_sql}",
+    (
+        client_id,
+        current_date.strftime("%Y-%m-%d"),
+        next_date.strftime("%Y-%m-%d"),
+        client_id,
+        current_date.strftime("%Y-%m-%d"),
+        next_date.strftime("%Y-%m-%d"),
+    )
+)
+
+⸻
+
+Ważna uwaga
+
+Masz tu dwa poziomy placeholderów:
+
+1. Placeholdery tekstowe .format(...)
+
+Do wstrzyknięcia fragmentów SQL, np.:
+
+* {stats_pivot_select}
+* {client_filter}
+* {shard_condition}
+
+2. Placeholdery DB ?
+
+Do wstrzyknięcia wartości, np.:
+
+* client_id
+* date_from
+* date_to
+
+To jest poprawny układ.
+
+⸻
+
+Czego nie robić
+
+Nie rób tak:
+
+f"AND g.INVO_CLNTNO = {client_id}"
+
+dla wartości runtime.
+To ma zostać przez ?.
+
+⸻
+
+Co bym Ci polecił praktycznie
+
+Dla Twojego flow:
+
+* stats_pivot_select — składany w Pythonie
+* client_filter — składany w Pythonie
+* shard_condition — składany w Pythonie
+* reszta SQL — w plikach
+
+Czyli hybryda, nie pełne „wszystko w SQL” i nie pełne „wszystko w Python stringach”.
+
+To jest najbliżej tego, co chcesz:
+
+* wydajność zostaje pod Twoją kontrolą,
+* filtr może wejść przed GROUP BY,
+* kod nadal da się utrzymać.
+
+Jeśli chcesz, w następnym kroku rozpiszę Ci gotowe funkcje:
+load_sql(), build_stats_pivot_sql(), build_dataset_raw_sql() i pokażę dokładnie, jak podmienić obecny kod w build_dataset_db.py.
+
 Dobra — to co wrzuciłeś to jest bardzo dobry moment na refactor, ale też widać dokładnie gdzie masz jeszcze „stary świat” (config + string SQL + ręczne inserty).
 
 Zrobię Ci to konkretnie i systemowo, bez filozofii.
