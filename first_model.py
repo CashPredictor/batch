@@ -1,3 +1,4 @@
+# first_model.py
 import pandas as pd
 import numpy as np
 import torch
@@ -185,25 +186,30 @@ def _parse_test_ids(raw_ids):
     except ValueError:
         return None
 
-def build_client_filter_sql(params):
-    """
-    Zwraca string typu 'AND <client_id_col> IN (..)' albo '' dla ALL.
-    Wymaga: params['client_id_col'] (np. 'INVO_DEBC_NO' lub 'CLIENT_ID').
-    Źródło ID: params['test_client_id'] (lista, csv, '[..]' lub 'ALL').
-    """
-    col = params.get('client_id_col') 
-    ids = _parse_test_ids(params.get('test_client_id'))
-    if col and ids:
-        in_list = ",".join(str(i) for i in sorted(set(ids)))
-        return f"AND {col} IN ({in_list})"
-    return ""  # ALL        
+def build_client_filter_sql(params, currently_testing=False):
+    default_col = "INVO_CLNTNO"
+    if currently_testing:
+        col = params.get("test_client_id_column", default_col)
+        ids = params.get("test_client_id")
+    else:
+        col = params.get("train_client_id_column", default_col)
+        ids = params.get("train_client_id")
+    if not ids:
+        return ""
+    if not isinstance(ids, list):
+        ids = [ids]
+    ids = [int(x) for x in ids if x is not None]
+    if not ids:
+        return ""
+    ids_sql = ",".join(str(i) for i in ids)
+    return f" AND {col} IN ({ids_sql})"
 
 def preprocess_data_model1(data_start, data_end, params, operation_mode='test', currently_testing=False, train_on_all=False):
     query_template = params['sql_query_train'] if not currently_testing else params['sql_query_test']
     base_query = query_template.format(data_start=data_start, data_end=data_end).rstrip().rstrip(";")
 
     # 1) klient-filter (jeśli masz) MUSI być doklejony do base_query i do countów
-    client_filter_sql = build_client_filter_sql(params)
+    client_filter_sql = build_client_filter_sql(params, currently_testing=currently_testing)
     if client_filter_sql:
         base_query_with_filter = f"{base_query}\n{client_filter_sql}"
         logging.info(f"[first_model] Using client filter: {client_filter_sql}")
