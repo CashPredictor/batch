@@ -1,1228 +1,233 @@
-#build_dataset_db.py
-import os
-import importlib
-import sqlite3
-import pandas as pd
-from datetime import datetime, timedelta, date
-import time
-import numpy as np
-import yaml
-import glob
-import logging
-import re
-import sys
-from db_init import load_sql_file
-from pathlib import Path
+Tak, tu są 3 osobne rzeczy.
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+1. Błąd sqlite3.OperationalError: unrecognized token: "{"
 
-import warnings
-warnings.filterwarnings(
-    "ignore",
-    category=FutureWarning,
-    message="The behavior of DataFrame concatenation with empty or all-NA entries is deprecated"
-)
+To oznacza, że do SQLite trafił SQL z niewypełnionym placeholderem w stylu {...}.
 
-EXCEL_ORIGIN = "1899-12-30"  # standard dla pandas (Excel 1900 system)
+U Ciebie wywala na:
 
-def sqlite_object_exists(cursor, obj_type: str, name: str) -> bool:
-    cursor.execute(
-        """
-        SELECT 1
-        FROM sqlite_master
-        WHERE type = ? AND name = ?
-        LIMIT 1
-        """,
-        (obj_type, name),
-    )
-    return cursor.fetchone() is not None
+query_invo = load_sql_file(f"{queries_dir}/invo_select.sql")
+cursor.execute(query_invo, (params['od_dnia'], client_id))
 
+To znaczy, że w pliku invo_select.sql nadal masz coś typu:
 
-def validate_required_schema_for_create_database(cursor) -> None:
-    required_tables = [
-        "invo",
-        "debc",
-        "clhs",
-        "dcmo",
-        "group_cust_inv_days",
-        "grouped_client_days",
-        "summary_client_days_tab",
-        "extended_grouped_client_days_tab",
-        "dataset_tab",
-        "dataset",
-        "INVO_CLHS_JOINED_TAB",
-        "swieta",
-        "aggregated_data_temp",
-        "statystyki_faktur",
-    ]
+... WHERE {coś}
 
-    required_views = [
-        "invo_view",
-        "clhs_view",
-        "DEBC_view",
-        "dcmo_view",
-        "INVO_CLHS_JOINED",
-        "summary_client_days_view",
-        "extended_grouped_client_days",
-    ]
+albo inny fragment z klamrami, a cursor.execute() rozumie tylko gotowy SQL, nie template.
 
-    missing_tables = [
-        name for name in required_tables
-        if not sqlite_object_exists(cursor, "table", name)
-    ]
-    missing_views = [
-        name for name in required_views
-        if not sqlite_object_exists(cursor, "view", name)
-    ]
+Co sprawdzić
 
-    if missing_tables or missing_views:
-        parts = []
-        if missing_tables:
-            parts.append(f"brak tabel: {', '.join(missing_tables)}")
-        if missing_views:
-            parts.append(f"brak widoków: {', '.join(missing_views)}")
+Otwórz invo_select.sql. On powinien wyglądać mniej więcej tak:
 
-        raise RuntimeError(
-            "Baza nie ma pełnego schematu wymaganego przez build_dataset_db; "
-            "najpierw uruchom DBInit. " + " | ".join(parts)
-        )
+SELECT 
+    INVO_NO,
+    INVO_ADMNO,
+    INVO_CLNTNO,
+    INVO_DEBH_NO,
+    INVO_DEBC_NO,
+    INVO_INVDATE,
+    INVO_FINALPAYMENTDATE
+FROM invo_view
+WHERE INVO_INVDATE IS NOT NULL
+  AND DATE(INVO_INVDATE) >= DATE(?)
+  AND INVO_CLNTNO = ?
 
-def _coerce_excel_date_series(s: pd.Series) -> pd.Series:
-    """
-    Konwertuje serię, która może zawierać:
-    - excel seriale (float/int lub "45911.25" jako string) -> datetime
-    - normalne stringi dat -> datetime
-    - braki / śmieci -> NaT
-    """
-    if s is None:
-        return s
+Czyli:
 
-    # Zrób kopię
-    s2 = s.copy()
+* w tym pliku mają być tylko ?
+* nie może być żadnych {client_filter}, {od_dnia}, {client_id} itd.
 
-    # 1) spróbuj wyciągnąć liczby (seriale)
-    num = pd.to_numeric(s2, errors="coerce")
+Jeżeli chcesz używać {...}, to musisz wcześniej zrobić:
 
-    # seriale: w tym miejscu nie musimy strzelać widełkami,
-    # bo i tak robimy to TYLKO dla kolumn z konfiguracji.
-    mask_num = num.notna()
+query_invo = load_sql_file(...).format(...)
 
-    out = pd.Series(pd.NaT, index=s2.index, dtype="datetime64[ns]")
+Ale tutaj nie ma potrzeby. Tu wystarczy czysty SQL z ?.
 
-    # Excel serial -> datetime (część dziesiętna to czas)
-    if mask_num.any():
-        out.loc[mask_num] = pd.to_datetime(
-            num.loc[mask_num],
-            unit="D",
-            origin=EXCEL_ORIGIN,
-            errors="coerce"
-        )
+⸻
 
-    # 2) reszta -> klasyczny parser dat
-    mask_other = ~mask_num
-    if mask_other.any():
-        out.loc[mask_other] = pd.to_datetime(s2.loc[mask_other], errors="coerce")
+2. Dlaczego wypisuje klientów 2 razy
 
-    return out
+Bo w kodzie masz dwa print-bloki robiące to samo:
 
+pierwszy:
 
-def normalize_excel_date_columns(
-    df: pd.DataFrame,
-    date_cols: list[str] | None
-) -> pd.DataFrame:
-    """
-    Jeśli date_cols jest puste / None -> nic nie rób.
-    Dla każdej kolumny z listy: konwersja excel serial / string -> datetime.
-    """
-    if df is None or not isinstance(df, pd.DataFrame):
-        return df
-    if not date_cols:  # None lub [] lub ""
-        return df
-
-    for col in date_cols:
-        if col in df.columns:
-            df[col] = _coerce_excel_date_series(df[col])
-
-    return df
-
-
-def apply_excel_date_config(
-    dfs_by_name: dict[str, pd.DataFrame],
-    params: dict
-) -> dict[str, pd.DataFrame]:
-    """
-    Czyta params['excel_date_columns'] (mapa: tabela -> lista kolumn)
-    i stosuje konwersję tylko tam, gdzie jest definicja.
-    Jeśli brak definicji -> pomija.
-    """
-    mapping = (params or {}).get("excel_date_columns")
-    if not mapping or not isinstance(mapping, dict):
-        return dfs_by_name  # brak konfiguracji => nic nie robimy
-
-    for table_name, df in dfs_by_name.items():
-        cols = mapping.get(table_name)
-        if cols:  # tylko jeśli lista niepusta
-            dfs_by_name[table_name] = normalize_excel_date_columns(df, cols)
-
-    return dfs_by_name
-
-def load_excel_sheets(file_path, params=None):
-    sheet_names = ['INVO', 'DEBC', 'CLHS', 'DCMO']
-    dfs = pd.read_excel(file_path, sheet_name=sheet_names)
-
-    # Uporządkuj do dict (żeby łatwo mapować po nazwie tabeli)
-    dfs_by_name = {
-        'INVO': dfs.get('INVO'),
-        'DEBC': dfs.get('DEBC'),
-        'CLHS': dfs.get('CLHS'),
-        'DCMO': dfs.get('DCMO'),
-    }
-
-    # Konwersja dat wg konfiguracji (jeśli brak/ puste -> nic nie robi)
-    dfs_by_name = apply_excel_date_config(dfs_by_name, params or {})
-
-    return dfs_by_name['INVO'], dfs_by_name['DEBC'], dfs_by_name['CLHS'], dfs_by_name['DCMO']
-
-
-def _to_date_str(d) -> str:
-    """Zwraca 'YYYY-MM-DD' niezależnie czy d to date/datetime/str."""
-    if isinstance(d, datetime):
-        return d.strftime("%Y-%m-%d")
-    if isinstance(d, date):
-        return d.strftime("%Y-%m-%d")
-    # string lub coś innego: spróbuj przyciąć do 10 znaków (YYYY-MM-DD)
-    s = str(d)
-    return s[:10]
-
-# Funkcja generująca wiersze
-def generate_dates(start_date, end_date):
-    rows = []
-    
-    current_date = datetime.strptime(start_date, "%Y-%m-%d")
-    end_date = datetime.strptime(end_date, "%Y-%m-%d")
-
-    while current_date <= end_date:
-        dzien = current_date.strftime("%Y-%m-%d")
-        dzis_dzien_tyg = current_date.isoweekday()  # 1 = poniedziałek, 7 = niedziela
-        dzis_sobota = 1 if dzis_dzien_tyg == 6 else 0
-        dzis_niedziela = 1 if dzis_dzien_tyg == 7 else 0
-
-        rows.append((dzien, dzis_dzien_tyg, dzis_sobota, dzis_niedziela))
-        current_date += timedelta(days=1)
-
-    return rows
-
-def remove_case_insensitive_duplicate_columns(df):
-    """
-    Usuwa powielone kolumny w DataFrame, ignorując różnice w wielkości liter, zachowując pierwsze wystąpienie.
-    
-    :param df: Pandas DataFrame
-    :return: DataFrame z unikalnymi kolumnami
-    """
-    # Tworzymy mapę nazw kolumn w małych literach do ich pierwszego wystąpienia
-    lowercase_columns_map = {}
-    columns_to_drop = []
-
-    for col in df.columns:
-        col_lower = col.lower()
-        if col_lower not in lowercase_columns_map:
-            lowercase_columns_map[col_lower] = col
-        else:
-            # Jeśli nazwa już występuje w innej wersji (case-insensitive), dodajemy do usunięcia
-            columns_to_drop.append(col)
-    
-    if columns_to_drop:
-        df = df.drop(columns=columns_to_drop)
-
-    return df
-
-def insert_aggregated_data_temp(conn, data_end, data_start="2023-03-12"):
-    cursor = conn.cursor()
-
-    rows_to_insert = generate_dates(data_start, data_end)
-
-    insert_query = """
-        INSERT OR IGNORE INTO aggregated_data_temp
-        (DZIEN, DZIS_DZIEN_TYG, DZIS_SOBOTA, DZIS_NIEDZIELA)
-        VALUES (?, ?, ?, ?)
-    """
-    cursor.executemany(insert_query, rows_to_insert)
-    conn.commit()
-
-    print(f"Próbowano wstawić {len(rows_to_insert)} wierszy do aggregated_data_temp (duplikaty pominięte).")
-
-def sanitize_column_names(df):
-    """
-    Usuwa niechciane znaki z nazw kolumn w DataFrame, aby były zgodne z wymogami SQLite.
-    Zamienia każdy znak nie-alfanumeryczny (poza _) na znak '_'.
-    """
-    new_columns = []
-    for col in df.columns:
-        # np. re.sub('[^A-Za-z0-9_]+', '', col) – usunąć w ogóle
-        # Lub re.sub('[^A-Za-z0-9_]+', '_', col) – zastąpić znakami podkreślenia
-        safe_col = re.sub(r"[^A-Za-z0-9_]+", "_", col)  
-        new_columns.append(safe_col)
-    
-    df.columns = new_columns
-    return df
-
-def refill_dataset_for_client(
-    conn,
-    client_id,
-    source_table="dataset_tab",
-    target_table="dataset",
-    batch_days=31
+for rank, (cid, cnt) in enumerate(
+    zip(_counts_sorted['INVO_CLNTNO'], _counts_sorted['cnt']),
+    start=1
 ):
-    cursor = conn.cursor()
+    print(f"{rank:>2}. klient {int(cid)} → {int(cnt)} wierszy INVO")
 
-    cursor.execute(f"DELETE FROM {target_table} WHERE INVO_CLNTNO = ?", (client_id,))
-    conn.commit()
+i zaraz potem drugi:
 
-    cursor.execute(f"""
-        SELECT MIN(DATE(DZIEN)), MAX(DATE(DZIEN))
-        FROM {source_table}
-        WHERE INVO_CLNTNO = ?
-    """, (client_id,))
-    min_date, max_date = cursor.fetchone()
+print("Kolejność przetwarzania (od najmniejszej liczby wierszy INVO):")
+for rank, (cid, cnt) in enumerate(zip(_counts_sorted['INVO_CLNTNO'],
+                                      _counts_sorted['cnt']), start=1):
+    print(f"{rank:>2}. klient {int(cid)} → {int(cnt)} wierszy INVO")
 
-    if not min_date or not max_date:
-        print(f"[INFO] Brak danych dla klienta {client_id} w {source_table}.")
-        return
+Usuń pierwszy albo drugi
 
-    cursor.execute(f"PRAGMA table_info({source_table});")
-    columns_info_raw = cursor.fetchall()
-    columns_info = [(col[1], col[2] if col[2] else "TEXT") for col in columns_info_raw]
+Zostaw tylko jeden, np.:
 
-    current_date = pd.to_datetime(min_date)
-    end_date = pd.to_datetime(max_date)
+print("Kolejność przetwarzania (od najmniejszej liczby wierszy INVO):")
+for rank, (cid, cnt) in enumerate(
+    zip(_counts_sorted['INVO_CLNTNO'], _counts_sorted['cnt']),
+    start=1
+):
+    print(f"{rank:>2}. klient {int(cid)} → {int(cnt)} wierszy INVO")
 
-    total_inserted = 0
+Usuń też ten debug:
 
-    while current_date <= end_date:
-        next_date = current_date + pd.Timedelta(days=batch_days - 1)
+print("przed client_ids = df_invo_all['INVO_CLNTNO'].dropna().unique()")
+print("po client_ids = df_invo_all['INVO_CLNTNO'].dropna().unique() order by _counts.sort_values('cnt', ascending=True)['INVO_CLNTNO']")
 
-        chunk_df = pd.read_sql_query(
-            f"""
-            SELECT *
-            FROM {source_table}
-            WHERE INVO_CLNTNO = ?
-              AND DATE(DZIEN) >= DATE(?)
-              AND DATE(DZIEN) <= DATE(?)
-            ORDER BY DZIEN, INVO_NO
-            """,
-            conn,
-            params=(client_id, current_date.strftime("%Y-%m-%d"), next_date.strftime("%Y-%m-%d"))
-        )
+bo już tylko zaśmieca log.
 
-        if not chunk_df.empty:
-            processed_df = process_dataset_tab(chunk_df, columns_info)
-            processed_df = remove_case_insensitive_duplicate_columns(processed_df)
-            processed_df = sanitize_column_names(processed_df)
+⸻
 
-            float_cols = processed_df.select_dtypes(include=[np.float64, np.float32]).columns
-            if len(float_cols) > 0:
-                processed_df[float_cols] = processed_df[float_cols].round(4)
-                for c in float_cols:
-                    processed_df[c] = processed_df[c].astype("float32")
+3. Dlaczego „nie zawęża tylko do tych z wywołania”
 
-            processed_df = processed_df.where(pd.notna(processed_df), None)
+Tak naprawdę zawęża, ale tylko w finalnej liście do przetworzenia.
 
-            placeholders = ", ".join(["?" for _ in processed_df.columns])
-            insert_sql = f"INSERT INTO {target_table} VALUES ({placeholders})"
+To widać tu:
 
-            def _to_sqlite_safe(v):
-                if pd.isna(v):
-                    return None
-                if isinstance(v, np.datetime64):
-                    v = pd.to_datetime(v)
-                if isinstance(v, pd.Timestamp):
-                    return v.to_pydatetime()
-                return v
-
-            rows = [
-                tuple(_to_sqlite_safe(v) for v in row)
-                for row in processed_df.itertuples(index=False, name=None)
-            ]
-
-            cursor.executemany(insert_sql, rows)
-            conn.commit()
-
-            inserted_now = len(rows)
-            total_inserted += inserted_now
-            print(
-                f"[INFO] dataset: client={client_id}, "
-                f"{current_date.strftime('%Y-%m-%d')}..{next_date.strftime('%Y-%m-%d')}, "
-                f"inserted={inserted_now}, total={total_inserted}"
-            )
-
-        current_date = next_date + pd.Timedelta(days=1)
-
-    print(f"[OK] dataset rebuilt for client {client_id}, total rows inserted: {total_inserted}")
-
-def build_client_filter_sql(alias: str = "g", use_range: bool = True) -> str:
-    parts = [f"AND {alias}.INVO_CLNTNO = ?"]
-    if use_range:
-        parts.append(f"AND DATE({alias}.DZIEN) >= DATE(?)")
-        parts.append(f"AND DATE({alias}.DZIEN) <= DATE(?)")
-    return "\n".join(parts)
-def build_shard_condition_sql(num_shards: int, shard: int) -> str:
-    if shard < num_shards:
-        return f"""
-(
-    { "g" }.INVO_DEBC_NO IS NOT NULL
-    AND { "g" }.INVO_DEBC_NO NOT GLOB '*[^0-9]*'
-    AND (CAST({ "g" }.INVO_DEBC_NO AS INTEGER) % {num_shards}) = {shard}
-)
-""".strip()
-    return """
-(
-    g.INVO_DEBC_NO IS NULL
-    OR g.INVO_DEBC_NO GLOB '*[^0-9]*'
-)
-""".strip()
-
-def validate_and_convert_dates(df, columns):
-    invalid_values = []
-
-    for col in columns:
-        try:
-            # Próba konwersji na datetime
-            df[col] = pd.to_datetime(df[col], errors='coerce')
-        except Exception as e:
-            # Przechwycenie błędów
-            invalid_values.append((col, df[col].iloc[0], str(e)))
-
-    return invalid_values
-
-def process_dataset_tab(df, columns):
-    # 1. Wyodrębnienie kolumn identyfikujących
-    id_columns = ['INVO_NO', 'INVO_ADMNO', 'INVO_CLNTNO', 'INVO_DEBH_NO', 'INVO_DEBC_NO', 'INVO_INVDATE', 'DZIEN', 'INVO_DUEDATE', 'INVO_FINALPAYMENTDATE']
-
-    # 2. Wybór kolumn liczbowych
-    numeric_columns = [col for col, dtype in columns if dtype in ['NUM', 'REAL', 'INT']]
-    numeric_df = df[numeric_columns]
-
-    # 3. Walidacja kolumn datowych
-    date_columns = [col for col, dtype in columns if dtype == 'DATETIME']
-    invalid_values = validate_and_convert_dates(df, date_columns)
-
-    # Wyświetlenie problematycznych wartości
-    if invalid_values:
-        print("Problematyczne wartości w kolumnach datowych:")
-        for col, value, error in invalid_values:
-            print(f"Kolumna: {col}, Wartość: {value}, Błąd: {error}")    
-
-    # --- cache konwersji dat: raz i korzystamy niżej ---
-    dt = {col: pd.to_datetime(df[col], errors='coerce') for col in date_columns if col in df.columns}
-
-    # 5. „Przycięcie” pól zależnych (bez zmian u Ciebie)
-    df['CLHS_NEXT_CHANGED_DATETIME'] = df['CLHS_NEXT_CHANGED_DATETIME'].where(
-        pd.to_datetime(df['CLHS_NEXT_CHANGED_DATETIME']) > pd.to_datetime(df['DZIEN']),
-        None
-    )    
-    df['INVO_MARKCODESPECDATE'] = df['INVO_MARKCODESPECDATE'].where(
-        pd.to_datetime(df['INVO_MARKCODESPECDATE']) > pd.to_datetime(df['DZIEN']),
-        None
-    )
-    df['INVO_MARKCODESPEC'] = df['INVO_MARKCODESPEC'].where(
-        pd.to_datetime(df['INVO_MARKCODESPECDATE']) > pd.to_datetime(df['DZIEN']),
-        None
-    )
-
-    # 4.1 Różnice dni względem INVO_INVDATE (jak u Ciebie, ale na cache dt)
-    base_cols = [col for col, dtype in columns
-                 if dtype == 'DATETIME' and col not in ('INVO_INVDATE', 'INVO_FINALPAYMENTDATE')]
-    date_diff_df = pd.DataFrame(index=df.index)
-    if 'INVO_INVDATE' in dt:
-        invdate_ser = dt['INVO_INVDATE']
-        for col in base_cols:
-            if col in dt:
-                date_diff_df[f'{col}_DAYS_DIFF'] = (dt[col] - invdate_ser).dt.days
-
-        if 'INVO_FINALPAYMENTDATE' in dt:
-            date_diff_df['INVO_FINALPAYMENTDATE_DAYS_DIFF'] = (dt['INVO_FINALPAYMENTDATE'] - invdate_ser).dt.days
-
-        if 'DZIEN' in dt:
-            date_diff_df['FROM_DZIEN_TO_INVO_INVDATE'] = (dt['DZIEN'] - invdate_ser).dt.days
-
-    date_diff_df = date_diff_df.fillna(0).round(0).astype('int', copy=False)
-
-    # 4.2 NOWE: różnice dni względem INVO_DUEDATE
-    due_date_diff_df = pd.DataFrame(index=df.index)
-    if 'INVO_DUEDATE' in dt:
-        duedate_ser = dt['INVO_DUEDATE']
-        due_cols = [col for col, dtype in columns
-                    if dtype == 'DATETIME' and col not in ('INVO_DUEDATE', 'INVO_FINALPAYMENTDATE')]
-        for col in due_cols:
-            if col in dt:
-                due_date_diff_df[f'{col}_DUE_DAYS_DIFF'] = (dt[col] - duedate_ser).dt.days
-
-        if 'INVO_FINALPAYMENTDATE' in dt:
-            due_date_diff_df['INVO_FINALPAYMENTDATE_DUE_DAYS_DIFF'] = (dt['INVO_FINALPAYMENTDATE'] - duedate_ser).dt.days
-
-        if 'DZIEN' in dt:
-            due_date_diff_df['FROM_DZIEN_TO_INVO_DUEDATE'] = (dt['DZIEN'] - duedate_ser).dt.days
-
-    # jeżeli nie było DUEDATE, to due_date_diff_df zostanie pusty – to OK przy concat
-    if not due_date_diff_df.empty:
-        due_date_diff_df = due_date_diff_df.fillna(0).round(0).astype('int', copy=False)
-
-    # 6. Transformacja wybranych dat (na cache dt, tylko te które mamy)
-    def transform_date_column(date_column):
-        transformed_df = pd.DataFrame(index=df.index)
-        if date_column not in dt:
-            return transformed_df  # brak kolumny – zwracamy pusty DF
-        ser = dt[date_column]
-        transformed_df[f'{date_column}_YEAR'] = ser.dt.year
-        transformed_df[f'{date_column}_MONTH'] = ser.dt.month
-        transformed_df[f'{date_column}_DAY'] = ser.dt.day
-        transformed_df[f'{date_column}_WEEKDAY'] = ser.dt.weekday
-        transformed_df[f'{date_column}_DAYS_FROM_YEAR_START'] = ser.dt.dayofyear
-        transformed_df[f'{date_column}_DAYS_TO_YEAR_END'] = 365 - ser.dt.dayofyear
-        transformed_df[f'{date_column}_DAYS_FROM_MONTH_START'] = ser.dt.day
-        transformed_df[f'{date_column}_DAYS_TO_MONTH_END'] = ser.dt.days_in_month - ser.dt.day
-        if date_column in ('INVO_DUEDATE', 'DZIEN'):
-            transformed_df[f'{date_column}_IS_SATURDAY'] = (ser.dt.weekday == 5).astype(int)
-            transformed_df[f'{date_column}_IS_SUNDAY'] = (ser.dt.weekday == 6).astype(int)
-        return transformed_df
-
-    transformed_dates_df = pd.concat(
-        [transform_date_column(col) for col in
-         ['DZIEN', 'INVO_INVDATE', 'INVO_DUEDATE', 'CLHS_CHANGED_DATETIME', 'CLHS_NEXT_CHANGED_DATETIME']],
-        axis=1
-    ).fillna(0).round(0).astype('int', copy=False)
-
-    # 7. Końcowe kolumny płatności
-    has_final = 'INVO_FINALPAYMENTDATE' in df.columns
-    if has_final:
-        final_payment_date = df['INVO_FINALPAYMENTDATE']
-        final_payment_date_diff = date_diff_df['INVO_FINALPAYMENTDATE_DAYS_DIFF'] if 'INVO_FINALPAYMENTDATE_DAYS_DIFF' in date_diff_df.columns else None
-        if 'INVO_FINALPAYMENTDATE_DAYS_DIFF' in date_diff_df.columns:
-            date_diff_df = date_diff_df.drop(columns=['INVO_FINALPAYMENTDATE_DAYS_DIFF'])
-        final_payment_due_date_diff = (
-            due_date_diff_df['INVO_FINALPAYMENTDATE_DUE_DAYS_DIFF']
-            if 'INVO_FINALPAYMENTDATE_DUE_DAYS_DIFF' in due_date_diff_df.columns else None
-        )
-        if 'INVO_FINALPAYMENTDATE_DUE_DAYS_DIFF' in due_date_diff_df.columns:
-            due_date_diff_df = due_date_diff_df.drop(columns=['INVO_FINALPAYMENTDATE_DUE_DAYS_DIFF'])
-
-    # 8. Sklejenie wszystkiego
-    processed_df = pd.concat(
-        [df[id_columns], transformed_dates_df, date_diff_df, due_date_diff_df, numeric_df],
-        axis=1
-    )
-    if has_final:
-        processed_df['INVO_FINALPAYMENTDATE'] = final_payment_date
-    
-    inv = pd.to_datetime(processed_df['INVO_INVDATE'], errors='coerce') \
-          if 'INVO_INVDATE' in processed_df.columns else pd.Series(pd.NaT, index=processed_df.index)
-    
-    fin = pd.to_datetime(processed_df['INVO_FINALPAYMENTDATE'], errors='coerce') \
-          if 'INVO_FINALPAYMENTDATE' in processed_df.columns else pd.Series(pd.NaT, index=processed_df.index)
-    
-    processed_df['INVO_FINALPAYMENTDATE_DAYS_DIFF'] = (fin - inv).dt.days.astype('float32')
-
-    return processed_df
-
-# Funkcja symulująca najbliższy dzień roboczy
-def get_next_working_day(termin_platnosci, holidays):
-    while termin_platnosci.weekday() >= 5 or termin_platnosci in holidays:
-        termin_platnosci += timedelta(days=1)
-    return termin_platnosci
-
-# Funkcja do wstawienia danych z widoku do tabeli
-
-def generate_days(start_date, end_date):
-    current_date = datetime.strptime(start_date, '%Y-%m-%d')
-    end_date = datetime.strptime(end_date, '%Y-%m-%d')
-    while current_date <= end_date:
-        yield current_date  # zwracamy datetime
-        current_date += timedelta(days=1)
-        
-# Adapter: datetime → string (dla SQLite)
-def adapt_datetime(ts):
-    return ts.strftime('%Y-%m-%d %H:%M:%S')  # Format akceptowany przez SQLite
-
-# Konwerter: string → datetime (z SQLite)
-def convert_datetime(ts):
-    return datetime.strptime(ts.decode('utf-8'), '%Y-%m-%d %H:%M:%S')
-
-def adapt_pandas_timestamp(ts):
-    return ts.to_pydatetime().strftime('%Y-%m-%d %H:%M:%S')
-
-def convert_pandas_timestamp(ts):
-    return pd.Timestamp(ts.decode('utf-8'))
-
-def resolve_clients(all_clients, include=None, exclude=None):
-    all_clients = set(all_clients)
-    # include
-    if include is None or len(include) == 0:
-        selected = all_clients
-    else:
-        selected = set(include)
-    # exclude
-    if exclude:
-        selected -= set(exclude)
-    return sorted(selected)
-
-# Rejestracja adapterów
-sqlite3.register_adapter(datetime, adapt_datetime)
-sqlite3.register_converter('DATETIME', convert_datetime)
-sqlite3.register_adapter(pd.Timestamp, adapt_pandas_timestamp)
-sqlite3.register_converter('DATETIME', convert_pandas_timestamp)
-
-def build_dataset_db(params, t0, include_clients=None, exclude_clients=None, skip_raw_tables=False, build_derived=True):
-    
-    # skip_raw_tables=False, build_derived=True -> NORMAL (RAW+DERIVED)
-    # skip_raw_tables=False, build_derived=False -> ETAP 1 (RAW only)
-    # skip_raw_tables=True,  build_derived=True -> ETAP 2 (DERIVED only)    
-    queries_dir = params["sql_paths"]["queries_dir"]
-    data_end_str = _to_date_str(t0)
-    # --- jeden plik z wieloma klientami ---
-    file_path = params['multi_client_excel_path']
-    df_invo_all, df_debc_all, df_clhs_all, df_dcmo_all = load_excel_sheets(file_path, params)
-
-    print("przed client_ids = df_invo_all['INVO_CLNTNO'].dropna().unique()")
-    # ------------------------------------------------------------------
-    # 1️⃣ wszyscy klienci z Excela (jak dotychczas)
-    # ------------------------------------------------------------------
-    # wszystkie klienty z danych
-    all_client_ids = (
-        df_invo_all['INVO_CLNTNO']
-        .dropna()
-        .astype(int)
-        .unique()
-        .tolist()
-    )
-    client_ids = resolve_clients(
-        all_clients=all_client_ids,
-        include=include_clients,
-        exclude=exclude_clients,
-    )
-    
-    # ------------------------------------------------------------------
-    # 2️⃣ liczenie i sortowanie (TYLKO do logu + kolejności)
-    # ------------------------------------------------------------------
-    _counts = (
-        df_invo_all
-        .dropna(subset=['INVO_CLNTNO'])
-        .groupby('INVO_CLNTNO', as_index=False)
-        .size()
-        .rename(columns={'size': 'cnt'})
-    )
-    
-    _counts_sorted = _counts.sort_values('cnt', ascending=True)
-    
-    for rank, (cid, cnt) in enumerate(
-        zip(_counts_sorted['INVO_CLNTNO'], _counts_sorted['cnt']),
-        start=1
-    ):
-        print(f"{rank:>2}. klient {int(cid)} → {int(cnt)} wierszy INVO")
-    
-    print(f"[INFO] Finalna lista klientów do przetworzenia: {client_ids}")
-    
-    # czytelny wydruk: kolejność + ile rekordów ma każdy klient
-    print("Kolejność przetwarzania (od najmniejszej liczby wierszy INVO):")
-    for rank, (cid, cnt) in enumerate(zip(_counts_sorted['INVO_CLNTNO'],
-                                          _counts_sorted['cnt']), start=1):
-        print(f"{rank:>2}. klient {int(cid)} → {int(cnt)} wierszy INVO")     
-    print("po client_ids = df_invo_all['INVO_CLNTNO'].dropna().unique() order by _counts.sort_values('cnt', ascending=True)['INVO_CLNTNO']")
-
-    db_path = params['database']
-    conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
-    cursor = conn.cursor()
-    
-    for client_id in client_ids:
-        print("client_id: ", client_id)
-    
-        # wczytujemy dane:
-        df_invo = df_invo_all[df_invo_all['INVO_CLNTNO'] == client_id].copy()
-        df_debc = df_debc_all[df_debc_all['DEBC_CLNTNO'] == client_id].copy()
-        df_clhs = df_clhs_all[df_clhs_all['CLHS_CLNTNO'] == client_id].copy()
-        df_dcmo = df_dcmo_all[df_dcmo_all['DEBC_CLNTNO'] == client_id].copy()
-
-        validate_required_schema_for_create_database(cursor)
-    
-        od_dnia = pd.to_datetime(params['od_dnia'])
-        dcmo_year = int(od_dnia.year)
-        dcmo_month = int(od_dnia.month)
-    
-        # Filtrowanie df_invo: INVO_INVDATE >= od_dnia
-        if df_invo is not None and not df_invo.empty and 'INVO_INVDATE' in df_invo.columns:
-            df_invo['INVO_INVDATE'] = pd.to_datetime(df_invo['INVO_INVDATE'], errors='coerce')
-            df_invo = df_invo[df_invo['INVO_INVDATE'].notna() & (df_invo['INVO_INVDATE'] >= od_dnia)]
-    
-        # Filtrowanie df_clhs: CLHS_DATCHANGED >= od_dnia (format YYYYMMDD, np. 20210712)
-        if df_clhs is not None and not df_clhs.empty and 'CLHS_DATCHANGED' in df_clhs.columns:
-            df_clhs['CLHS_DATCHANGED'] = pd.to_datetime(df_clhs['CLHS_DATCHANGED'].astype(str), format='%Y%m%d', errors='coerce')
-            df_clhs = df_clhs[df_clhs['CLHS_DATCHANGED'].notna() & (df_clhs['CLHS_DATCHANGED'] >= od_dnia)]
-    
-        # Filtrowanie df_dcmo: (YEAR, MONTH) >= od_dnia
-        if df_dcmo is not None and not df_dcmo.empty and 'DCMO_YEAR' in df_dcmo.columns and 'DCMO_MONTH' in df_dcmo.columns:
-            df_dcmo['DCMO_YEAR'] = pd.to_numeric(df_dcmo['DCMO_YEAR'], errors='coerce')
-            df_dcmo['DCMO_MONTH'] = pd.to_numeric(df_dcmo['DCMO_MONTH'], errors='coerce')
-        
-            df_dcmo = df_dcmo[
-                (df_dcmo['DCMO_YEAR'] > dcmo_year) |
-                ((df_dcmo['DCMO_YEAR'] == dcmo_year) & (df_dcmo['DCMO_MONTH'] >= dcmo_month))
-            ]
-    
-        # --- RAW tables: invo/debc/clhs/dcmo ---
-        if not skip_raw_tables:
-            cursor.execute("DELETE FROM invo WHERE INVO_CLNTNO = ?", (client_id,))
-            cursor.execute("DELETE FROM debc WHERE DEBC_CLNTNO = ?", (client_id,))
-            cursor.execute("DELETE FROM clhs WHERE CLHS_CLNTNO = ?", (client_id,))
-            cursor.execute("DELETE FROM dcmo WHERE DEBC_CLNTNO = ?", (client_id,))
-            
-            df_invo.to_sql('invo', conn, if_exists='append', index=False)
-            df_debc.to_sql('debc', conn, if_exists='append', index=False)
-            df_clhs.to_sql('clhs', conn, if_exists='append', index=False)
-            df_dcmo.to_sql('dcmo', conn, if_exists='append', index=False)
-        
-            conn.commit()
-        else:
-            logging.info("[build_dataset_db] skip_raw_tables=True -> nie ruszam invo/debc/clhs/dcmo")
-
-        # --- stop after RAW if requested (ETAP 1) ---
-        if not build_derived:
-            logging.info("[build_dataset_db] build_derived=False -> kończę po imporcie RAW (bez widoków/datasetów).")
-            conn.commit()
-            conn.close()
-            continue
-        
-        
-        # Wstawianie danych z widoku do tabeli
-        cursor.execute("DELETE FROM INVO_CLHS_JOINED_TAB WHERE INVO_CLNTNO = ?", (client_id,))
-        insert_query = """
-        INSERT INTO INVO_CLHS_JOINED_TAB
-        SELECT * FROM INVO_CLHS_JOINED
-        WHERE INVO_CLNTNO = ?;
-        """
-        cursor.execute(insert_query, (client_id,))
-        print("Dane zostały skopiowane z widoku do tabeli 'INVO_CLHS_JOINED_TAB'.")
-
-        remove_duplicates_query = """
-            WITH d AS (
-              SELECT
-                rowid AS rid,
-                ROW_NUMBER() OVER (
-                  PARTITION BY
-                    INVO_NO, INVO_CLNTNO, INVO_ADMNO, INVO_DEBH_NO, INVO_DEBC_NO, CLHS_CHANGED_DATETIME
-                  ORDER BY RANDOM()          -- losowy wybór zwycięzcy
-                ) AS rn
-              FROM INVO_CLHS_JOINED_TAB
-              WHERE INVO_CLNTNO = ?
-            )
-            DELETE FROM INVO_CLHS_JOINED_TAB
-            WHERE rowid IN (SELECT rid FROM d WHERE rn > 1);
-        """
-        cursor.execute(remove_duplicates_query, (client_id,))
-
-        # Zatwierdzenie zmian i zamknięcie połączenia
-        conn.commit()
-        
-        print("Operacja zakończona sukcesem.")
-        
-        # Pobranie danych z invo_view
-        query_invo = load_sql_file(f"{queries_dir}/invo_select.sql")
-        cursor.execute(query_invo, (params['od_dnia'], client_id))
-        rows = cursor.fetchall()
-        
-        # Dynamiczne wstawianie danych do tabeli z obliczeniem ROK i MIESIAC
-        data_to_insert = []
-        for row in rows:
-            (invo_no, invo_admno, invo_clntno, invo_debh_no, invo_debc_no,
-             invo_invdate, invo_finalpaymentdate) = row
-        
-            # 1) Sprowadź wszystko do str 'YYYY-MM-DD' (albo None)
-            invdate_s = pd.to_datetime(invo_invdate, errors='coerce')
-            if pd.isna(invdate_s):
-                # Bez daty wystawienia nie ma sensu generować dni – pomiń rekord
-                continue
-            invdate_s = invdate_s.strftime("%Y-%m-%d")
-        
-            if invo_finalpaymentdate is not None and not pd.isna(invo_finalpaymentdate):
-                finalpay_s = pd.to_datetime(invo_finalpaymentdate, errors='coerce')
-                finalpay_s = None if pd.isna(finalpay_s) else finalpay_s.strftime("%Y-%m-%d")
-            else:
-                finalpay_s = None
-        
-            # 2) Jeśli brak finalnej daty płatności → użyj invdate + 120 dni
-            end_for_days_s = (
-                finalpay_s if finalpay_s
-                else (pd.to_datetime(invdate_s) + pd.Timedelta(days=120)).strftime("%Y-%m-%d")
-            )
-        
-            # 3) generate_days oczekuje STR → OK
-            days = list(generate_days(invdate_s, end_for_days_s))
-        
-            # 4) Przy insertach do SQLite trzymaj typy proste (date/datetime → date)
-            invdate_d  = pd.to_datetime(invdate_s).date()
-            finalpay_d = (pd.to_datetime(finalpay_s).date() if finalpay_s else None)
-        
-            for day in days:
-                # generate_days zwraca datetime → rzutujemy na date
-                day_d = day.date()
-                data_to_insert.append((
-                    invo_no, invo_admno, invo_clntno, invo_debh_no, invo_debc_no,
-                    invdate_d, day_d, day_d.year, day_d.month, finalpay_d
-                ))
-        
-        # Wstawianie danych do tabeli
-        cursor.execute("DELETE FROM group_cust_inv_days WHERE INVO_CLNTNO = ?", (client_id,))
-
-        cursor.executemany("""
-        INSERT INTO group_cust_inv_days (
-            INVO_NO, INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, INVO_INVDATE, DZIEN, ROK, MIESIAC, INVO_FINALPAYMENTDATE
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, data_to_insert)
-
-        # Zatwierdzenie zmian
-        conn.commit()
-        
-        print("Tabela 'group_cust_inv_days' została pomyślnie wypełniona.")
-        print(datetime.now().strftime("%H:%M:%S"))
-    
-        # Pobranie danych z group_cust_inv_days z grupowaniem
-        grouped_query = load_sql_file(f"{queries_dir}/group_cust_inv_days_select.sql")
-        # Wczytanie danych do DataFrame
-        df = pd.read_sql_query(grouped_query, conn, params=(client_id,))
-        
-        # Zapisanie DataFrame do tabeli SQLite (struktura tabeli tworzona automatycznie)
-        cursor.execute("DELETE FROM grouped_client_days WHERE INVO_CLNTNO = ?", (client_id,))
-        df.to_sql("grouped_client_days", conn, if_exists="append", index=False)
-
-        # Zatwierdzenie zmian i zamknięcie połączenia
-        conn.commit()
-    
-        print("Rozpoczynam partiami wstawianie do 'extended_grouped_client_days_tab'...")
-        select_year_month_sql = """
-            SELECT DISTINCT ROK, MIESIAC
-            FROM extended_grouped_client_days
-            WHERE INVO_CLNTNO = ?
-            ORDER BY ROK, MIESIAC
-        """
-        insert_extended_sql = load_sql_file(f"{queries_dir}/insert_extended_grouped_client_days.sql")
-        insert_summary_sql = load_sql_file(f"{queries_dir}/insert_summary_client_days.sql")
-        # lista partii do przerobienia
-        cursor.execute(select_year_month_sql, (client_id,))
-        year_month_rows = cursor.fetchall()
-        # odświeżenie targetów dla klienta
-        cursor.execute("DELETE FROM extended_grouped_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
-        cursor.execute("DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
-        conn.commit()
-        # 1) extended_grouped_client_days_tab
-        inserted_count = 0
-        for (year, month) in year_month_rows:
-            cursor.execute(insert_extended_sql, (year, month, params["od_dnia"], client_id))
-            conn.commit()
-            row_count = cursor.rowcount if cursor.rowcount != -1 else 0
-            inserted_count += row_count
-            print(f"Wstawiono extended: ROK={year}, MIESIAC={month} -> {row_count} wierszy (narastająco={inserted_count})")
-        print(f"Extended zakończone. Łącznie wstawiono = {inserted_count}.")
-        print(datetime.now().strftime("%H:%M:%S"))
-        # 2) summary_client_days_tab
-        print("Rozpoczynam partiami wstawianie do 'summary_client_days_tab'...")
-        inserted_count = 0
-        for (year, month) in year_month_rows:
-            cursor.execute(insert_summary_sql, (year, month, client_id))
-            conn.commit()
-            row_count = cursor.rowcount if cursor.rowcount != -1 else 0
-            inserted_count += row_count
-            print(f"Wstawiono summary: ROK={year}, MIESIAC={month} -> {row_count} wierszy (narastająco={inserted_count})")
-        print(f"Summary zakończone. Łącznie wstawiono = {inserted_count}.")
-        print(datetime.now().strftime("%H:%M:%S"))
-        # Pobranie świąt (jeśli istnieją)
-        cursor.execute("SELECT data FROM swieta")
-        holidays = {pd.Timestamp(row[0]) for row in cursor.fetchall() if row[0] is not None}
-        
-        # Parametry wejściowe
-        z_ilu_dni_values = [14, 30, 60, 90]
-        maksymalna_data = pd.Timestamp(data_end_str)
-        log_triggered = False
-        inserted_count = 0
-
-        cursor.execute("DELETE FROM statystyki_faktur WHERE INVO_CLNTNO = ?", (client_id,))
-        for z_ilu_dni in z_ilu_dni_values:
-            # Pobranie danych klientów i dni
-            query = """
-                SELECT DISTINCT INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, DZIEN
-                FROM group_cust_inv_days
-                WHERE INVO_CLNTNO = ?
-                  AND DZIEN <= ?
-            """
-            customer_days = pd.read_sql_query(
-                query,
-                conn,
-                params=(client_id, maksymalna_data.strftime('%Y-%m-%d %H:%M:%S'))
-            )
-
-            
-            # Iteracja po klientach i dniach
-            sql = load_sql_file(f"{queries_dir}/select_faktury.sql")
-            for _, row in customer_days.iterrows():
-                invo_admno = row['INVO_ADMNO']
-                invo_clntno = row['INVO_CLNTNO']
-                invo_debh_no = row['INVO_DEBH_NO']
-                invo_debc_no = row['INVO_DEBC_NO']
-                na_dzien = pd.Timestamp(row['DZIEN'])
-                
-                end_day   = na_dzien.strftime('%Y-%m-%d')
-                start_day = (na_dzien - pd.Timedelta(days=z_ilu_dni)).strftime('%Y-%m-%d')
-
-                # Pobranie faktur dla klienta
-                # Pomiar czasu wczytywania faktur
-                start_read_time = time.time()
-                faktury = pd.read_sql_query(
-                    sql,
-                    conn,
-                    params=(
-                        end_day,
-                        invo_admno,
-                        invo_clntno,
-                        invo_debh_no,
-                        invo_debc_no,
-                        start_day,
-                        end_day,
-                        start_day,
-                        end_day,
-                    )
-                )
-        
-                read_duration = time.time() - start_read_time
-        
-                # Symulacja przeliczenia terminów płatności
-                faktury['INVO_DUEDATE'] = faktury['INVO_DUEDATE'].apply(
-                    lambda x: get_next_working_day(pd.Timestamp(x), holidays) if pd.notna(x) else x
-                )
-        
-                faktury['INVO_FINALPAYMENTDATE'] = pd.to_datetime(faktury['INVO_FINALPAYMENTDATE'], errors='coerce')
-                faktury['INVO_DUEDATE'] = pd.to_datetime(faktury['INVO_DUEDATE'], errors='coerce')
-                faktury['INVO_INVDATE'] = pd.to_datetime(faktury['INVO_INVDATE'], errors='coerce')
-                
-                paid = faktury['INVO_FINALPAYMENTDATE'].notna()
-                unpaid = faktury['INVO_FINALPAYMENTDATE'].isna()        
-                
-                # Definicje scenariuszy
-                scenariusze = {
-                    'zapłacone_przed_terminem': faktury[
-                        (faktury['INVO_FINALPAYMENTDATE'].notna()) & 
-                        (faktury['INVO_FINALPAYMENTDATE'] <= faktury['INVO_DUEDATE']) & 
-                        (faktury['INVO_FINALPAYMENTDATE'] < na_dzien)
-                    ],
-                    'zapłacone_po_terminie': faktury[
-                        (faktury['INVO_FINALPAYMENTDATE'].notna()) & 
-                        (faktury['INVO_FINALPAYMENTDATE'] > faktury['INVO_DUEDATE']) &
-                        (faktury['INVO_FINALPAYMENTDATE'] < na_dzien) 
-                    ],
-                    'niezapłacone_po_terminie': faktury[
-                        unpaid &
-                        (na_dzien > faktury['INVO_DUEDATE'])
-                    ],
-                    'niezapłacone_przed_terminem': faktury[
-                        unpaid &
-                        (na_dzien <= faktury['INVO_DUEDATE'])
-                    ],
-                    'wszystkie_faktury': faktury
-                }
-        
-                # Obliczanie statystyk dla każdego scenariusza
-                for scenariusz, df in scenariusze.items():
-                    if df.empty:
-                        continue
-                
-                    # Kopia, żeby uniknąć SettingWithCopyWarning
-                    dfc = df.copy()
-                
-                    # Kwoty (bezpieczne)
-                    dfc['INVO_AINITIALH'] = pd.to_numeric(dfc['INVO_AINITIALH'], errors='coerce')
-                    sum_invo_ainitialh = float(dfc['INVO_AINITIALH'].sum(skipna=True))
-                    avg_invo_ainitialh = float(dfc['INVO_AINITIALH'].mean(skipna=True))
-                    stdev_invo_ainitialh = float(dfc['INVO_AINITIALH'].std(skipna=True))
-                    ile_faktur = int(len(dfc))
-                
-                    # Maski płatności znanych na na_dzien
-                    paid_mask = dfc['INVO_FINALPAYMENTDATE'].notna()
-                    unpaid_mask = ~paid_mask
-                
-                    # Domyślnie ustawiamy NULL-e (NaN -> SQLite zapisze jako NULL)
-                    avg_dni_do_zaplaty = np.nan
-                    stdev_dni_do_zaplaty = np.nan
-                    avg_dni_opoznienia = np.nan
-                    stdev_dni_opoznienia = np.nan
-                
-                    if scenariusz.startswith('zapłacone'):
-                        # Prawdziwe metryki, legalne (bo FINALPAYMENTDATE <= na_dzien)
-                        days_to_pay = (dfc.loc[paid_mask, 'INVO_FINALPAYMENTDATE'] - dfc.loc[paid_mask, 'INVO_INVDATE']).dt.days
-                        days_late = (dfc.loc[paid_mask, 'INVO_FINALPAYMENTDATE'] - dfc.loc[paid_mask, 'INVO_DUEDATE']).dt.days
-                
-                        avg_dni_do_zaplaty = float(days_to_pay.mean()) if not days_to_pay.empty else np.nan
-                        stdev_dni_do_zaplaty = float(days_to_pay.std()) if len(days_to_pay) > 1 else np.nan
-                
-                        avg_dni_opoznienia = float(days_late.mean()) if not days_late.empty else np.nan
-                        stdev_dni_opoznienia = float(days_late.std()) if len(days_late) > 1 else np.nan
-                
-                    elif scenariusz.startswith('niezapłacone'):
-                        # PROXY metryki "as-of" dla niezapłaconych (bez leak'u)
-                        # "dni do zapłaty" -> wiek faktury do na_dzien
-                        age_today = (na_dzien - dfc.loc[unpaid_mask, 'INVO_INVDATE']).dt.days
-                
-                        # "dni opóźnienia" -> ile dni po terminie na na_dzien, obcięte do >=0
-                        late_today = (na_dzien - dfc.loc[unpaid_mask, 'INVO_DUEDATE']).dt.days
-                        late_today = late_today.clip(lower=0)
-                
-                        avg_dni_do_zaplaty = float(age_today.mean()) if not age_today.empty else np.nan
-                        stdev_dni_do_zaplaty = float(age_today.std()) if len(age_today) > 1 else np.nan
-                
-                        avg_dni_opoznienia = float(late_today.mean()) if not late_today.empty else np.nan
-                        stdev_dni_opoznienia = float(late_today.std()) if len(late_today) > 1 else np.nan
-                
-                    else:  # 'wszystkie_faktury'
-                        # Mieszany wariant: dla zapłaconych prawdziwe, dla niezapłaconych proxy as-of
-                        days_to_pay_paid = (dfc.loc[paid_mask, 'INVO_FINALPAYMENTDATE'] - dfc.loc[paid_mask, 'INVO_INVDATE']).dt.days
-                        days_to_pay_unpaid = (na_dzien - dfc.loc[unpaid_mask, 'INVO_INVDATE']).dt.days
-                        days_to_pay = pd.concat([days_to_pay_paid, days_to_pay_unpaid], ignore_index=True)
-                
-                        days_late_paid = (dfc.loc[paid_mask, 'INVO_FINALPAYMENTDATE'] - dfc.loc[paid_mask, 'INVO_DUEDATE']).dt.days
-                        days_late_unpaid = (na_dzien - dfc.loc[unpaid_mask, 'INVO_DUEDATE']).dt.days
-                        days_late_unpaid = days_late_unpaid.clip(lower=0)
-                        days_late = pd.concat([days_late_paid, days_late_unpaid], ignore_index=True)
-                
-                        avg_dni_do_zaplaty = float(days_to_pay.mean()) if not days_to_pay.empty else np.nan
-                        stdev_dni_do_zaplaty = float(days_to_pay.std()) if len(days_to_pay) > 1 else np.nan
-                
-                        avg_dni_opoznienia = float(days_late.mean()) if not days_late.empty else np.nan
-                        stdev_dni_opoznienia = float(days_late.std()) if len(days_late) > 1 else np.nan
-
-                    # Wstawianie wyników do tabeli
-                    cursor.execute("""
-                        INSERT INTO statystyki_faktur (
-                            INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, DZIEN,
-                            SCENARIUSZ, AVG_DNI_DO_ZAPLATY, STDEV_DNI_DO_ZAPLATY,
-                            AVG_DNI_OPOZNIENIA, STDEV_DNI_OPOZNIENIA,
-                            SUM_INVO_AINITIALH, AVG_INVO_AINITIALH, STDEV_INVO_AINITIALH,
-                            ILE_FAKTUR, PARAM_Z_ILU_DNI, INSERT_TIMESTAMP
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        invo_admno, invo_clntno, invo_debh_no, invo_debc_no,
-                        na_dzien.strftime('%Y-%m-%d %H:%M:%S'),
-                        scenariusz,
-                        avg_dni_do_zaplaty, stdev_dni_do_zaplaty,
-                        avg_dni_opoznienia, stdev_dni_opoznienia,
-                        sum_invo_ainitialh, avg_invo_ainitialh, stdev_invo_ainitialh,
-                        ile_faktur, z_ilu_dni, datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    ))
-                
-                    # Aktualizacja licznika i logowanie co 10 minut
-                    inserted_count += 1
-                    current_time = datetime.now()
-                    if current_time.minute % 10 == 0 and not log_triggered:
-                        log_triggered = True
-                        cursor.execute("SELECT * FROM statystyki_faktur ORDER BY INSERT_TIMESTAMP DESC LIMIT 1")
-                        recent_rows = cursor.fetchall()
-                        print(f"[{current_time}] Inserted rows so far: {inserted_count}")
-                        print(f"[{current_time}] Remaining rows to insert: {len(customer_days) * len(z_ilu_dni_values) - inserted_count}")
-                        print(f"[{current_time}] Last row in statystyki_faktur: {recent_rows}")
-                    elif current_time.minute % 10 != 0:
-                        log_triggered = False
-        
-            # Zapis do bazy na końcu pętli
-            # conn.commit()
-        conn.commit()
-        print("Statystyki faktur zostały obliczone i zapisane.")
-        print(datetime.now().strftime("%H:%M:%S"))
-
-        # Pobranie minimalnej i maksymalnej daty z widoku
-        cursor.execute(
-            "SELECT MIN(dzien), MAX(dzien) FROM group_cust_inv_days WHERE INVO_CLNTNO = ?;",
-            (client_id,)
-        )
-        min_date, max_date = cursor.fetchone()
-        
-        
-        if not min_date or not max_date:
-            print("Brak danych w widoku, wychodzę.")
-            conn.close()
-            continue
-        else:
-            print(f"Zakres dat w widoku: {min_date} - {max_date}")
-        
-        
-        NUM_SHARDS = params['NUM_SHARDS']
-        batch_size = 1000
-        total_inserted_all = 0
-
-        cursor.execute("DELETE FROM dataset_tab WHERE INVO_CLNTNO = ?", (client_id,))
-        conn.commit()
-
-        for shard in range(NUM_SHARDS + 1):
-
-            stats_pivot_sql = load_sql_file(f"{queries_dir}/query_stats_pivot_select.sql")
-            dataset_raw_sql = load_sql_file(f"{queries_dir}/query_dataset_raw_select.sql")
-            client_filter_sql = build_client_filter_sql(alias="g", use_range=True)
-            shard_condition_sql = build_shard_condition_sql(NUM_SHARDS, shard)
-            stats_pivot_sql = stats_pivot_sql.format(
-                client_filter=client_filter_sql,
-                shard_condition=shard_condition_sql,
-            )
-            dataset_raw_sql = dataset_raw_sql.format(
-                stats_pivot_select=stats_pivot_sql,
-                client_filter=client_filter_sql,
-                shard_condition=shard_condition_sql,
-            )
-
-            current_date = pd.to_datetime(min_date)
-            total_inserted_shard = 0
-
-            while current_date <= pd.to_datetime(data_end_str):
-                next_date = current_date + pd.Timedelta(days=batch_size - 1)
-
-                query_batch_insert = f"""
-                INSERT INTO dataset_tab
-                {dataset_raw_sql}
-                """
-
-                cursor.execute(
-                    query_batch_insert,
-                    (
-                        client_id,
-                        current_date.strftime('%Y-%m-%d'),
-                        next_date.strftime('%Y-%m-%d'),
-                        client_id,
-                        current_date.strftime('%Y-%m-%d'),
-                        next_date.strftime('%Y-%m-%d'),
-                    )
-                )
-                conn.commit()
-
-                batch_inserted = cursor.rowcount if cursor.rowcount != -1 else 0
-                total_inserted_shard += batch_inserted
-                total_inserted_all += batch_inserted
-
-                print(
-                    f"Dla client={client_id}, shard={shard} zaimportowano "
-                    f"{batch_inserted} rekordów dla dni "
-                    f"{current_date.strftime('%Y-%m-%d')} - {next_date.strftime('%Y-%m-%d')}."
-                )
-                print(datetime.now().strftime("%H:%M:%S"))
-
-                current_date = next_date + pd.Timedelta(days=1)
-
-            print(
-                f"[INFO] Client={client_id}, shard={shard} zakończony. "
-                f"Łącznie w shardzie: {total_inserted_shard}"
-            )
-
-        cursor.execute("DELETE FROM dataset WHERE INVO_CLNTNO = ?", (client_id,))
-        conn.commit()
-
-        refill_dataset_for_client(
-            conn,
-            client_id=client_id,
-            source_table="dataset_tab",
-            target_table="dataset",
-            batch_days=params.get("dataset_batch_days", 31)
-        )
-        print(datetime.now().strftime("%H:%M:%S"))
-        
-    
-    insert_aggregated_data_temp(conn, data_end_str)
-    
-    # (na końcu)
-    conn.commit()
-    conn.close()
-
-(cpdev50)C:\Users\OE00SG\CashPredictor\dev3\gcp batch>conda activate cpdev50
-
-(cpdev50)C:\Users\OE00SG\CashPredictor\dev3\gcp batch>cd C:\Users\OE00SG\CashPredictor\dev3\gcp batch
-
-(cpdev50)C:\Users\OE00SG\CashPredictor\dev3\gcp batch>python build_client_db.py ^
-More?   --t0 2026-03-02 ^
-More?   --include-clients 13581,10095,6089,8964,8989 ^
-More?   --exclude-clients 9320 ^
-More?   --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor1.db
-[INFO] DB does not exist, initializing: C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor1.db
-[INFO] Executing 000_create_aggregated_data_temp.sql
-[INFO] Executing 001_create_swieta.sql
-[INFO] Executing 002_create_invo.sql
-[INFO] Executing 003_create_debc.sql
-[INFO] Executing 004_create_clhs.sql
-[INFO] Executing 005_create_dcmo.sql
-[INFO] Executing 006_create_group_cust_inv_days.sql
-[INFO] Executing 007_create_grouped_client_days.sql
-[INFO] Executing 008_create_summary_client_days_tab.sql
-[INFO] Executing 009_create_extended_grouped_client_days_tab.sql
-[INFO] Executing 010_create_dataset_tab.sql
-[INFO] Executing 011_create_dataset.sql
-[INFO] Executing 012_create_first_model_tab.sql
-[INFO] Executing 013_create_statystyki_faktur.sql
-[INFO] Executing 014_create_create_invo_clhs_joined_tab_table.sql
-[OK] Seed swieta z CSV zakończony. Dodano 143 nowych rekordów.
-[INFO] Executing 101_invo_view.sql
-[INFO] Executing 102_clhs_view.sql
-[INFO] Executing 103_debc_view.sql
-[INFO] Executing 104_dcmo_view.sql
-[INFO] Executing 105_invo_clhs_joined.sql
-[INFO] Executing 106_summary_client_days_view.sql
-[INFO] Executing 107_extended_grouped_client_days.sql
-[INFO] Executing create_idx_clhs_joined_keys_datetime.sql
-[INFO] Executing create_idx_dataset_clear.sql
-[INFO] Executing create_idx_dataset_inv_day.sql
-[INFO] Executing create_idx_ext_days_ids_dzien.sql
-[INFO] Executing create_idx_first_model_tab_client_day.sql
-[INFO] Executing create_idx_first_model_tab_invoice.sql
-[INFO] Executing create_idx_first_model_tab_runid.sql
-[INFO] Executing create_idx_group_cust_inv_days_one_for_all.sql
-[INFO] Executing create_idx_group_cust_inv_days_year_month.sql
-[INFO] Executing create_idx_invo_debcno_invdate.sql
-[INFO] Executing create_idx_invo_debcno_invdate_etc.sql
-[INFO] Executing create_idx_invo_one_for_all.sql
-[INFO] Executing create_idx_statystyki_faktur_one_for_all.sql
-[INFO] Executing create_idx_statystyki_keys_day_param_scen.sql
-[INFO] Executing create_idx_summary_client_days_tab_one_for_all.sql
-[INFO] Executing create_idx_summary_days_ids_dzien.sql
-[OK] Database schema initialized: C:/Users/OE00SG/CashPredictor/dev3/databases/2026-03-02/2026-03-02/CashPredictor1.db
-[INFO] include=[13581, 10095, 6089, 8964, 8989], exclude=[9320]
-przed client_ids = df_invo_all['INVO_CLNTNO'].dropna().unique()
- 1. klient 13581 → 838 wierszy INVO
- 2. klient 10095 → 1225 wierszy INVO
- 3. klient 6089 → 2424 wierszy INVO
- 4. klient 8964 → 2966 wierszy INVO
- 5. klient 8989 → 3040 wierszy INVO
- 6. klient 9320 → 3695 wierszy INVO
- 7. klient 6558 → 4933 wierszy INVO
- 8. klient 10069 → 33915 wierszy INVO
 [INFO] Finalna lista klientów do przetworzenia: [6089, 8964, 8989, 10095, 13581]
-Kolejność przetwarzania (od najmniejszej liczby wierszy INVO):
- 1. klient 13581 → 838 wierszy INVO
- 2. klient 10095 → 1225 wierszy INVO
- 3. klient 6089 → 2424 wierszy INVO
- 4. klient 8964 → 2966 wierszy INVO
- 5. klient 8989 → 3040 wierszy INVO
- 6. klient 9320 → 3695 wierszy INVO
- 7. klient 6558 → 4933 wierszy INVO
- 8. klient 10069 → 33915 wierszy INVO
-po client_ids = df_invo_all['INVO_CLNTNO'].dropna().unique() order by _counts.sort_values('cnt', ascending=True)['INVO_CLNTNO']
-client_id:  6089
-Dane zostały skopiowane z widoku do tabeli 'INVO_CLHS_JOINED_TAB'.
-Operacja zakończona sukcesem.
-Traceback (most recent call last):
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\build_client_db.py", line 59, in <module>
-    main()
-    ~~~~^^
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\build_client_db.py", line 51, in main
-    build_dataset_db.build_dataset_db(
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
-        config["first_model_params"],
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    ...<2 lines>...
-        exclude_clients=exclude_clients
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    )
-    ^
-  File "C:\Users\OE00SG\CashPredictor\dev3\gcp batch\build_dataset_db.py", line 728, in build_dataset_db
-    cursor.execute(query_invo, (params['od_dnia'], client_id))
-    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-sqlite3.OperationalError: unrecognized token: "{"
 
-przeanalizuj kod, co to za błąd? dlaczego wypisuje 2 razy kleintów i dlaczego nie zawęża tylko do tych podanych z wywołaniu?
+czyli include/exclude zadziałało.
+
+Skąd w logu inni klienci?
+
+Bo _counts i _counts_sorted liczysz na całym Excelu, a nie na wybranych klientach:
+
+_counts = (
+    df_invo_all
+    .dropna(subset=['INVO_CLNTNO'])
+    .groupby('INVO_CLNTNO', as_index=False)
+    .size()
+    .rename(columns={'size': 'cnt'})
+)
+
+Więc log pokazuje wszystkich z pliku, nie tylko wybranych.
+
+Jak to poprawić
+
+Przefiltruj _counts do client_ids:
+
+_counts = (
+    df_invo_all
+    .dropna(subset=['INVO_CLNTNO'])
+    .assign(INVO_CLNTNO=lambda d: d['INVO_CLNTNO'].astype(int))
+)
+_counts = _counts[_counts['INVO_CLNTNO'].isin(client_ids)]
+_counts_sorted = (
+    _counts
+    .groupby('INVO_CLNTNO', as_index=False)
+    .size()
+    .rename(columns={'size': 'cnt'})
+    .sort_values('cnt', ascending=True)
+)
+
+Wtedy log pokaże tylko klientów z wywołania.
+
+⸻
+
+4. Jeszcze ważniejsza rzecz: kolejność przetwarzania nie jest zgodna z logiem
+
+Masz log „od najmniejszej liczby wierszy”, ale realnie iterujesz po:
+
+client_ids = resolve_clients(...)
+
+a resolve_clients() robi:
+
+return sorted(selected)
+
+czyli sortuje po numerze klienta, nie po liczbie rekordów.
+
+Dlatego u Ciebie pierwszy poszedł 6089, a nie 13581.
+
+Jeśli chcesz naprawdę przetwarzać od najmniejszych
+
+Po wyliczeniu _counts_sorted zrób:
+
+client_ids = _counts_sorted['INVO_CLNTNO'].astype(int).tolist()
+
+Wtedy:
+
+* log
+* finalna lista
+* rzeczywista kolejność przetwarzania
+
+będą spójne.
+
+⸻
+
+Co konkretnie zmienić
+
+A. Napraw invo_select.sql
+
+Usuń z niego wszystkie {...} i zostaw tylko ?.
+
+B. Uporządkuj wybór i logowanie klientów
+
+Podmień ten fragment:
+
+_counts = (
+    df_invo_all
+    .dropna(subset=['INVO_CLNTNO'])
+    .groupby('INVO_CLNTNO', as_index=False)
+    .size()
+    .rename(columns={'size': 'cnt'})
+)
+_counts_sorted = _counts.sort_values('cnt', ascending=True)
+for rank, (cid, cnt) in enumerate(
+    zip(_counts_sorted['INVO_CLNTNO'], _counts_sorted['cnt']),
+    start=1
+):
+    print(f"{rank:>2}. klient {int(cid)} → {int(cnt)} wierszy INVO")
+print(f"[INFO] Finalna lista klientów do przetworzenia: {client_ids}")
+print("Kolejność przetwarzania (od najmniejszej liczby wierszy INVO):")
+for rank, (cid, cnt) in enumerate(zip(_counts_sorted['INVO_CLNTNO'],
+                                      _counts_sorted['cnt']), start=1):
+    print(f"{rank:>2}. klient {int(cid)} → {int(cnt)} wierszy INVO")
+
+na:
+
+_counts_base = (
+    df_invo_all
+    .dropna(subset=['INVO_CLNTNO'])
+    .assign(INVO_CLNTNO=lambda d: d['INVO_CLNTNO'].astype(int))
+)
+_counts_sorted = (
+    _counts_base[_counts_base['INVO_CLNTNO'].isin(client_ids)]
+    .groupby('INVO_CLNTNO', as_index=False)
+    .size()
+    .rename(columns={'size': 'cnt'})
+    .sort_values('cnt', ascending=True)
+)
+client_ids = _counts_sorted['INVO_CLNTNO'].astype(int).tolist()
+print(f"[INFO] Finalna lista klientów do przetworzenia: {client_ids}")
+print("Kolejność przetwarzania (od najmniejszej liczby wierszy INVO):")
+for rank, (cid, cnt) in enumerate(
+    zip(_counts_sorted['INVO_CLNTNO'], _counts_sorted['cnt']),
+    start=1
+):
+    print(f"{rank:>2}. klient {int(cid)} → {int(cnt)} wierszy INVO")
+
+⸻
+
+Krótka diagnoza
+
+Problem:
+
+1. invo_select.sql nadal zawiera {...}
+2. klientów logujesz dwa razy
+3. log pokazuje wszystkich z Excela, nie tylko wybranych
+4. rzeczywista kolejność przetwarzania jest po ID, nie po liczbie rekordów
+
+Rozwiązanie:
+
+1. invo_select.sql ma mieć tylko ?
+2. usuń zdublowane printy
+3. licz _counts_sorted tylko dla client_ids
+4. nadpisz client_ids kolejnością z _counts_sorted
+
+Jeśli chcesz, w następnym kroku mogę Ci od razu wkleić gotowy, poprawiony fragment build_dataset_db.py od all_client_ids = ... do początku pętli for client_id in client_ids:.
