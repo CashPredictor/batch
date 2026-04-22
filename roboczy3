@@ -1,109 +1,357 @@
-Tak to finalnie powinno wyglądać w build_dataset_db.py — z użyciem tych dwóch plików SQL i bez starych params['idx_...'].
+Tak. Poniżej masz uporządkowaną, zaktualizowaną wersję.
 
-Wstaw ten fragment w miejsce całego starego bloku zaczynającego się od:
+Co zmieniamy
 
-offsets = [1, 2, 3, 6, 12]
-print("Rozpoczynam partiami wstawianie do 'extended_grouped_client_days_tab'...")
-...
-cursor.execute("SELECT data FROM swieta")
-holidays = {pd.Timestamp(row[0]) for row in cursor.fetchall()}
+1. swieta nie będą już seedowane z config.yaml, tylko z pliku:
+    data/swieta.csv
+2. aggregated_data_temp przenosimy do pliku SQL w schema
+3. dodatkowe indeksy, które wcześniej były tworzone w kodzie, też lecą z katalogu sql/indexes
+4. db_init.py ma już:
+    * nie używać params['query_*']
+    * nie używać params['idx_*']
+    * czytać SQL tylko z plików
+    * ładować święta z CSV
 
-Fragment do wklejenia
+⸻
 
-        print("Rozpoczynam partiami wstawianie do 'extended_grouped_client_days_tab'...")
-        select_year_month_sql = """
-            SELECT DISTINCT ROK, MIESIAC
-            FROM extended_grouped_client_days
-            WHERE INVO_CLNTNO = ?
-            ORDER BY ROK, MIESIAC
+1. Plik SQL dla aggregated_data_temp
+
+Dodaj do sql/schema nowy plik:
+
+000_create_aggregated_data_temp.sql
+
+zawartość:
+
+CREATE TABLE IF NOT EXISTS aggregated_data_temp (
+    DZIEN DATE NOT NULL,
+    DZIS_DZIEN_TYG INTEGER NOT NULL,
+    DZIS_SOBOTA INTEGER NOT NULL,
+    DZIS_NIEDZIELA INTEGER NOT NULL
+);
+
+To ma być przed 001_create_swieta.sql, więc numeracja 000_... jest dobra.
+
+⸻
+
+2. CSV ze świętami
+
+Założenie:
+
+* plik: data/swieta.csv
+* separator: przecinek
+* nagłówki:
+    * nazwa
+    * rodzaj
+    * data
+    * rok
+    * mies
+    * dzien
+    * dzien_tyg
+
+To jest OK.
+
+⸻
+
+3. Co jeszcze wyrzucamy z config.yaml
+
+Po tej zmianie z configa możesz już docelowo usunąć:
+
+* query_swieta
+* swieta_columns
+* swieta_rows
+* wszystkie query_create_*
+* wszystkie query_create_*view*
+* wszystkie idx_*
+
+W configu zostają tylko ścieżki typu:
+
+* sql_paths
+* ewentualnie data_paths
+
+⸻
+
+4. Zaktualizowany db_init.py
+
+Poniżej masz wersję pod nowe podejście.
+
+import argparse
+import csv
+import os
+import sqlite3
+import sys
+import yaml
+from pathlib import Path
+def load_sql_file(path: str) -> str:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"SQL file not found: {path}")
+    return p.read_text(encoding="utf-8")
+def exec_sql_file(conn: sqlite3.Connection, path: str) -> None:
+    sql = load_sql_file(path)
+    conn.executescript(sql)
+def exec_sql_dir(conn: sqlite3.Connection, dir_path: str) -> None:
+    sql_dir = Path(dir_path)
+    if not sql_dir.exists():
+        raise FileNotFoundError(f"SQL directory not found: {dir_path}")
+    for path in sorted(sql_dir.glob("*.sql")):
+        print(f"[INFO] Executing {path.name}")
+        exec_sql_file(conn, str(path))
+def load_config(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+def table_exists(cursor: sqlite3.Cursor, table_name: str) -> bool:
+    cursor.execute(
         """
-        insert_extended_sql = load_sql_file(f"{queries_dir}/insert_extended_grouped_client_days.sql")
-        insert_summary_sql = load_sql_file(f"{queries_dir}/insert_summary_client_days.sql")
-        # lista partii do przerobienia
-        cursor.execute(select_year_month_sql, (client_id,))
-        year_month_rows = cursor.fetchall()
-        # odświeżenie targetów dla klienta
-        cursor.execute("DELETE FROM extended_grouped_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
-        cursor.execute("DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table' AND name = ?
+        LIMIT 1
+        """,
+        (table_name,),
+    )
+    return cursor.fetchone() is not None
+def seed_swieta_from_csv(cursor: sqlite3.Cursor, csv_path: str) -> None:
+    path = Path(csv_path)
+    if not path.exists():
+        raise FileNotFoundError(f"CSV file with holidays not found: {csv_path}")
+    required_columns = ["nazwa", "rodzaj", "data", "rok", "mies", "dzien", "dzien_tyg"]
+    inserted = 0
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f, delimiter=",")
+        if reader.fieldnames is None:
+            raise RuntimeError(f"CSV has no header: {csv_path}")
+        missing = [c for c in required_columns if c not in reader.fieldnames]
+        if missing:
+            raise RuntimeError(
+                f"CSV {csv_path} does not contain required columns: {missing}. "
+                f"Found: {reader.fieldnames}"
+            )
+        for row in reader:
+            values = (
+                row["nazwa"],
+                row["rodzaj"],
+                row["data"],
+                int(row["rok"]) if row["rok"] not in (None, "") else None,
+                int(row["mies"]) if row["mies"] not in (None, "") else None,
+                int(row["dzien"]) if row["dzien"] not in (None, "") else None,
+                row["dzien_tyg"],
+            )
+            cursor.execute(
+                """
+                SELECT 1
+                FROM swieta
+                WHERE nazwa = ?
+                  AND rodzaj = ?
+                  AND data = ?
+                  AND rok = ?
+                  AND mies = ?
+                  AND dzien = ?
+                  AND dzien_tyg = ?
+                LIMIT 1
+                """,
+                values,
+            )
+            exists = cursor.fetchone() is not None
+            if not exists:
+                cursor.execute(
+                    """
+                    INSERT INTO swieta (nazwa, rodzaj, data, rok, mies, dzien, dzien_tyg)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+                inserted += 1
+    print(f"[OK] Seed swieta z CSV zakończony. Dodano {inserted} nowych rekordów.")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="SQLite DB schema initialization")
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--db-path", required=True)
+    args = parser.parse_args()
+    if os.path.exists(args.db_path):
+        print(f"[ERROR] Baza już istnieje: {args.db_path}")
+        sys.exit(1)
+    os.makedirs(os.path.dirname(args.db_path), exist_ok=True)
+    cfg = load_config(args.config)
+    sql_paths = cfg["sql_paths"]
+    schema_dir = sql_paths["schema_dir"]
+    views_dir = sql_paths["views_dir"]
+    indexes_dir = sql_paths["indexes_dir"]
+    # możesz trzymać też to w configu jako data_paths["swieta_csv"]
+    swieta_csv_path = cfg.get("data_paths", {}).get("swieta_csv", "data/swieta.csv")
+    conn = sqlite3.connect(args.db_path)
+    cursor = conn.cursor()
+    try:
+        # 1. Schema
+        exec_sql_dir(conn, schema_dir)
         conn.commit()
-        # 1) extended_grouped_client_days_tab
-        inserted_count = 0
-        for (year, month) in year_month_rows:
-            cursor.execute(insert_extended_sql, (year, month, params["od_dnia"], client_id))
+        # 2. Seed swieta z CSV
+        if table_exists(cursor, "swieta"):
+            seed_swieta_from_csv(cursor, swieta_csv_path)
             conn.commit()
-            row_count = cursor.rowcount if cursor.rowcount != -1 else 0
-            inserted_count += row_count
-            print(f"Wstawiono extended: ROK={year}, MIESIAC={month} -> {row_count} wierszy (narastająco={inserted_count})")
-        print(f"Extended zakończone. Łącznie wstawiono = {inserted_count}.")
-        print(datetime.now().strftime("%H:%M:%S"))
-        # 2) summary_client_days_tab
-        print("Rozpoczynam partiami wstawianie do 'summary_client_days_tab'...")
-        inserted_count = 0
-        for (year, month) in year_month_rows:
-            cursor.execute(insert_summary_sql, (year, month, client_id))
-            conn.commit()
-            row_count = cursor.rowcount if cursor.rowcount != -1 else 0
-            inserted_count += row_count
-            print(f"Wstawiono summary: ROK={year}, MIESIAC={month} -> {row_count} wierszy (narastająco={inserted_count})")
-        print(f"Summary zakończone. Łącznie wstawiono = {inserted_count}.")
-        print(datetime.now().strftime("%H:%M:%S"))
-        # Pobranie świąt (jeśli istnieją)
-        cursor.execute("SELECT data FROM swieta")
-        holidays = {pd.Timestamp(row[0]) for row in cursor.fetchall() if row[0] is not None}
+        else:
+            print("[WARN] Tabela 'swieta' nie istnieje po wykonaniu schema.")
+        # 3. Views
+        exec_sql_dir(conn, views_dir)
+        conn.commit()
+        # 4. Indexes
+        exec_sql_dir(conn, indexes_dir)
+        conn.commit()
+        print(f"[OK] Database schema initialized: {args.db_path}")
+    finally:
+        conn.close()
+if __name__ == "__main__":
+    main()
 
 ⸻
 
-Co z tego usuń
+5. Co ten kod zakłada o katalogach
 
-Usuń już całkowicie:
+Zakłada taki układ:
 
-offsets = [1, 2, 3, 6, 12]
+sql/schema
+sql/views
+sql/indexes
+data/swieta.csv
 
-Usuń też cały blok:
+albo, jeśli chcesz jawnie z configa:
 
-cursor.execute(params['idx_invo_debcno_invdate_etc'])
-cursor.execute(params['idx_invo_debcno_invdate'])
-cursor.execute(params['idx_summary_days_ids_dzien'])
-cursor.execute(params['idx_ext_days_ids_dzien'])
-cursor.execute(params['idx_clhs_joined_keys_datetime'])
-conn.commit()
-
-bo indeksy mają już być zakładane w db_init.py, nie tutaj.
-
-⸻
-
-Dlaczego tak
-
-To zachowuje starą logikę:
-
-* najpierw pobierasz listę (ROK, MIESIAC) z extended_grouped_client_days
-* potem czyścisz tabele docelowe dla klienta
-* potem lecisz partiami po miesiącach:
-    * najpierw extended_grouped_client_days_tab
-    * potem summary_client_days_tab
-
-I korzystasz już z plików:
-
-* insert_extended_grouped_client_days.sql
-* insert_summary_client_days.sql
+sql_paths:
+  schema_dir: sql/schema
+  views_dir: sql/views
+  indexes_dir: sql/indexes
+data_paths:
+  swieta_csv: data/swieta.csv
 
 ⸻
 
-Drobna uwaga
+6. Co usunąć z obecnego db_init.py
 
-To zapytanie:
+Usuń całkiem:
 
-select_year_month_sql = """
-    SELECT DISTINCT ROK, MIESIAC
-    FROM extended_grouped_client_days
-    WHERE INVO_CLNTNO = ?
-    ORDER BY ROK, MIESIAC
-"""
+* exec_sql
+* create_indexes
+* create_aggregated_data_temp_schema
+* seed_swieta(...) stare oparte o config
+* wszystkie wywołania:
+    * params.get("query_*")
+    * params['idx_*']
+    * ręczne cursor.execute("CREATE INDEX IF NOT EXISTS ...") dla rzeczy, które już wrzuciłeś do sql/indexes
 
-też możesz później wynieść do pliku, np.:
+⸻
 
-select_distinct_year_month_extended_grouped_client_days.sql
+7. Jak to ma teraz działać
 
-ale na teraz nie musisz. Ten fragment może spokojnie zostać inline.
+Kolejność:
 
-Jeśli chcesz, mogę teraz zrobić Ci jeszcze następny krok: wskazać dokładnie, które bloki w build_dataset_db.py zostały jeszcze do wyniesienia do plików SQL, a które warto już zostawić w Pythonie.
+1. tworzy DB
+2. wykonuje wszystko z sql/schema
+3. ładuje święta z data/swieta.csv
+4. wykonuje wszystko z sql/views
+5. wykonuje wszystko z sql/indexes
+
+To jest już spójne.
+
+⸻
+
+8. Ważna uwaga do Twojego obecnego db_init.py
+
+W tym, co wkleiłeś wcześniej, miałeś błąd:
+
+schema_dir = cfg["sql_paths"]["schema_dir"]
+views_dir = cfg["sql_paths"]["views_dir"]
+indexes_dir = cfg["sql_paths"]["indexes_dir"]
+exec_sql_dir(conn, schema_dir)
+exec_sql_dir(conn, views_dir)    
+exec_sql_dir(conn, indexes_dir)
+conn = sqlite3.connect(args.db_path)
+
+To jest niepoprawne, bo conn jest użyte zanim powstanie.
+
+W nowej wersji to jest już naprawione.
+
+⸻
+
+9. Dodatkowe pliki indeksów ze zdjęcia
+
+Na zdjęciu widać, że dodałeś też:
+
+* create_idx_dataset_inv_day.sql
+* create_idx_dataset_clear.sql
+* create_idx_summary_client_days_tab_one_for_all.sql
+* create_idx_group_cust_inv_days_year_month.sql
+* create_idx_invo_one_for_all.sql
+* create_idx_first_model_tab_runid.sql
+* create_idx_first_model_tab_client_day.sql
+* create_idx_first_model_tab_invoice.sql
+
+To bardzo dobrze — wtedy nie rób ich już w Pythonie. Wystarczy exec_sql_dir(conn, indexes_dir).
+
+Czyli po prostu trzymaj całość indeksów w sql/indexes.
+
+⸻
+
+10. Proponowane nazwy obiektów ↔ pliki
+
+Żeby było spójnie, ja bym przyjął taki wzorzec:
+
+schema
+
+* 000_create_aggregated_data_temp.sql
+* 001_create_swieta.sql
+* 002_create_invo.sql
+* 003_create_debc.sql
+* 004_create_clhs.sql
+* 005_create_dcmo.sql
+* 006_create_group_cust_inv_days.sql
+* 007_create_grouped_client_days.sql
+* 008_create_summary_client_days_tab.sql
+* 009_create_extended_grouped_client_days_tab.sql
+* 010_create_dataset_tab.sql
+* 011_create_dataset.sql
+* 012_create_first_model_tab.sql
+* 013_create_statystyki_faktur.sql
+
+views
+
+* 101_create_invo_view.sql
+* 102_create_clhs_view.sql
+* 103_create_debc_view.sql
+* 104_create_dcmo_view.sql
+* 105_create_invo_clhs_joined.sql
+* 106_create_summary_client_days_view.sql
+* 107_create_extended_grouped_client_days.sql
+
+indexes
+
+zostawiłbym tak jak masz:
+
+* create_idx_...sql
+
+To już jest czytelne.
+
+⸻
+
+11. Minimalny config po zmianie
+
+Przykład:
+
+sql_paths:
+  schema_dir: sql/schema
+  views_dir: sql/views
+  indexes_dir: sql/indexes
+data_paths:
+  swieta_csv: data/swieta.csv
+first_model_params:
+  database: ...
+  multi_client_excel_path: ...
+  od_dnia: ...
+  NUM_SHARDS: ...
+  excel_date_columns:
+    INVO: [...]
+    DEBC: [...]
+    CLHS: [...]
+    DCMO: [...]
+
+⸻
+
+Najkrócej: tak, teraz kierunek jest dobry — db_init.py powinien już iść wyłącznie w pliki + CSV dla świąt. Jeśli chcesz, mogę teraz od razu przygotować Ci też analogiczne odchudzenie build_dataset_db.py, żeby tam już nie było żadnych resztek po configowych SQL-ach.
