@@ -1,410 +1,234 @@
-Tak, sam Python wygląda już dużo lepiej. Teraz problem jest prawie na pewno w plikach SQL, nie w samej logice pythona.
+rozdzieliliśmy na 2 etapy:
+* 1.5 — domknięcie nowej logiki wspólnej bazy i procesu build
+* 1.6 — odchudzenie CreateDatabase.py, porządek parametrów, SQL-i i test zgodności ASOF vs FULL
 
-Co jest dobrze
+To jest sensowne, bo:
 
-To już masz sensownie poprawione:
-
-* zawężanie klientów po include/exclude
-* logowanie tylko wybranych klientów
-* kolejność przetwarzania po liczbie rekordów
-* ładowanie wielu zapytań z plików .sql
-* sklejanie query_stats_pivot_select.sql i query_dataset_raw_select.sql przez .format(...)
-
-To jest OK.
+* db_init.py i build_client_db.py już istnieją,
+* logika jednej bazy już działa 
+* odchudzony nowy CreateDatabase.py czyli build_dataset_db i config
+* runner_batch.py jeszcze nie jest konsekwentnie ustawiony pod model „jedna baza trainowa”.
+* skrypty w plikach
 
 ⸻
 
-Skąd błąd near "?": syntax error
+Co trzeba jeszcze odchudzać z CreateDatabase.py i dlaczego
 
-Ten błąd oznacza, że w invo_select.sql masz SQL, który zawiera ?, ale w miejscu niepoprawnym składniowo.
+2. Wyrzuciłem z pliku build_dataset_db niepotrzebny kod
 
-Błąd jest tutaj:
 
-query_invo = load_sql_file(f"{queries_dir}/invo_select.sql")
-cursor.execute(query_invo, (params['od_dnia'], client_id))
+3. Przerzuciłem SELECT-y z build_dataset_db do configa
 
-Czyli plik invo_select.sql musi być:
+To jest dobry ruch, ale z umiarem.
 
-* gotowym SQL-em dla sqlite
-* z placeholderami ?
-* bez żadnych {...}
+Co warto przenieść
 
-Najczęstsze błędy w takim pliku to np.:
+Te zapytania, które są:
 
-DATE ?                  -- źle
-DATE(?                  -- źle, brak )
-AND INVO_CLNTNO = ?,    -- źle, przecinek
-WHERE ... ? ... ? ...   -- zła kolejność albo zły operator
+* duże,
+* biznesowe,
+* tabelaryczne,
+* dotyczą logiki danych, a nie sterowania procesem.
 
-⸻
+Przykłady:
 
-Zasada: gdzie ?, a gdzie {}
+* query_invo
+* query_faktury_tpl
+* selecty do grouped_client_days
+* selecty do extended_grouped_client_days_tab
+* selecty do summary_client_days_tab
+* selecty używane do budowy dataset_tab
 
-Używaj ? tylko tam, gdzie potem robisz:
+Czego nie warto przenosić
 
-* cursor.execute(sql, (...))
-* pd.read_sql_query(sql, conn, params=(...))
+Bardzo prostych, technicznych zapytań typu:
 
-Czyli dla zapytań wykonywanych bezpośrednio przez sqlite.
+* DELETE FROM ... WHERE INVO_CLNTNO = ?
+* SELECT MIN(DZIEN), MAX(DZIEN) ...
+* PRAGMA table_info(...)
 
-Używaj {} tylko tam, gdzie wcześniej robisz:
-
-* sql = sql_template.format(...)
-
-Czyli do wstrzykiwania fragmentów SQL, takich jak:
-
-* całe warunki AND ...
-* całe subquery
-* całe joiny
-* kawałki WHERE ...
-* shard conditions
-
-Nigdy nie mieszaj tego tak, że do sqlite trafia surowe {...}.
+To nie jest logika biznesowa, tylko techniczna obsługa procesu. Tego nie warto pchać do configa.
 
 ⸻
 
-W Twoim kodzie: które pliki mają mieć ?, a które {}
+4. Ujednoliciłem przekazywanie parametrów do build_dataset_db
 
-Pliki, które powinny mieć tylko ? i żadnych {}
 
-1. invo_select.sql
+zrobione: Zostawić jeszcze SQL-e poza kodem, ale wydzielić je z config.yaml do osobnych plików, np.:
 
-Wywołanie:
+* sql/sqlite/schema/*.sql
+* sql/sqlite/views/*.sql
+* sql/sqlite/selects/*.sql
+* sql/sqlite/indexes/*.sql
 
-cursor.execute(query_invo, (params['od_dnia'], client_id))
+Etap 1.5 — dokładny plan działań
 
-Więc w pliku mają być dokładnie 2 placeholdery ? i w tej kolejności:
+to co powyżej zrobione, zostało po tych zmianach:
 
-1. od_dnia
-2. client_id
+4. Test procesu
 
-Przykład poprawny:
+Uruchomić pełny test:
 
-SELECT
-    INVO_NO,
-    INVO_ADMNO,
-    INVO_CLNTNO,
-    INVO_DEBH_NO,
-    INVO_DEBC_NO,
-    INVO_INVDATE,
-    INVO_FINALPAYMENTDATE
-FROM invo_view
-WHERE INVO_INVDATE IS NOT NULL
-  AND DATE(INVO_INVDATE) >= DATE(?)
-  AND INVO_CLNTNO = ?
+1. db_init
+2. build_client_db
+3. runner_batch
 
-⸻
+5. Kryterium końca 1.5
 
-2. group_cust_inv_days_select.sql
-
-Wywołanie:
-
-pd.read_sql_query(grouped_query, conn, params=(client_id,))
-
-Czyli w pliku ma być 1 sztuka ?:
-
-1. client_id
-
-Przykład:
-
-SELECT
-    g.INVO_ADMNO,
-    g.INVO_CLNTNO,
-    g.INVO_DEBH_NO,
-    g.INVO_DEBC_NO,
-    g.DZIEN,
-    g.MIESIAC,
-    g.ROK
-FROM group_cust_inv_days g
-WHERE g.INVO_CLNTNO = ?
-GROUP BY
-    g.INVO_ADMNO,
-    g.INVO_CLNTNO,
-    g.INVO_DEBH_NO,
-    g.INVO_DEBC_NO,
-    g.DZIEN,
-    g.MIESIAC,
-    g.ROK
+* jedna wspólna baza jest tworzona i uzupełniana poprawnie,
+* wielu klientów może być załadowanych do jednej bazy,
+* train działa na jednej wspólnej bazie,
+* test działa w obecnym trybie pomostowym,
+* nie ma już błędów wynikających z reliktów po per-client DB w build flow.
+* model nie działa poprawnie - słabe ACC
 
 ⸻
 
-3. insert_extended_grouped_client_days.sql
+Etap 1.6 — dokładny plan działań
 
-Wywołanie:
+3. Ujednolicić wejście do buildera
 
-cursor.execute(insert_extended_sql, (year, month, params["od_dnia"], client_id))
+Zamiast mieszaniny parametrów:
 
-Czyli w pliku mają być 4 placeholdery ? w kolejności:
+* uprościć interfejs funkcji buildującej,
+* jasno rozdzielić:
+    * parametry runtime,
+    * parametry danych,
+    * parametry procesu.
 
-1. year
-2. month
-3. od_dnia
-4. client_id
+coś jeszcze?
 
-Plik:
+6. Test zgodności dataset ASOF vs FULL
 
-INSERT INTO extended_grouped_client_days_tab
-SELECT *
-FROM extended_grouped_client_days
-WHERE ROK = ?
-  AND MIESIAC = ?
-  AND DATE(DZIEN) >= DATE(?)
-  AND INVO_CLNTNO = ?
+Po zmianach trzeba wykonać kontrolę:
 
-⸻
+* porównać dataset ze starej poprawnej bazy
+* z dataset nowej bazy po refaktorze
+* uwzględniając INVO_CLNTNO w kluczu porównania
 
-4. insert_summary_client_days.sql
+To jest idealny test końca 1.6, bo sprawdza efekt całego ETL.
 
-Wywołanie:
+Kryterium końca 1.6
 
-cursor.execute(insert_summary_sql, (year, month, client_id))
-
-Czyli w pliku mają być 3 placeholdery ?:
-
-1. year
-2. month
-3. client_id
-
-Plik:
-
-INSERT INTO summary_client_days_tab
-SELECT *
-FROM summary_client_days_view
-WHERE ROK = ?
-  AND MIESIAC = ?
-  AND INVO_CLNTNO = ?
+* plik buildujący bazę jest krótszy, czytelniejszy i ma jedną odpowiedzialność,
+* stare tryby nie zaśmiecają aktywnego flow,
+* duże SQL-e są wyciągnięte z kodu,
+* runner_batch.py jest spójniejszy z modelem jednej wspólnej bazy,
+* test dataset ASOF vs FULL przechodzi albo daje wyjaśnione różnice.
 
 ⸻
 
-5. select_faktury.sql
+Etap 2 — struktura kodu
 
-Wywołanie:
+Cel
 
-pd.read_sql_query(
-    sql,
-    conn,
-    params=(
-        end_day,
-        invo_admno,
-        invo_clntno,
-        invo_debh_no,
-        invo_debc_no,
-        start_day,
-        end_day,
-        start_day,
-        end_day,
-    )
-)
+Ustawić projekt w sensowną strukturę modułów, żeby dało się go dalej rozwijać i migrować.
 
-Czyli w pliku musi być 9 placeholderów ? dokładnie w tej kolejności:
+Główne działania
 
-1. end_day
-2. invo_admno
-3. invo_clntno
-4. invo_debh_no
-5. invo_debc_no
-6. start_day
-7. end_day
-8. start_day
-9. end_day
+* rozdzielić:
+    * entrypointy,
+    * build/ETL,
+    * model execution,
+    * storage/db helpers,
+    * query layer,
+    * config/runtime settings
+* wydzielić np.:
+    * app/build/
+    * app/model/
+    * app/db/
+    * app/sql/
+    * app/config/
+    * legacy/
+* przenieść stare pliki do legacy, jeśli nie są już aktywne
+* ustalić jeden aktywny flow uruchamiania
 
-Przykład poprawny:
+Efekt
 
-WITH invo_base AS (
-    SELECT
-        INVO_ADMNO,
-        INVO_CLNTNO,
-        INVO_DEBH_NO,
-        INVO_DEBC_NO,
-        INVO_AINITIALH,
-        INVO_INVDATE,
-        CASE
-            WHEN INVO_FINALPAYMENTDATE IS NOT NULL
-             AND DATE(INVO_FINALPAYMENTDATE) < DATE(?)
-            THEN INVO_FINALPAYMENTDATE
-            ELSE NULL
-        END AS INVO_FINALPAYMENTDATE,
-        INVO_DUEDATE
-    FROM invo_view
-    WHERE INVO_ADMNO = ?
-      AND INVO_CLNTNO = ?
-      AND INVO_DEBH_NO = ?
-      AND INVO_DEBC_NO = ?
-)
-SELECT
-    INVO_ADMNO,
-    INVO_CLNTNO,
-    INVO_DEBH_NO,
-    INVO_DEBC_NO,
-    INVO_AINITIALH,
-    INVO_INVDATE,
-    INVO_FINALPAYMENTDATE,
-    INVO_DUEDATE
-FROM invo_base
-WHERE
-      (INVO_DUEDATE IS NOT NULL
-       AND DATE(INVO_DUEDATE) BETWEEN DATE(?) AND DATE(?))
-   OR (INVO_FINALPAYMENTDATE IS NOT NULL
-       AND DATE(INVO_FINALPAYMENTDATE) BETWEEN DATE(?) AND DATE(?))
+Projekt przestaje być zbiorem ciężkich skryptów, a zaczyna być podzieloną aplikacją batchową.
 
 ⸻
 
-Pliki, które powinny mieć {}
+Etap 3 — schema + Alembic
 
-To są tylko te, które najpierw sklejasz przez .format(...).
+Tak, ten etap warto dać przed konteneryzacją, bo wtedy konteneryzujesz już coś architektonicznie czystszego.
 
-6. query_stats_pivot_select.sql
+Cel
 
-Tu powinny być {client_filter} i {shard_condition}.
+Wprowadzić jawny, wersjonowany schemat trwałej bazy.
 
-Bo robisz:
+Główne działania
 
-stats_pivot_sql = stats_pivot_sql.format(
-    client_filter=client_filter_sql,
-    shard_condition=shard_condition_sql,
-)
+* zidentyfikować tabele trwałe vs stagingowe
+* zdecydować, które obiekty:
+    * są tylko techniczne,
+    * są runtime build artifacts,
+    * są trwałym modelem danych
+* przygotować definicje trwałego schematu
+* wprowadzić:
+    * SQLAlchemy dla warstwy schematu
+    * Alembic dla migracji
+* ustalić rozdział:
+    * staging / transient
+    * durable schema
 
-Czyli ten plik nie powinien być wykonywany bezpośrednio przez sqlite.
+Efekt
 
-Przykład:
+Masz już:
 
-SELECT
-    g.INVO_ADMNO,
-    g.INVO_CLNTNO,
-    g.INVO_DEBH_NO,
-    g.INVO_DEBC_NO,
-    g.DZIEN
-FROM group_cust_inv_days g
-LEFT JOIN statystyki_faktur stats_pivot
-    ON g.INVO_ADMNO = stats_pivot.INVO_ADMNO
-   AND g.INVO_CLNTNO = stats_pivot.INVO_CLNTNO
-   AND g.INVO_DEBH_NO = stats_pivot.INVO_DEBH_NO
-   AND g.INVO_DEBC_NO = stats_pivot.INVO_DEBC_NO
-   AND DATE(g.DZIEN) = DATE(stats_pivot.DZIEN)
-WHERE {shard_condition}
-{client_filter}
-GROUP BY
-    g.INVO_ADMNO,
-    g.INVO_CLNTNO,
-    g.INVO_DEBH_NO,
-    g.INVO_DEBC_NO,
-    g.DZIEN
+* wersjonowany schemat,
+* kontrolowane zmiany,
+* fundament pod PostgreSQL.
 
 ⸻
 
-7. query_dataset_raw_select.sql
+Etap 4 — PostgreSQL w cloud SQL
 
-Tu też powinny być {stats_pivot_select}, {client_filter}, {shard_condition}.
+Cel
 
-Bo robisz:
+Przenieść aktywny MVP flow ze SQLite na PostgreSQL w cloud SQL.
 
-dataset_raw_sql = dataset_raw_sql.format(
-    stats_pivot_select=stats_pivot_sql,
-    client_filter=client_filter_sql,
-    shard_condition=shard_condition_sql,
-)
+Główne działania
 
-Czyli ten plik też jest template.
+* zastąpić sqlite3 warstwą zgodną z PostgreSQL
+* usunąć zależności od:
+    * PRAGMA
+    * SQLite-specific SQL
+    * SQLite-specific typów i adapterów
+* przepisać problematyczne query
+* potwierdzić, że:
+    * build działa,
+    * first_model działa,
+    * wyniki są zgodne funkcjonalnie
 
-⸻
+Efekt
 
-Najważniejsze: kolejność argumentów
-
-invo_select.sql
-
-(params['od_dnia'], client_id)
-
-więc SQL:
-
-... DATE(?) ... = ?
-
-group_cust_inv_days_select.sql
-
-(client_id,)
-
-insert_extended_grouped_client_days.sql
-
-(year, month, params["od_dnia"], client_id)
-
-insert_summary_client_days.sql
-
-(year, month, client_id)
-
-select_faktury.sql
-
-(
-    end_day,
-    invo_admno,
-    invo_clntno,
-    invo_debh_no,
-    invo_debc_no,
-    start_day,
-    end_day,
-    start_day,
-    end_day,
-)
+Aplikacja nadal działa lokalnie, ale już na bazie zgodnej z docelowym kierunkiem czyli w cloud SQL tylko w testowym schemacie do migracji na dev
 
 ⸻
 
-Co jeszcze sprawdzić u Ciebie teraz
+Etap 5 — konteneryzacja
 
-1. invo_select.sql
+Dopiero teraz ma to większy sens.
 
-To jest teraz główny podejrzany.
+Cel
 
-Sprawdź, czy tam nie ma:
+Spakować już uporządkowaną aplikację do kontenera.
 
-* {...}
-* DATE ?
-* INVO_CLNTNO == ?
-* średnika w złym miejscu
-* przecinka po ?
-* WHERE AND ...
+Główne działania
 
-2. query_stats_pivot_select.sql i query_dataset_raw_select.sql
+* przygotować Dockerfile
+* usunąć zależności od lokalnych ścieżek
+* wystawić parametry przez:
+    * CLI
+    * env vars
+* upewnić się, że:
+    * db_init
+    * build_client_db
+    * runner_batch
+        mogą działać jako kontenerowe joby
+* przygotować minimalny obraz uruchomieniowy
 
-Tam {} są OK, ale nie może być przypadkiem ? w liczbie niezgodnej z tym, co potem przekazujesz.
+Efekt
 
-Po finalnym .format(...) do cursor.execute() trafia 6 parametrów:
-
-(
-    client_id,
-    current_date.strftime('%Y-%m-%d'),
-    next_date.strftime('%Y-%m-%d'),
-    client_id,
-    current_date.strftime('%Y-%m-%d'),
-    next_date.strftime('%Y-%m-%d'),
-)
-
-Czyli po sklejeniu finalny SQL musi mieć dokładnie 6 sztuk ?:
-
-* 3 dla stats_pivot_select
-* 3 dla części głównej dataset_raw_select
-
-⸻
-
-Czy sam Python jest już dobrze?
-
-Prawie tak. Z rzeczy do poprawy widzę tylko jedno praktyczne:
-
-Masz:
-
-read_duration = time.time() - start_read_time
-
-i nigdzie tego nie używasz. To tylko relikt, możesz usunąć.
-
-Poza tym ten fragment z klientami jest już OK.
-
-⸻
-
-Najkrótsza odpowiedź
-
-Masz teraz dobrze w Pythonie, ale:
-
-* pliki wykonywane przez cursor.execute(..., params) albo read_sql_query(..., params=...) muszą mieć tylko ?
-* pliki składane przez .format(...) muszą mieć tylko {...} dla fragmentów SQL
-* obecny błąd siedzi prawie na pewno w invo_select.sql
-
-Jeżeli chcesz, w następnym kroku mogę Ci rozpisać gotową checklistę plik po pliku w formacie:
-
-nazwa_pliku -> ma mieć placeholdery: ... -> kolejność parametrów: ... -> przykład treści
+Masz batchową aplikację możliwą do lokalnego uruchamiania w Dockerze i gotową pod późniejszy deployment.
