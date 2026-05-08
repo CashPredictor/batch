@@ -1,1194 +1,1129 @@
-# first_model.py
-import pandas as pd
-import numpy as np
-import torch
+#build_dataset_db.py
 import os
+import importlib
+import sqlite3
+import pandas as pd
+from datetime import datetime, timedelta, date
+import time
+import numpy as np
+import yaml
+import glob
 import logging
+import re
+import sys
+from db_init import load_sql_file
+from pathlib import Path
+
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
 import warnings
-from torch.utils.data import TensorDataset, DataLoader
-from torch import nn
-import torch.nn.functional as F
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from scipy.stats import skew, kurtosis, mode
-import matplotlib.pyplot as plt
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message="The behavior of DataFrame concatenation with empty or all-NA entries is deprecated"
+)
 
-from mpl_toolkits.mplot3d import Axes3D
-from importlib import reload
-from database import read_data_from_db, write_output_to_db, read_data_from_all_db
-from datetime import datetime, timedelta
-from captum.attr import IntegratedGradients
-import math
+EXCEL_ORIGIN = "1899-12-30"  # standard dla pandas (Excel 1900 system)
 
-class NoDataError(Exception):
-    """Raised when query returns 0 rows for given client/time window."""
-    pass
-    
-def cap_fraction_power(n_clients: int,
-                       alpha: float = 0.5,
-                       min_frac: float = 0.05,
-                       max_frac: float = 1.0) -> float:
-    """
-    Power-law cap:
-      f(n) = c * n^(-alpha)
-    z ograniczeniami [min_frac, max_frac]
-    """
-    if n_clients <= 0:
-        return max_frac
-
-    frac = n_clients ** (-alpha)
-    frac = min(max_frac, frac)
-    frac = max(min_frac, frac)
-    return float(frac)
-    
-def explain_model_with_captum(model, X, device):
-    # Captum oczekuje skalaru; owijamy model tak, by zwracał wyłącznie głowę regresji jako [B,1]
-    class _RegWrapper(nn.Module):
-        def __init__(self, base):
-            super().__init__()
-            self.base = base
-        def forward(self, x):
-            reg_pred, _ = self.base(x)  # model multi-head zwraca (reg, logits)
-            return reg_pred.unsqueeze(-1)
-
-    X = X.to(device)
-    wrapped = _RegWrapper(model).to(device)
-    ig = IntegratedGradients(wrapped)
-    attributions, _ = ig.attribute(X, target=0, return_convergence_delta=True)
-    attributions_np = attributions.detach().cpu().numpy()
-    return attributions_np
-
-def aggregate_attributions(attributions_list, feature_names):
-    # Łączenie wszystkich wyników z batchy w jeden numpy array
-    all_attributions = np.concatenate(attributions_list, axis=0)
-
-    # Tworzenie DataFrame z wynikami
-    df_attributions = pd.DataFrame(all_attributions, columns=feature_names)
-
-    # Obliczanie zagregowanych wartości istotności (avg, min, max, std)
-    df_agg = pd.DataFrame({
-        'Feature': feature_names,  # Dodanie nazw kolumn
-        'avg_importance': df_attributions.mean(),
-        'std_importance': df_attributions.std(),
-        'min_importance': df_attributions.min(),
-        'max_importance': df_attributions.max()
-    })
-
-    # Dodawanie kolumn z wartościami bezwzględnymi
-    df_agg['abs_avg_importance'] = df_agg['avg_importance'].abs()
-    df_agg['abs_std_importance'] = df_agg['std_importance'].abs()
-    df_agg['abs_min_importance'] = df_agg['min_importance'].abs()
-    df_agg['abs_max_importance'] = df_agg['max_importance'].abs()
-
-    # Sortowanie według avg_importance malejąco
-    df_agg = df_agg.sort_values(by='avg_importance', ascending=False)
-
-    return df_agg
-
-class NeuralNetModel1(nn.Module):
-    def __init__(self, input_size, hidden_layers, output_size, n_classes=181, keep_regression_head=True):
-        super(NeuralNetModel1, self).__init__()
-        self.hidden_layer_1 = nn.Linear(input_size, hidden_layers[0])
-        self.hidden_layer_2 = nn.Linear(hidden_layers[0], hidden_layers[1])
-        self.hidden_layer_3 = nn.Linear(hidden_layers[1], hidden_layers[2])
-        self.hidden_layer_4 = nn.Linear(hidden_layers[2], output_size)
-        self.hidden_activation = nn.ReLU()
-
-        # --- Głowy wyjściowe ---
-        self.keep_regression_head = keep_regression_head
-        if keep_regression_head:
-            self.out = nn.Linear(output_size, 1)      # STARE: ciągła liczba dni
-        self.cls_head = nn.Linear(output_size, n_classes)  # NOWE: klasy 0..N (N = koszyk N+)
-
-    def forward(self, x):
-        x = self.hidden_layer_1(x)
-        x = self.hidden_layer_2(x)
-        x = self.hidden_layer_3(x)
-        x = self.hidden_layer_4(x)
-        h = self.hidden_activation(x)
-
-        logits = self.cls_head(h)                    # [B, N+1]
-        if self.keep_regression_head:
-            reg = self.out(h).squeeze(-1)           # [B]
-        else:
-            reg = None
-        return reg, logits
-
-class CustomLossModel1(nn.Module):
-    def __init__(self):
-        super(CustomLossModel1, self).__init__()
-        self.mse_loss = nn.MSELoss()
-
-    def forward(self, y_pred, y_true):
-        mse = self.mse_loss(y_pred, y_true)
-        total_loss = mse
-
-        return total_loss
-
-def get_modulo_condition(row_count, limit, invo_no_col, d=0):
-    """
-    Zwraca (divisor, condition_sql).
-    - Jeśli row_count <= limit → (None, "").
-    - Gdy nadmiar jest mały (row_count/limit ≤ 2): odrzucamy co g-ty wiersz:  AND (INVO_NO % g != 0)
-    - Gdy nadmiar jest duży (row_count/limit > 2): zostawiamy co k-ty wiersz: AND (INVO_NO % k = 0)
-    """
-    if limit is None or limit <= 0 or row_count <= limit:
-        return None, ""
-
-    over = row_count - limit
-    # Próg: gdy wierszy jest co najwyżej 2x więcej niż limit, lepsze jest „odrzucanie co g-ty”
-    if row_count / limit <= 2:
-        # Chcemy odrzucić ~over wierszy → g ≈ row_count / over
-        g = max(2, row_count // over)  # floor
-        # Korekta: upewnij się, że po odrzuceniu nie przekroczymy limitu
-        # (przybliżenie: zostaje row_count - floor(row_count/g))
-        while row_count - (row_count // g) > limit:
-            g += 1
-        condition_sql = f"AND (({invo_no_col} % {g}) != {d})"  # odrzucamy co g-ty
-        return g, condition_sql
-    else:
-        # Chcemy zostawić ~limit wierszy → k ≈ ceil(row_count / limit)
-        k = math.ceil(row_count / limit)
-        # Korekta: upewnij się, że po zostawieniu co k-tych nie przekroczysz limitu
-        # (przybliżenie: zostaje floor(row_count/k))
-        while (row_count // k) > limit:
-            k += 1
-        condition_sql = f"AND (({invo_no_col} % {k}) = {d})"  # zostawiamy co k-ty
-        return k, condition_sql
-
-def _parse_test_ids(raw_ids):
-    """
-    Akceptuje: None / 'ALL' / 'all' / liczba / '6017' / '6017,619' / '[6017, 619]'
-    Zwraca: list[int] lub None (dla ALL).
-    """
-    if raw_ids is None:
-        return None
-    if isinstance(raw_ids, (list, tuple, set)):
-        ids = [int(x) for x in raw_ids]
-        return ids if len(ids) > 0 else None
-    s = str(raw_ids).strip()
-    if s.lower() in ("all", ""):
-        return None
-    # lista w stringu
-    if s.startswith("[") and s.endswith("]"):
-        import ast
-        try:
-            arr = ast.literal_eval(s)
-            return [int(x) for x in arr]
-        except Exception:
-            pass
-    # csv
-    if "," in s:
-        return [int(x.strip()) for x in s.split(",") if x.strip()]
-    # pojedyncza liczba
-    try:
-        return [int(s)]
-    except ValueError:
-        return None
-
-def build_client_filter_sql(params, currently_testing=False):
-    default_col = "INVO_CLNTNO"
-    if currently_testing:
-        col = params.get("test_client_id_column", default_col)
-        ids = params.get("test_client_id")
-    else:
-        col = params.get("train_client_id_column", default_col)
-        ids = params.get("train_client_id")
-    if not ids:
-        return ""
-    if not isinstance(ids, list):
-        ids = [ids]
-    ids = [int(x) for x in ids if x is not None]
-    if not ids:
-        return ""
-    ids_sql = ",".join(str(i) for i in ids)
-    return f" AND {col} IN ({ids_sql})"
-
-def preprocess_data_model1(data_start, data_end, params, operation_mode='test', currently_testing=False, train_on_all=False):
-    query_template = params['sql_query_train'] if not currently_testing else params['sql_query_test']
-    base_query = query_template.format(data_start=data_start, data_end=data_end).rstrip().rstrip(";")
-
-    # 1) klient-filter (jeśli masz) MUSI być doklejony do base_query i do countów
-    client_filter_sql = build_client_filter_sql(params, currently_testing=currently_testing)
-    if client_filter_sql:
-        base_query_with_filter = f"{base_query}\n{client_filter_sql}"
-        logging.info(f"[first_model] Using client filter: {client_filter_sql}")
-    else:
-        base_query_with_filter = base_query
-        logging.info("[first_model] Client filter: ALL (no filtering)")
-
-    # 2) policz row_count bazowego selekta (to jest "przed dodaniem warunku 10%")
-    base_count_query = f"SELECT COUNT(*) as row_count FROM ({base_query_with_filter}) q"
-    df_base_count = read_data_from_db(base_count_query, params, currently_testing=currently_testing)
-    row_count_base = int(df_base_count['row_count'].iloc[0])
-
-    # 3) build query (na start = bazowy)
-    query = base_query_with_filter
-
-    # 4) TRAIN-ONLY: cap per klient = 10% globalnego wyniku bazowego
-    if operation_mode == 'train':
-        per_client_count_query = f"""
-        SELECT INVO_CLNTNO, COUNT(*) AS cnt
-        FROM ({base_query_with_filter}) q
-        GROUP BY INVO_CLNTNO
+def sqlite_object_exists(cursor, obj_type: str, name: str) -> bool:
+    cursor.execute(
         """
-        df_pc = read_data_from_db(per_client_count_query, params, currently_testing=currently_testing)
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = ? AND name = ?
+        LIMIT 1
+        """,
+        (obj_type, name),
+    )
+    return cursor.fetchone() is not None
+
+
+def validate_required_schema_for_create_database(cursor) -> None:
+    required_tables = [
+        "invo",
+        "debc",
+        "clhs",
+        "dcmo",
+        "group_cust_inv_days",
+        "grouped_client_days",
+        "summary_client_days_tab",
+        "extended_grouped_client_days_tab",
+        "dataset_tab",
+        "dataset",
+        "INVO_CLHS_JOINED_TAB",
+        "swieta",
+        "aggregated_data_temp",
+        "statystyki_faktur",
+    ]
+
+    required_views = [
+        "invo_view",
+        "clhs_view",
+        "DEBC_view",
+        "dcmo_view",
+        "INVO_CLHS_JOINED",
+        "summary_client_days_view",
+        "extended_grouped_client_days",
+    ]
+
+    missing_tables = [
+        name for name in required_tables
+        if not sqlite_object_exists(cursor, "table", name)
+    ]
+    missing_views = [
+        name for name in required_views
+        if not sqlite_object_exists(cursor, "view", name)
+    ]
+
+    if missing_tables or missing_views:
+        parts = []
+        if missing_tables:
+            parts.append(f"brak tabel: {', '.join(missing_tables)}")
+        if missing_views:
+            parts.append(f"brak widoków: {', '.join(missing_views)}")
+
+        raise RuntimeError(
+            "Baza nie ma pełnego schematu wymaganego przez build_dataset_db; "
+            "najpierw uruchom DBInit. " + " | ".join(parts)
+        )
+
+def _coerce_excel_date_series(s: pd.Series) -> pd.Series:
+    """
+    Konwertuje serię, która może zawierać:
+    - excel seriale (float/int lub "45911.25" jako string) -> datetime
+    - normalne stringi dat -> datetime
+    - braki / śmieci -> NaT
+    """
+    if s is None:
+        return s
+
+    # Zrób kopię
+    s2 = s.copy()
+
+    # 1) spróbuj wyciągnąć liczby (seriale)
+    num = pd.to_numeric(s2, errors="coerce")
+
+    # seriale: w tym miejscu nie musimy strzelać widełkami,
+    # bo i tak robimy to TYLKO dla kolumn z konfiguracji.
+    mask_num = num.notna()
+
+    out = pd.Series(pd.NaT, index=s2.index, dtype="datetime64[ns]")
+
+    # Excel serial -> datetime (część dziesiętna to czas)
+    if mask_num.any():
+        out.loc[mask_num] = pd.to_datetime(
+            num.loc[mask_num],
+            unit="D",
+            origin=EXCEL_ORIGIN,
+            errors="coerce"
+        )
+
+    # 2) reszta -> klasyczny parser dat
+    mask_other = ~mask_num
+    if mask_other.any():
+        out.loc[mask_other] = pd.to_datetime(s2.loc[mask_other], errors="coerce")
+
+    return out
+
+
+def normalize_excel_date_columns(
+    df: pd.DataFrame,
+    date_cols: list[str] | None
+) -> pd.DataFrame:
+    """
+    Jeśli date_cols jest puste / None -> nic nie rób.
+    Dla każdej kolumny z listy: konwersja excel serial / string -> datetime.
+    """
+    if df is None or not isinstance(df, pd.DataFrame):
+        return df
+    if not date_cols:  # None lub [] lub ""
+        return df
+
+    for col in date_cols:
+        if col in df.columns:
+            df[col] = _coerce_excel_date_series(df[col])
+
+    return df
+
+
+def apply_excel_date_config(
+    dfs_by_name: dict[str, pd.DataFrame],
+    params: dict
+) -> dict[str, pd.DataFrame]:
+    """
+    Czyta params['excel_date_columns'] (mapa: tabela -> lista kolumn)
+    i stosuje konwersję tylko tam, gdzie jest definicja.
+    Jeśli brak definicji -> pomija.
+    """
+    mapping = (params or {}).get("excel_date_columns")
+    if not mapping or not isinstance(mapping, dict):
+        return dfs_by_name  # brak konfiguracji => nic nie robimy
+
+    for table_name, df in dfs_by_name.items():
+        cols = mapping.get(table_name)
+        if cols:  # tylko jeśli lista niepusta
+            dfs_by_name[table_name] = normalize_excel_date_columns(df, cols)
+
+    return dfs_by_name
+
+def load_excel_sheets(file_path, params=None):
+    sheet_names = ['INVO', 'DEBC', 'CLHS', 'DCMO']
+    dfs = pd.read_excel(file_path, sheet_name=sheet_names)
+
+    # Uporządkuj do dict (żeby łatwo mapować po nazwie tabeli)
+    dfs_by_name = {
+        'INVO': dfs.get('INVO'),
+        'DEBC': dfs.get('DEBC'),
+        'CLHS': dfs.get('CLHS'),
+        'DCMO': dfs.get('DCMO'),
+    }
+
+    # Konwersja dat wg konfiguracji (jeśli brak/ puste -> nic nie robi)
+    dfs_by_name = apply_excel_date_config(dfs_by_name, params or {})
+
+    return dfs_by_name['INVO'], dfs_by_name['DEBC'], dfs_by_name['CLHS'], dfs_by_name['DCMO']
+
+
+def _to_date_str(d) -> str:
+    """Zwraca 'YYYY-MM-DD' niezależnie czy d to date/datetime/str."""
+    if isinstance(d, datetime):
+        return d.strftime("%Y-%m-%d")
+    if isinstance(d, date):
+        return d.strftime("%Y-%m-%d")
+    # string lub coś innego: spróbuj przyciąć do 10 znaków (YYYY-MM-DD)
+    s = str(d)
+    return s[:10]
+
+# Funkcja generująca wiersze
+def generate_dates(start_date, end_date):
+    rows = []
     
-        # 2) lista klientów pochodzi z danych (to jest dawny CAPPED_CLIENTS)
-        capped_clients = sorted(df_pc["INVO_CLNTNO"].astype(int).unique().tolist())
-        clients_csv = ",".join(str(x) for x in capped_clients)
+    current_date = datetime.strptime(start_date, "%Y-%m-%d")
+    end_date = datetime.strptime(end_date, "%Y-%m-%d")
+
+    while current_date <= end_date:
+        dzien = current_date.strftime("%Y-%m-%d")
+        dzis_dzien_tyg = current_date.isoweekday()  # 1 = poniedziałek, 7 = niedziela
+        dzis_sobota = 1 if dzis_dzien_tyg == 6 else 0
+        dzis_niedziela = 1 if dzis_dzien_tyg == 7 else 0
+
+        rows.append((dzien, dzis_dzien_tyg, dzis_sobota, dzis_niedziela))
+        current_date += timedelta(days=1)
+
+    return rows
+
+def remove_case_insensitive_duplicate_columns(df):
+    """
+    Usuwa powielone kolumny w DataFrame, ignorując różnice w wielkości liter, zachowując pierwsze wystąpienie.
     
-        # 3) dynamiczny cap_frac zależny od liczby klientów
-        n_clients = len(capped_clients)
-        cap_frac = cap_fraction_power(n_clients, alpha=0.5, min_frac=0.05)
-        cap_global = max(1, int(row_count_base * cap_frac))
+    :param df: Pandas DataFrame
+    :return: DataFrame z unikalnymi kolumnami
+    """
+    # Tworzymy mapę nazw kolumn w małych literach do ich pierwszego wystąpienia
+    lowercase_columns_map = {}
+    columns_to_drop = []
+
+    for col in df.columns:
+        col_lower = col.lower()
+        if col_lower not in lowercase_columns_map:
+            lowercase_columns_map[col_lower] = col
+        else:
+            # Jeśli nazwa już występuje w innej wersji (case-insensitive), dodajemy do usunięcia
+            columns_to_drop.append(col)
     
-        invo_no_col = params['invoice_id']  # np. INVO_NO
+    if columns_to_drop:
+        df = df.drop(columns=columns_to_drop)
+
+    return df
+
+def insert_aggregated_data_temp(conn, data_end, data_start="2023-03-12"):
+    cursor = conn.cursor()
+
+    rows_to_insert = generate_dates(data_start, data_end)
+
+    insert_query = """
+        INSERT OR IGNORE INTO aggregated_data_temp
+        (DZIEN, DZIS_DZIEN_TYG, DZIS_SOBOTA, DZIS_NIEDZIELA)
+        VALUES (?, ?, ?, ?)
+    """
+    cursor.executemany(insert_query, rows_to_insert)
+    conn.commit()
+
+    print(f"Próbowano wstawić {len(rows_to_insert)} wierszy do aggregated_data_temp (duplikaty pominięte).")
+
+def sanitize_column_names(df):
+    """
+    Usuwa niechciane znaki z nazw kolumn w DataFrame, aby były zgodne z wymogami SQLite.
+    Zamienia każdy znak nie-alfanumeryczny (poza _) na znak '_'.
+    """
+    new_columns = []
+    for col in df.columns:
+        # np. re.sub('[^A-Za-z0-9_]+', '', col) – usunąć w ogóle
+        # Lub re.sub('[^A-Za-z0-9_]+', '_', col) – zastąpić znakami podkreślenia
+        safe_col = re.sub(r"[^A-Za-z0-9_]+", "_", col)  
+        new_columns.append(safe_col)
     
-        capped_conditions = []
-        capped_clients_over = []
+    df.columns = new_columns
+    return df
+
+def refill_dataset_for_client(
+    conn,
+    client_id,
+    source_table="dataset_tab",
+    target_table="dataset",
+    batch_days=31
+):
+    cursor = conn.cursor()
+
+    cursor.execute(f"DELETE FROM {target_table} WHERE INVO_CLNTNO = ?", (client_id,))
+    conn.commit()
+
+    cursor.execute(f"""
+        SELECT MIN(DATE(DZIEN)), MAX(DATE(DZIEN))
+        FROM {source_table}
+        WHERE INVO_CLNTNO = ?
+    """, (client_id,))
+    min_date, max_date = cursor.fetchone()
+
+    if not min_date or not max_date:
+        print(f"[INFO] Brak danych dla klienta {client_id} w {source_table}.")
+        return
+
+    cursor.execute(f"PRAGMA table_info({source_table});")
+    columns_info_raw = cursor.fetchall()
+    columns_info = [(col[1], col[2] if col[2] else "TEXT") for col in columns_info_raw]
+
+    current_date = pd.to_datetime(min_date)
+    end_date = pd.to_datetime(max_date)
+
+    total_inserted = 0
+
+    while current_date <= end_date:
+        next_date = current_date + pd.Timedelta(days=batch_days - 1)
+
+        chunk_df = pd.read_sql_query(
+            f"""
+            SELECT *
+            FROM {source_table}
+            WHERE INVO_CLNTNO = ?
+              AND DATE(DZIEN) >= DATE(?)
+              AND DATE(DZIEN) <= DATE(?)
+            ORDER BY DZIEN, INVO_NO
+            """,
+            conn,
+            params=(client_id, current_date.strftime("%Y-%m-%d"), next_date.strftime("%Y-%m-%d"))
+        )
+
+        if not chunk_df.empty:
+            processed_df = process_dataset_tab(chunk_df, columns_info)
+            processed_df = remove_case_insensitive_duplicate_columns(processed_df)
+            processed_df = sanitize_column_names(processed_df)
+
+            float_cols = processed_df.select_dtypes(include=[np.float64, np.float32]).columns
+            if len(float_cols) > 0:
+                processed_df[float_cols] = processed_df[float_cols].round(4)
+                for c in float_cols:
+                    processed_df[c] = processed_df[c].astype("float32")
+
+            processed_df = processed_df.where(pd.notna(processed_df), None)
+
+            placeholders = ", ".join(["?" for _ in processed_df.columns])
+            insert_sql = f"INSERT INTO {target_table} VALUES ({placeholders})"
+
+            def _to_sqlite_safe(v):
+                if pd.isna(v):
+                    return None
+                if isinstance(v, np.datetime64):
+                    v = pd.to_datetime(v)
+                if isinstance(v, pd.Timestamp):
+                    return v.to_pydatetime()
+                return v
+
+            rows = [
+                tuple(_to_sqlite_safe(v) for v in row)
+                for row in processed_df.itertuples(index=False, name=None)
+            ]
+
+            cursor.executemany(insert_sql, rows)
+            conn.commit()
+
+            inserted_now = len(rows)
+            total_inserted += inserted_now
+            print(
+                f"[INFO] dataset: client={client_id}, "
+                f"{current_date.strftime('%Y-%m-%d')}..{next_date.strftime('%Y-%m-%d')}, "
+                f"inserted={inserted_now}, total={total_inserted}"
+            )
+
+        current_date = next_date + pd.Timedelta(days=1)
+
+    print(f"[OK] dataset rebuilt for client {client_id}, total rows inserted: {total_inserted}")
+
+def build_client_filter_sql(alias: str = "g", use_range: bool = True) -> str:
+    parts = [f"AND {alias}.INVO_CLNTNO = ?"]
+    if use_range:
+        parts.append(f"AND DATE({alias}.DZIEN) >= DATE(?)")
+        parts.append(f"AND DATE({alias}.DZIEN) <= DATE(?)")
+    return "\n".join(parts)
+def build_shard_condition_sql(num_shards: int, shard: int) -> str:
+    if shard < num_shards:
+        return f"""
+(
+    { "g" }.INVO_DEBC_NO IS NOT NULL
+    AND { "g" }.INVO_DEBC_NO NOT GLOB '*[^0-9]*'
+    AND (CAST({ "g" }.INVO_DEBC_NO AS INTEGER) % {num_shards}) = {shard}
+)
+""".strip()
+    return """
+(
+    g.INVO_DEBC_NO IS NULL
+    OR g.INVO_DEBC_NO GLOB '*[^0-9]*'
+)
+""".strip()
+
+def validate_and_convert_dates(df, columns):
+    invalid_values = []
+
+    for col in columns:
+        try:
+            # Próba konwersji na datetime
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+        except Exception as e:
+            # Przechwycenie błędów
+            invalid_values.append((col, df[col].iloc[0], str(e)))
+
+    return invalid_values
+
+def process_dataset_tab(df, columns):
+    # 1. Wyodrębnienie kolumn identyfikujących
+    id_columns = ['INVO_NO', 'INVO_ADMNO', 'INVO_CLNTNO', 'INVO_DEBH_NO', 'INVO_DEBC_NO', 'INVO_INVDATE', 'DZIEN', 'INVO_DUEDATE', 'INVO_FINALPAYMENTDATE']
+
+    # 2. Wybór kolumn liczbowych
+    numeric_columns = [col for col, dtype in columns if dtype in ['NUM', 'REAL', 'INT']]
+    numeric_df = df[numeric_columns]
+
+    # 3. Walidacja kolumn datowych
+    date_columns = [col for col, dtype in columns if dtype == 'DATETIME']
+    invalid_values = validate_and_convert_dates(df, date_columns)
+
+    # Wyświetlenie problematycznych wartości
+    if invalid_values:
+        print("Problematyczne wartości w kolumnach datowych:")
+        for col, value, error in invalid_values:
+            print(f"Kolumna: {col}, Wartość: {value}, Błąd: {error}")    
+
+    # --- cache konwersji dat: raz i korzystamy niżej ---
+    dt = {col: pd.to_datetime(df[col], errors='coerce') for col in date_columns if col in df.columns}
+
+    # 5. „Przycięcie” pól zależnych (bez zmian u Ciebie)
+    df['CLHS_NEXT_CHANGED_DATETIME'] = df['CLHS_NEXT_CHANGED_DATETIME'].where(
+        pd.to_datetime(df['CLHS_NEXT_CHANGED_DATETIME']) > pd.to_datetime(df['DZIEN']),
+        None
+    )    
+    df['INVO_MARKCODESPECDATE'] = df['INVO_MARKCODESPECDATE'].where(
+        pd.to_datetime(df['INVO_MARKCODESPECDATE']) > pd.to_datetime(df['DZIEN']),
+        None
+    )
+    df['INVO_MARKCODESPEC'] = df['INVO_MARKCODESPEC'].where(
+        pd.to_datetime(df['INVO_MARKCODESPECDATE']) > pd.to_datetime(df['DZIEN']),
+        None
+    )
+
+    # 4.1 Różnice dni względem INVO_INVDATE (jak u Ciebie, ale na cache dt)
+    base_cols = [col for col, dtype in columns
+                 if dtype == 'DATETIME' and col not in ('INVO_INVDATE', 'INVO_FINALPAYMENTDATE')]
+    date_diff_df = pd.DataFrame(index=df.index)
+    if 'INVO_INVDATE' in dt:
+        invdate_ser = dt['INVO_INVDATE']
+        for col in base_cols:
+            if col in dt:
+                date_diff_df[f'{col}_DAYS_DIFF'] = (dt[col] - invdate_ser).dt.days
+
+        if 'INVO_FINALPAYMENTDATE' in dt:
+            date_diff_df['INVO_FINALPAYMENTDATE_DAYS_DIFF'] = (dt['INVO_FINALPAYMENTDATE'] - invdate_ser).dt.days
+
+        if 'DZIEN' in dt:
+            date_diff_df['FROM_DZIEN_TO_INVO_INVDATE'] = (dt['DZIEN'] - invdate_ser).dt.days
+
+    date_diff_df = date_diff_df.fillna(0).round(0).astype('int', copy=False)
+
+    # 4.2 NOWE: różnice dni względem INVO_DUEDATE
+    due_date_diff_df = pd.DataFrame(index=df.index)
+    if 'INVO_DUEDATE' in dt:
+        duedate_ser = dt['INVO_DUEDATE']
+        due_cols = [col for col, dtype in columns
+                    if dtype == 'DATETIME' and col not in ('INVO_DUEDATE', 'INVO_FINALPAYMENTDATE')]
+        for col in due_cols:
+            if col in dt:
+                due_date_diff_df[f'{col}_DUE_DAYS_DIFF'] = (dt[col] - duedate_ser).dt.days
+
+        if 'INVO_FINALPAYMENTDATE' in dt:
+            due_date_diff_df['INVO_FINALPAYMENTDATE_DUE_DAYS_DIFF'] = (dt['INVO_FINALPAYMENTDATE'] - duedate_ser).dt.days
+
+        if 'DZIEN' in dt:
+            due_date_diff_df['FROM_DZIEN_TO_INVO_DUEDATE'] = (dt['DZIEN'] - duedate_ser).dt.days
+
+    # jeżeli nie było DUEDATE, to due_date_diff_df zostanie pusty – to OK przy concat
+    if not due_date_diff_df.empty:
+        due_date_diff_df = due_date_diff_df.fillna(0).round(0).astype('int', copy=False)
+
+    # 6. Transformacja wybranych dat (na cache dt, tylko te które mamy)
+    def transform_date_column(date_column):
+        transformed_df = pd.DataFrame(index=df.index)
+        if date_column not in dt:
+            return transformed_df  # brak kolumny – zwracamy pusty DF
+        ser = dt[date_column]
+        transformed_df[f'{date_column}_YEAR'] = ser.dt.year
+        transformed_df[f'{date_column}_MONTH'] = ser.dt.month
+        transformed_df[f'{date_column}_DAY'] = ser.dt.day
+        transformed_df[f'{date_column}_WEEKDAY'] = ser.dt.weekday
+        transformed_df[f'{date_column}_DAYS_FROM_YEAR_START'] = ser.dt.dayofyear
+        transformed_df[f'{date_column}_DAYS_TO_YEAR_END'] = 365 - ser.dt.dayofyear
+        transformed_df[f'{date_column}_DAYS_FROM_MONTH_START'] = ser.dt.day
+        transformed_df[f'{date_column}_DAYS_TO_MONTH_END'] = ser.dt.days_in_month - ser.dt.day
+        if date_column in ('INVO_DUEDATE', 'DZIEN'):
+            transformed_df[f'{date_column}_IS_SATURDAY'] = (ser.dt.weekday == 5).astype(int)
+            transformed_df[f'{date_column}_IS_SUNDAY'] = (ser.dt.weekday == 6).astype(int)
+        return transformed_df
+
+    transformed_dates_df = pd.concat(
+        [transform_date_column(col) for col in
+         ['DZIEN', 'INVO_INVDATE', 'INVO_DUEDATE', 'CLHS_CHANGED_DATETIME', 'CLHS_NEXT_CHANGED_DATETIME']],
+        axis=1
+    ).fillna(0).round(0).astype('int', copy=False)
+
+    # 7. Końcowe kolumny płatności
+    has_final = 'INVO_FINALPAYMENTDATE' in df.columns
+    if has_final:
+        final_payment_date = df['INVO_FINALPAYMENTDATE']
+        final_payment_date_diff = date_diff_df['INVO_FINALPAYMENTDATE_DAYS_DIFF'] if 'INVO_FINALPAYMENTDATE_DAYS_DIFF' in date_diff_df.columns else None
+        if 'INVO_FINALPAYMENTDATE_DAYS_DIFF' in date_diff_df.columns:
+            date_diff_df = date_diff_df.drop(columns=['INVO_FINALPAYMENTDATE_DAYS_DIFF'])
+        final_payment_due_date_diff = (
+            due_date_diff_df['INVO_FINALPAYMENTDATE_DUE_DAYS_DIFF']
+            if 'INVO_FINALPAYMENTDATE_DUE_DAYS_DIFF' in due_date_diff_df.columns else None
+        )
+        if 'INVO_FINALPAYMENTDATE_DUE_DAYS_DIFF' in due_date_diff_df.columns:
+            due_date_diff_df = due_date_diff_df.drop(columns=['INVO_FINALPAYMENTDATE_DUE_DAYS_DIFF'])
+
+    # 8. Sklejenie wszystkiego
+    processed_df = pd.concat(
+        [df[id_columns], transformed_dates_df, date_diff_df, due_date_diff_df, numeric_df],
+        axis=1
+    )
+    if has_final:
+        processed_df['INVO_FINALPAYMENTDATE'] = final_payment_date
     
-        for _, r in df_pc.iterrows():
-            cl = int(r["INVO_CLNTNO"])
-            cnt = int(r["cnt"])
+    inv = pd.to_datetime(processed_df['INVO_INVDATE'], errors='coerce') \
+          if 'INVO_INVDATE' in processed_df.columns else pd.Series(pd.NaT, index=processed_df.index)
     
-            if cnt > cap_global:
-                # ✅ TU używamy Twojej funkcji get_modulo_condition
-                div, cond = get_modulo_condition(cnt, limit=cap_global, invo_no_col=invo_no_col, d=1)
+    fin = pd.to_datetime(processed_df['INVO_FINALPAYMENTDATE'], errors='coerce') \
+          if 'INVO_FINALPAYMENTDATE' in processed_df.columns else pd.Series(pd.NaT, index=processed_df.index)
     
-                # cond ma postać np.: "AND ((INVO_NO % 17) = 0)" albo "AND ((INVO_NO % 5) != 0)"
-                cond_inner = cond.strip()
-                if cond_inner.upper().startswith("AND"):
-                    cond_inner = cond_inner[3:].strip()
+    processed_df['INVO_FINALPAYMENTDATE_DAYS_DIFF'] = (fin - inv).dt.days.astype('float32')
+
+    return processed_df
+
+# Funkcja symulująca najbliższy dzień roboczy
+def get_next_working_day(termin_platnosci, holidays):
+    while termin_platnosci.weekday() >= 5 or termin_platnosci in holidays:
+        termin_platnosci += timedelta(days=1)
+    return termin_platnosci
+
+# Funkcja do wstawienia danych z widoku do tabeli
+
+def generate_days(start_date, end_date):
+    current_date = datetime.strptime(start_date, '%Y-%m-%d')
+    end_date = datetime.strptime(end_date, '%Y-%m-%d')
+    while current_date <= end_date:
+        yield current_date  # zwracamy datetime
+        current_date += timedelta(days=1)
+        
+# Adapter: datetime → string (dla SQLite)
+def adapt_datetime(ts):
+    return ts.strftime('%Y-%m-%d %H:%M:%S')  # Format akceptowany przez SQLite
+
+# Konwerter: string → datetime (z SQLite)
+def convert_datetime(ts):
+    return datetime.strptime(ts.decode('utf-8'), '%Y-%m-%d %H:%M:%S')
+
+def adapt_pandas_timestamp(ts):
+    return ts.to_pydatetime().strftime('%Y-%m-%d %H:%M:%S')
+
+def convert_pandas_timestamp(ts):
+    return pd.Timestamp(ts.decode('utf-8'))
+
+def resolve_clients(all_clients, include=None, exclude=None):
+    all_clients = set(all_clients)
+    # include
+    if include is None or len(include) == 0:
+        selected = all_clients
+    else:
+        selected = set(include)
+    # exclude
+    if exclude:
+        selected -= set(exclude)
+    return sorted(selected)
+
+# Rejestracja adapterów
+sqlite3.register_adapter(datetime, adapt_datetime)
+sqlite3.register_converter('DATETIME', convert_datetime)
+sqlite3.register_adapter(pd.Timestamp, adapt_pandas_timestamp)
+sqlite3.register_converter('DATETIME', convert_pandas_timestamp)
+
+def build_dataset_db(params, t0, include_clients=None, exclude_clients=None, skip_raw_tables=False, build_derived=True):
     
-                capped_clients_over.append(cl)
-                capped_conditions.append(f"(INVO_CLNTNO = {cl} AND ({cond_inner}))")
+    # skip_raw_tables=False, build_derived=True -> NORMAL (RAW+DERIVED)
+    # skip_raw_tables=False, build_derived=False -> ETAP 1 (RAW only)
+    # skip_raw_tables=True,  build_derived=True -> ETAP 2 (DERIVED only)    
+    queries_dir = params["sql_paths"]["queries_dir"]
+    data_end_str = _to_date_str(t0)
+    # --- jeden plik z wieloma klientami ---
+    file_path = params['multi_client_excel_path']
+    df_invo_all, df_debc_all, df_clhs_all, df_dcmo_all = load_excel_sheets(file_path, params)
+
+    # ------------------------------------------------------------------
+    # 1️⃣ wszyscy klienci z Excela (jak dotychczas)
+    # ------------------------------------------------------------------
+    # wszystkie klienty z danych
+    all_client_ids = (
+        df_invo_all['INVO_CLNTNO']
+        .dropna()
+        .astype(int)
+        .unique()
+        .tolist()
+    )
+    client_ids = resolve_clients(
+        all_clients=all_client_ids,
+        include=include_clients,
+        exclude=exclude_clients,
+    )
     
-                print(f"[CAP] client={cl} cnt={cnt} > {cap_global} -> divisor={div} cond={cond_inner}")
+    # ------------------------------------------------------------------
+    # 2️⃣ liczenie i sortowanie (TYLKO do logu + kolejności)
+    # ------------------------------------------------------------------
+    _counts = (
+        df_invo_all
+        .dropna(subset=['INVO_CLNTNO'])
+        .assign(INVO_CLNTNO=lambda d: d['INVO_CLNTNO'].astype(int))
+    )
+    _counts = _counts[_counts['INVO_CLNTNO'].isin(client_ids)]
+    _counts_sorted = (
+        _counts
+        .groupby('INVO_CLNTNO', as_index=False)
+        .size()
+        .rename(columns={'size': 'cnt'})
+        .sort_values('cnt', ascending=True)
+    )
+    client_ids = _counts_sorted['INVO_CLNTNO'].astype(int).tolist()
     
-        if capped_conditions:
-            # warunek: pozostali klienci bez zmian; klienci z listy:
-            # - jeśli nie przekroczyli capa -> bez zmian
-            # - jeśli przekroczyli -> filtr modulo z get_modulo_condition
-            where_cap = f"""
-            AND (
-                INVO_CLNTNO NOT IN ({clients_csv})
-                OR
-                (
-                    INVO_CLNTNO IN ({clients_csv})
-                    AND (
-                        INVO_CLNTNO NOT IN ({",".join(map(str, capped_clients_over))})
-                        OR
-                        {" OR ".join(capped_conditions)}
+    print(f"[INFO] Finalna lista klientów do przetworzenia: {client_ids}")
+    
+    # czytelny wydruk: kolejność + ile rekordów ma każdy klient
+    print("Kolejność przetwarzania (od najmniejszej liczby wierszy INVO):")
+    for rank, (cid, cnt) in enumerate(zip(_counts_sorted['INVO_CLNTNO'],
+                                          _counts_sorted['cnt']), start=1):
+        print(f"{rank:>2}. klient {int(cid)} → {int(cnt)} wierszy INVO")     
+
+    db_path = params['database']
+    conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+    cursor = conn.cursor()
+    
+    for client_id in client_ids:
+        print("client_id: ", client_id)
+    
+        # wczytujemy dane:
+        df_invo = df_invo_all[df_invo_all['INVO_CLNTNO'] == client_id].copy()
+        df_debc = df_debc_all[df_debc_all['DEBC_CLNTNO'] == client_id].copy()
+        df_clhs = df_clhs_all[df_clhs_all['CLHS_CLNTNO'] == client_id].copy()
+        df_dcmo = df_dcmo_all[df_dcmo_all['DEBC_CLNTNO'] == client_id].copy()
+
+        validate_required_schema_for_create_database(cursor)
+    
+        od_dnia = pd.to_datetime(params['od_dnia'])
+        dcmo_year = int(od_dnia.year)
+        dcmo_month = int(od_dnia.month)
+    
+        # Filtrowanie df_invo: INVO_INVDATE >= od_dnia
+        if df_invo is not None and not df_invo.empty and 'INVO_INVDATE' in df_invo.columns:
+            df_invo['INVO_INVDATE'] = pd.to_datetime(df_invo['INVO_INVDATE'], errors='coerce')
+            df_invo = df_invo[df_invo['INVO_INVDATE'].notna() & (df_invo['INVO_INVDATE'] >= od_dnia)]
+    
+        # Filtrowanie df_clhs: CLHS_DATCHANGED >= od_dnia (format YYYYMMDD, np. 20210712)
+        if df_clhs is not None and not df_clhs.empty and 'CLHS_DATCHANGED' in df_clhs.columns:
+            df_clhs['CLHS_DATCHANGED'] = pd.to_datetime(df_clhs['CLHS_DATCHANGED'].astype(str), format='%Y%m%d', errors='coerce')
+            df_clhs = df_clhs[df_clhs['CLHS_DATCHANGED'].notna() & (df_clhs['CLHS_DATCHANGED'] >= od_dnia)]
+    
+        # Filtrowanie df_dcmo: (YEAR, MONTH) >= od_dnia
+        if df_dcmo is not None and not df_dcmo.empty and 'DCMO_YEAR' in df_dcmo.columns and 'DCMO_MONTH' in df_dcmo.columns:
+            df_dcmo['DCMO_YEAR'] = pd.to_numeric(df_dcmo['DCMO_YEAR'], errors='coerce')
+            df_dcmo['DCMO_MONTH'] = pd.to_numeric(df_dcmo['DCMO_MONTH'], errors='coerce')
+        
+            df_dcmo = df_dcmo[
+                (df_dcmo['DCMO_YEAR'] > dcmo_year) |
+                ((df_dcmo['DCMO_YEAR'] == dcmo_year) & (df_dcmo['DCMO_MONTH'] >= dcmo_month))
+            ]
+    
+        # --- RAW tables: invo/debc/clhs/dcmo ---
+        if not skip_raw_tables:
+            cursor.execute("DELETE FROM invo WHERE INVO_CLNTNO = ?", (client_id,))
+            cursor.execute("DELETE FROM debc WHERE DEBC_CLNTNO = ?", (client_id,))
+            cursor.execute("DELETE FROM clhs WHERE CLHS_CLNTNO = ?", (client_id,))
+            cursor.execute("DELETE FROM dcmo WHERE DEBC_CLNTNO = ?", (client_id,))
+            
+            df_invo.to_sql('invo', conn, if_exists='append', index=False)
+            df_debc.to_sql('debc', conn, if_exists='append', index=False)
+            df_clhs.to_sql('clhs', conn, if_exists='append', index=False)
+            df_dcmo.to_sql('dcmo', conn, if_exists='append', index=False)
+        
+            conn.commit()
+        else:
+            logging.info("[build_dataset_db] skip_raw_tables=True -> nie ruszam invo/debc/clhs/dcmo")
+
+        # --- stop after RAW if requested (ETAP 1) ---
+        if not build_derived:
+            logging.info("[build_dataset_db] build_derived=False -> kończę po imporcie RAW (bez widoków/datasetów).")
+            conn.commit()
+            conn.close()
+            continue
+        
+        
+        # Wstawianie danych z widoku do tabeli
+        cursor.execute("DELETE FROM INVO_CLHS_JOINED_TAB WHERE INVO_CLNTNO = ?", (client_id,))
+        insert_query = """
+        INSERT INTO INVO_CLHS_JOINED_TAB
+        SELECT * FROM INVO_CLHS_JOINED
+        WHERE INVO_CLNTNO = ?;
+        """
+        cursor.execute(insert_query, (client_id,))
+        print("Dane zostały skopiowane z widoku do tabeli 'INVO_CLHS_JOINED_TAB'.")
+
+        remove_duplicates_query = """
+            WITH d AS (
+              SELECT
+                rowid AS rid,
+                ROW_NUMBER() OVER (
+                  PARTITION BY
+                    INVO_NO, INVO_CLNTNO, INVO_ADMNO, INVO_DEBH_NO, INVO_DEBC_NO, CLHS_CHANGED_DATETIME
+                  ORDER BY RANDOM()          -- losowy wybór zwycięzcy
+                ) AS rn
+              FROM INVO_CLHS_JOINED_TAB
+              WHERE INVO_CLNTNO = ?
+            )
+            DELETE FROM INVO_CLHS_JOINED_TAB
+            WHERE rowid IN (SELECT rid FROM d WHERE rn > 1);
+        """
+        cursor.execute(remove_duplicates_query, (client_id,))
+
+        # Zatwierdzenie zmian i zamknięcie połączenia
+        conn.commit()
+        
+        print("Operacja zakończona sukcesem.")
+        
+        # Pobranie danych z invo_view
+        query_invo = load_sql_file(f"{queries_dir}/invo_select.sql")
+        cursor.execute(query_invo, (params['od_dnia'], client_id))
+        rows = cursor.fetchall()
+        
+        # Dynamiczne wstawianie danych do tabeli z obliczeniem ROK i MIESIAC
+        data_to_insert = []
+        for row in rows:
+            (invo_no, invo_admno, invo_clntno, invo_debh_no, invo_debc_no,
+             invo_invdate, invo_finalpaymentdate) = row
+        
+            # 1) Sprowadź wszystko do str 'YYYY-MM-DD' (albo None)
+            invdate_s = pd.to_datetime(invo_invdate, errors='coerce')
+            if pd.isna(invdate_s):
+                # Bez daty wystawienia nie ma sensu generować dni – pomiń rekord
+                continue
+            invdate_s = invdate_s.strftime("%Y-%m-%d")
+        
+            if invo_finalpaymentdate is not None and not pd.isna(invo_finalpaymentdate):
+                finalpay_s = pd.to_datetime(invo_finalpaymentdate, errors='coerce')
+                finalpay_s = None if pd.isna(finalpay_s) else finalpay_s.strftime("%Y-%m-%d")
+            else:
+                finalpay_s = None
+        
+            # 2) Jeśli brak finalnej daty płatności → użyj invdate + 120 dni
+            end_for_days_s = (
+                finalpay_s if finalpay_s
+                else (pd.to_datetime(invdate_s) + pd.Timedelta(days=120)).strftime("%Y-%m-%d")
+            )
+        
+            # 3) generate_days oczekuje STR → OK
+            days = list(generate_days(invdate_s, end_for_days_s))
+        
+            # 4) Przy insertach do SQLite trzymaj typy proste (date/datetime → date)
+            invdate_d  = pd.to_datetime(invdate_s).date()
+            finalpay_d = (pd.to_datetime(finalpay_s).date() if finalpay_s else None)
+        
+            for day in days:
+                # generate_days zwraca datetime → rzutujemy na date
+                day_d = day.date()
+                data_to_insert.append((
+                    invo_no, invo_admno, invo_clntno, invo_debh_no, invo_debc_no,
+                    invdate_d, day_d, day_d.year, day_d.month, finalpay_d
+                ))
+        
+        # Wstawianie danych do tabeli
+        cursor.execute("DELETE FROM group_cust_inv_days WHERE INVO_CLNTNO = ?", (client_id,))
+
+        cursor.executemany("""
+        INSERT INTO group_cust_inv_days (
+            INVO_NO, INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, INVO_INVDATE, DZIEN, ROK, MIESIAC, INVO_FINALPAYMENTDATE
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, data_to_insert)
+
+        # Zatwierdzenie zmian
+        conn.commit()
+        
+        print("Tabela 'group_cust_inv_days' została pomyślnie wypełniona.")
+        print(datetime.now().strftime("%H:%M:%S"))
+    
+        # Pobranie danych z group_cust_inv_days z grupowaniem
+        grouped_query = load_sql_file(f"{queries_dir}/group_cust_inv_days_select.sql")
+        # Wczytanie danych do DataFrame
+        df = pd.read_sql_query(grouped_query, conn, params=(client_id,))
+        
+        # Zapisanie DataFrame do tabeli SQLite (struktura tabeli tworzona automatycznie)
+        cursor.execute("DELETE FROM grouped_client_days WHERE INVO_CLNTNO = ?", (client_id,))
+        df.to_sql("grouped_client_days", conn, if_exists="append", index=False)
+
+        # Zatwierdzenie zmian i zamknięcie połączenia
+        conn.commit()
+    
+        print("Rozpoczynam partiami wstawianie do 'extended_grouped_client_days_tab'...")
+        select_year_month_sql = """
+            SELECT DISTINCT ROK, MIESIAC
+            FROM extended_grouped_client_days
+            WHERE INVO_CLNTNO = ?
+            ORDER BY ROK, MIESIAC
+        """
+        insert_extended_sql = load_sql_file(f"{queries_dir}/insert_extended_grouped_client_days.sql")
+        insert_summary_sql = load_sql_file(f"{queries_dir}/insert_summary_client_days.sql")
+        # lista partii do przerobienia
+        cursor.execute(select_year_month_sql, (client_id,))
+        year_month_rows = cursor.fetchall()
+        # odświeżenie targetów dla klienta
+        cursor.execute("DELETE FROM extended_grouped_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
+        cursor.execute("DELETE FROM summary_client_days_tab WHERE INVO_CLNTNO = ?", (client_id,))
+        conn.commit()
+        # 1) extended_grouped_client_days_tab
+        inserted_count = 0
+        for (year, month) in year_month_rows:
+            cursor.execute(insert_extended_sql, (year, month, params["od_dnia"], client_id))
+            conn.commit()
+            row_count = cursor.rowcount if cursor.rowcount != -1 else 0
+            inserted_count += row_count
+            print(f"Wstawiono extended: ROK={year}, MIESIAC={month} -> {row_count} wierszy (narastająco={inserted_count})")
+        print(f"Extended zakończone. Łącznie wstawiono = {inserted_count}.")
+        print(datetime.now().strftime("%H:%M:%S"))
+        # 2) summary_client_days_tab
+        print("Rozpoczynam partiami wstawianie do 'summary_client_days_tab'...")
+        inserted_count = 0
+        for (year, month) in year_month_rows:
+            cursor.execute(insert_summary_sql, (year, month, client_id))
+            conn.commit()
+            row_count = cursor.rowcount if cursor.rowcount != -1 else 0
+            inserted_count += row_count
+            print(f"Wstawiono summary: ROK={year}, MIESIAC={month} -> {row_count} wierszy (narastająco={inserted_count})")
+        print(f"Summary zakończone. Łącznie wstawiono = {inserted_count}.")
+        print(datetime.now().strftime("%H:%M:%S"))
+        # Pobranie świąt (jeśli istnieją)
+        cursor.execute("SELECT data FROM swieta")
+        holidays = {pd.Timestamp(row[0]) for row in cursor.fetchall() if row[0] is not None}
+        
+        # Parametry wejściowe
+        z_ilu_dni_values = [14, 30, 60, 90]
+        maksymalna_data = pd.Timestamp(data_end_str)
+        log_triggered = False
+        inserted_count = 0
+
+        cursor.execute("DELETE FROM statystyki_faktur WHERE INVO_CLNTNO = ?", (client_id,))
+        for z_ilu_dni in z_ilu_dni_values:
+            # Pobranie danych klientów i dni
+            query = """
+                SELECT DISTINCT INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, DZIEN
+                FROM group_cust_inv_days
+                WHERE INVO_CLNTNO = ?
+                  AND DZIEN <= ?
+            """
+            customer_days = pd.read_sql_query(
+                query,
+                conn,
+                params=(client_id, maksymalna_data.strftime('%Y-%m-%d %H:%M:%S'))
+            )
+
+            
+            # Iteracja po klientach i dniach
+            sql = load_sql_file(f"{queries_dir}/select_faktury.sql")
+            for _, row in customer_days.iterrows():
+                invo_admno = row['INVO_ADMNO']
+                invo_clntno = row['INVO_CLNTNO']
+                invo_debh_no = row['INVO_DEBH_NO']
+                invo_debc_no = row['INVO_DEBC_NO']
+                na_dzien = pd.Timestamp(row['DZIEN'])
+                
+                end_day   = na_dzien.strftime('%Y-%m-%d')
+                start_day = (na_dzien - pd.Timedelta(days=z_ilu_dni)).strftime('%Y-%m-%d')
+
+                # Pobranie faktur dla klienta
+                # Pomiar czasu wczytywania faktur
+                start_read_time = time.time()
+                faktury = pd.read_sql_query(
+                    sql,
+                    conn,
+                    params=(
+                        end_day,
+                        invo_admno,
+                        invo_clntno,
+                        invo_debh_no,
+                        invo_debc_no,
+                        start_day,
+                        end_day,
+                        start_day,
+                        end_day,
                     )
                 )
-            )
-            """
-    
-            # ✅ WAŻNE: nie doklejamy AND na koniec surowego SELECT-a,
-            # tylko owijamy go i dopiero dajemy WHERE 1=1
-            query = f"SELECT * FROM ({query}) q WHERE 1=1 {where_cap}"
+        
+                read_duration = time.time() - start_read_time
+        
+                # Symulacja przeliczenia terminów płatności
+                faktury['INVO_DUEDATE'] = faktury['INVO_DUEDATE'].apply(
+                    lambda x: get_next_working_day(pd.Timestamp(x), holidays) if pd.notna(x) else x
+                )
+        
+                faktury['INVO_FINALPAYMENTDATE'] = pd.to_datetime(faktury['INVO_FINALPAYMENTDATE'], errors='coerce')
+                faktury['INVO_DUEDATE'] = pd.to_datetime(faktury['INVO_DUEDATE'], errors='coerce')
+                faktury['INVO_INVDATE'] = pd.to_datetime(faktury['INVO_INVDATE'], errors='coerce')
+                
+                paid = faktury['INVO_FINALPAYMENTDATE'].notna()
+                unpaid = faktury['INVO_FINALPAYMENTDATE'].isna()        
+                
+                # Definicje scenariuszy
+                scenariusze = {
+                    'zapłacone_przed_terminem': faktury[
+                        (faktury['INVO_FINALPAYMENTDATE'].notna()) & 
+                        (faktury['INVO_FINALPAYMENTDATE'] <= faktury['INVO_DUEDATE']) & 
+                        (faktury['INVO_FINALPAYMENTDATE'] < na_dzien)
+                    ],
+                    'zapłacone_po_terminie': faktury[
+                        (faktury['INVO_FINALPAYMENTDATE'].notna()) & 
+                        (faktury['INVO_FINALPAYMENTDATE'] > faktury['INVO_DUEDATE']) &
+                        (faktury['INVO_FINALPAYMENTDATE'] < na_dzien) 
+                    ],
+                    'niezapłacone_po_terminie': faktury[
+                        unpaid &
+                        (na_dzien > faktury['INVO_DUEDATE'])
+                    ],
+                    'niezapłacone_przed_terminem': faktury[
+                        unpaid &
+                        (na_dzien <= faktury['INVO_DUEDATE'])
+                    ],
+                    'wszystkie_faktury': faktury
+                }
+        
+                # Obliczanie statystyk dla każdego scenariusza
+                for scenariusz, df in scenariusze.items():
+                    if df.empty:
+                        continue
+                
+                    # Kopia, żeby uniknąć SettingWithCopyWarning
+                    dfc = df.copy()
+                
+                    # Kwoty (bezpieczne)
+                    dfc['INVO_AINITIALH'] = pd.to_numeric(dfc['INVO_AINITIALH'], errors='coerce')
+                    sum_invo_ainitialh = float(dfc['INVO_AINITIALH'].sum(skipna=True))
+                    avg_invo_ainitialh = float(dfc['INVO_AINITIALH'].mean(skipna=True))
+                    stdev_invo_ainitialh = float(dfc['INVO_AINITIALH'].std(skipna=True))
+                    ile_faktur = int(len(dfc))
+                
+                    # Maski płatności znanych na na_dzien
+                    paid_mask = dfc['INVO_FINALPAYMENTDATE'].notna()
+                    unpaid_mask = ~paid_mask
+                
+                    # Domyślnie ustawiamy NULL-e (NaN -> SQLite zapisze jako NULL)
+                    avg_dni_do_zaplaty = np.nan
+                    stdev_dni_do_zaplaty = np.nan
+                    avg_dni_opoznienia = np.nan
+                    stdev_dni_opoznienia = np.nan
+                
+                    if scenariusz.startswith('zapłacone'):
+                        # Prawdziwe metryki, legalne (bo FINALPAYMENTDATE <= na_dzien)
+                        days_to_pay = (dfc.loc[paid_mask, 'INVO_FINALPAYMENTDATE'] - dfc.loc[paid_mask, 'INVO_INVDATE']).dt.days
+                        days_late = (dfc.loc[paid_mask, 'INVO_FINALPAYMENTDATE'] - dfc.loc[paid_mask, 'INVO_DUEDATE']).dt.days
+                
+                        avg_dni_do_zaplaty = float(days_to_pay.mean()) if not days_to_pay.empty else np.nan
+                        stdev_dni_do_zaplaty = float(days_to_pay.std()) if len(days_to_pay) > 1 else np.nan
+                
+                        avg_dni_opoznienia = float(days_late.mean()) if not days_late.empty else np.nan
+                        stdev_dni_opoznienia = float(days_late.std()) if len(days_late) > 1 else np.nan
+                
+                    elif scenariusz.startswith('niezapłacone'):
+                        # PROXY metryki "as-of" dla niezapłaconych (bez leak'u)
+                        # "dni do zapłaty" -> wiek faktury do na_dzien
+                        age_today = (na_dzien - dfc.loc[unpaid_mask, 'INVO_INVDATE']).dt.days
+                
+                        # "dni opóźnienia" -> ile dni po terminie na na_dzien, obcięte do >=0
+                        late_today = (na_dzien - dfc.loc[unpaid_mask, 'INVO_DUEDATE']).dt.days
+                        late_today = late_today.clip(lower=0)
+                
+                        avg_dni_do_zaplaty = float(age_today.mean()) if not age_today.empty else np.nan
+                        stdev_dni_do_zaplaty = float(age_today.std()) if len(age_today) > 1 else np.nan
+                
+                        avg_dni_opoznienia = float(late_today.mean()) if not late_today.empty else np.nan
+                        stdev_dni_opoznienia = float(late_today.std()) if len(late_today) > 1 else np.nan
+                
+                    else:  # 'wszystkie_faktury'
+                        # Mieszany wariant: dla zapłaconych prawdziwe, dla niezapłaconych proxy as-of
+                        days_to_pay_paid = (dfc.loc[paid_mask, 'INVO_FINALPAYMENTDATE'] - dfc.loc[paid_mask, 'INVO_INVDATE']).dt.days
+                        days_to_pay_unpaid = (na_dzien - dfc.loc[unpaid_mask, 'INVO_INVDATE']).dt.days
+                        days_to_pay = pd.concat([days_to_pay_paid, days_to_pay_unpaid], ignore_index=True)
+                
+                        days_late_paid = (dfc.loc[paid_mask, 'INVO_FINALPAYMENTDATE'] - dfc.loc[paid_mask, 'INVO_DUEDATE']).dt.days
+                        days_late_unpaid = (na_dzien - dfc.loc[unpaid_mask, 'INVO_DUEDATE']).dt.days
+                        days_late_unpaid = days_late_unpaid.clip(lower=0)
+                        days_late = pd.concat([days_late_paid, days_late_unpaid], ignore_index=True)
+                
+                        avg_dni_do_zaplaty = float(days_to_pay.mean()) if not days_to_pay.empty else np.nan
+                        stdev_dni_do_zaplaty = float(days_to_pay.std()) if len(days_to_pay) > 1 else np.nan
+                
+                        avg_dni_opoznienia = float(days_late.mean()) if not days_late.empty else np.nan
+                        stdev_dni_opoznienia = float(days_late.std()) if len(days_late) > 1 else np.nan
+
+                    # Wstawianie wyników do tabeli
+                    cursor.execute("""
+                        INSERT INTO statystyki_faktur (
+                            INVO_ADMNO, INVO_CLNTNO, INVO_DEBH_NO, INVO_DEBC_NO, DZIEN,
+                            SCENARIUSZ, AVG_DNI_DO_ZAPLATY, STDEV_DNI_DO_ZAPLATY,
+                            AVG_DNI_OPOZNIENIA, STDEV_DNI_OPOZNIENIA,
+                            SUM_INVO_AINITIALH, AVG_INVO_AINITIALH, STDEV_INVO_AINITIALH,
+                            ILE_FAKTUR, PARAM_Z_ILU_DNI, INSERT_TIMESTAMP
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        invo_admno, invo_clntno, invo_debh_no, invo_debc_no,
+                        na_dzien.strftime('%Y-%m-%d %H:%M:%S'),
+                        scenariusz,
+                        avg_dni_do_zaplaty, stdev_dni_do_zaplaty,
+                        avg_dni_opoznienia, stdev_dni_opoznienia,
+                        sum_invo_ainitialh, avg_invo_ainitialh, stdev_invo_ainitialh,
+                        ile_faktur, z_ilu_dni, datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    ))
+                
+                    # Aktualizacja licznika i logowanie co 10 minut
+                    inserted_count += 1
+                    current_time = datetime.now()
+                    if current_time.minute % 10 == 0 and not log_triggered:
+                        log_triggered = True
+                        cursor.execute("SELECT * FROM statystyki_faktur ORDER BY INSERT_TIMESTAMP DESC LIMIT 1")
+                        recent_rows = cursor.fetchall()
+                        print(f"[{current_time}] Inserted rows so far: {inserted_count}")
+                        print(f"[{current_time}] Remaining rows to insert: {len(customer_days) * len(z_ilu_dni_values) - inserted_count}")
+                        print(f"[{current_time}] Last row in statystyki_faktur: {recent_rows}")
+                    elif current_time.minute % 10 != 0:
+                        log_triggered = False
+        
+            # Zapis do bazy na końcu pętli
+            # conn.commit()
+        conn.commit()
+        print("Statystyki faktur zostały obliczone i zapisane.")
+        print(datetime.now().strftime("%H:%M:%S"))
+
+        # Pobranie minimalnej i maksymalnej daty z widoku
+        cursor.execute(
+            "SELECT MIN(dzien), MAX(dzien) FROM group_cust_inv_days WHERE INVO_CLNTNO = ?;",
+            (client_id,)
+        )
+        min_date, max_date = cursor.fetchone()
+        
+        
+        if not min_date or not max_date:
+            print("Brak danych w widoku, wychodzę.")
+            conn.close()
+            continue
         else:
-            print("[CAP] No clients exceeded cap_global, no cap filter applied.")
-
-    # 5) Teraz dopiero Twój globalny limiter rows_limit (jak dotychczas)
-    # policz count query z AKTUALNEGO query (już po cap)
-    final_count_query = f"SELECT COUNT(*) as row_count FROM ({query}) q"
-    df_count = read_data_from_db(final_count_query, params, currently_testing=currently_testing)
-    row_count = int(df_count['row_count'].iloc[0])
-    if row_count == 0:
-        # ważne: log, żebyś wiedział DLACZEGO skip
-        logging.info(f"[SKIP] preprocess_data_model1: row_count=0 for range {data_start}..{data_end}, operation_mode={operation_mode}")
-        raise NoDataError(f"No data for {data_start}..{data_end} op={operation_mode}")    
-
-    limit = params['rows_limit']
-    invo_no_col = params['invoice_id']
-    divisor, condition_sql = get_modulo_condition(row_count, limit=limit, invo_no_col=invo_no_col)
-
-    if divisor is not None:
-        print(f"[INFO] row_count={row_count} > {limit}, divisor={divisor}, dopinam: {condition_sql}")
-        query = f"{query}\n{condition_sql}"
-    else:
-        print(f"[INFO] row_count={row_count} <= {limit} => pobieram wszystkie wiersze.")
-
-    # 6) fetch
-    if train_on_all:
-        df = read_data_from_all_db(query, params, currently_testing=currently_testing)
-    else:
-        df = read_data_from_db(query, params, currently_testing=currently_testing)
-
-    df = df.fillna(0)
-    data_zaplaty_column = params['clear_date']
-    df[data_zaplaty_column] = pd.to_datetime(df[data_zaplaty_column], errors='coerce')
-    selected_columns = df[params['return_columns']] if params.get('return_columns') else None
-
-    df[params['clear_days']] = np.clip(df[params['clear_days']], 1, 365)
-    
-    original_columns = df.columns.tolist()
-    
-    non_numeric_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
-
-    for col in non_numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-
-
-    colums_to_remove = params['non_numeric_cols']
-    df = df.drop(columns=[col for col in colums_to_remove if col in df.columns], errors='ignore', axis=1)
-    licz_korelacje = 'false'
-    if licz_korelacje == 'true':
-        # --- wybór kolumn do korelacji ---
-        target_col = params['clear_days']  # UWAGA: musi być string z nazwą kolumny
-        feature_cols = [c for c in df.columns if c != target_col]
-        all_cols = feature_cols + [target_col]
+            print(f"Zakres dat w widoku: {min_date} - {max_date}")
         
-        # --- próbka (żeby nie zabić RAMu) ---
-        SAMPLE_N_PEARSON  = 1_000_000
-        SAMPLE_N_SPEARMAN = 200_000   # spearman jest cięższy
         
-        df_all = df[all_cols]
-        
-        df_p = df_all.sample(n=min(SAMPLE_N_PEARSON, len(df_all)), random_state=42) if len(df_all) > SAMPLE_N_PEARSON else df_all
-        df_s = df_all.sample(n=min(SAMPLE_N_SPEARMAN, len(df_all)), random_state=42) if len(df_all) > SAMPLE_N_SPEARMAN else df_all
-        
-        # --- korelacje ---
-        corr_p = df_p.corr(method='pearson')
-        corr_s = df_s.corr(method='spearman')
-        
-        # --- korelacja feature -> target (super do leakage / kandydatów) ---
-        corr_to_target_p = df_p[feature_cols].corrwith(df_p[target_col], method="pearson") \
-                                            .sort_values(key=lambda s: s.abs(), ascending=False)
-        
-        corr_to_target_s = df_s[feature_cols].corrwith(df_s[target_col], method="spearman") \
-                                            .sort_values(key=lambda s: s.abs(), ascending=False)
-        
-        # --- export do Excela ---
-        out_xlsx = r"C:\Users\OE00SG\CashPredictor\dev3\wyniki\corr_matrix_sample.xlsx"
-        with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
-            corr_p.to_excel(w, sheet_name="corr_p")
-            corr_s.to_excel(w, sheet_name="corr_s")
-            corr_to_target_p.to_frame("pearson_to_target").to_excel(w, sheet_name="to_target_p")
-            corr_to_target_s.to_frame("spearman_to_target").to_excel(w, sheet_name="to_target_s")
-        
-        print("Saved:", out_xlsx, "shape pearson:", corr_p.shape, "shape spearman:", corr_s.shape)
-        print("Top pearson->target:\n", corr_to_target_p.head(30))
-        print("Top spearman->target:\n", corr_to_target_s.head(30))
-        
-    remaining_columns = df.columns.tolist()
-    removed_columns = set(original_columns) - set(remaining_columns)
-
-    # # --- START 20260110 DROP LEAKY "F*" FEATURES (z wyjątkami) ---
-    
-    # explicit_keep_cols = {
-    #     "FROM_DZIEN_TO_INVO_INVDATE",
-    #     "FROM_DZIEN_TO_INVO_DUEDATE",
-    # }    
-    
-    # cols_before = df.columns.tolist()
-    
-    # to_drop = [
-    #     c for c in df.columns
-    #     if (
-    #         c not in explicit_keep_cols
-    #         and c.startswith("F")
-    #         and any(ch.isdigit() for ch in c)
-    #     )
-    # ]
-    
-    # df = df.drop(columns=to_drop, errors="ignore")
-    
-    # print(f"[LEAKAGE DROP] dropped={len(to_drop)} columns")
-    # print(f"[LEAKAGE DROP] kept explicit={explicit_keep_cols}")
-    # print(f"[LEAKAGE DROP] columns before={len(cols_before)} after={len(df.columns)}")
-    
-    # # --- STOP 20260110 DROP LEAKY "F*" FEATURES (z wyjątkami) ---
-    
-    feature_names = df.drop(params['clear_days'], axis=1).columns.tolist()
-
-    # Następnie wywołujesz get_invoice_date_column_positions:
-    invoice_date_column_positions = get_invoice_date_column_positions(df, params)
-
-    X_np = df.drop(params['clear_days'], axis=1).values
-    input_size = X_np.shape[1]
-    y_np = df[params['clear_days']].values
-
-    if selected_columns is not None and not selected_columns.empty:
-        return (X_np, y_np, input_size, selected_columns, feature_names, invoice_date_column_positions)
-    else:
-        # jak trenujesz model dla wielu kleintów, to podaj w test id te same co w train id bo inaczej wpadnie tutaj        
-        return (X_np, y_np, input_size, feature_names, invoice_date_column_positions)
-
-def compute_mean_std_model1(X):
-    mean = np.mean(X, axis=0)
-    std = np.std(X, axis=0)
-    return mean, std
-
-def normalize_data_model1(X, mean, std):
-    return (X - mean) / (std + 1e-10)
-
-def prepare_for_training(train_start, train_end, operation_mode, params, device):
-    is_training = True
-    model_id=1
-    X_train_np, y_train_np, input_size, additional_data, feature_names, invoice_date_column_positions = preprocess_data_model1(train_start, train_end, params, operation_mode=operation_mode,currently_testing=False, train_on_all=False)
-    
-    # Pominięcie wierszy z NULL w kolumnie daty zapłaty dla treningu
-    valid_indices = ~np.isnan(y_train_np)
-    X_train_np = X_train_np[valid_indices]
-    y_train_np = y_train_np[valid_indices]   
-
-    # Wyświetlenie ilości wierszy pominiętych w stosunku do wszystkich
-    total_rows = len(y_train_np) + sum(~valid_indices)
-    skipped_rows = sum(~valid_indices)
-    print(f"Pominięto {skipped_rows} z {total_rows} wierszy (NULL w kolumnie daty zapłaty).")
-    
-    X_train, X_test, y_train, y_test = train_test_split(X_train_np, y_train_np, test_size=0.01, random_state=42)
-    mean_np, std_np = compute_mean_std_model1(X_train)
-    mean = torch.from_numpy(mean_np).to(device).to(torch.float32)
-    std = torch.from_numpy(std_np).to(device).to(torch.float32)
-    X_train_tensor = torch.tensor(X_train, dtype=torch.float).to(device)
-    y_train_tensor = torch.tensor(y_train.reshape((-1, 1)), dtype=torch.float).to(device)
-    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-    train_dataloader = DataLoader(train_dataset, batch_size=params['batch_size'], shuffle=True, drop_last=True)
-    
-    X_test_tensor = torch.tensor(X_test, dtype=torch.float).to(device)
-    y_test_tensor = torch.tensor(y_test.reshape((-1, 1)), dtype=torch.float).to(device)
-    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
-    test_dataloader = DataLoader(test_dataset, batch_size=params['batch_size'], shuffle=False, drop_last=True)
-    
-    return train_dataloader, test_dataloader, mean, std, input_size, model_id, invoice_date_column_positions
-
-def prepare_for_testing(test_start, test_end, operation_mode, params, device):
-    is_training = False
-    model_id=1
-    X_test_np, y_test_np, input_size, additional_data, feature_names, invoice_date_column_positions = preprocess_data_model1(test_start, test_end, params, operation_mode=operation_mode, currently_testing=True)
-    X_test_tensor = torch.tensor(X_test_np, dtype=torch.float).to(device)
-    y_test_tensor = torch.tensor(y_test_np.reshape((-1, 1)), dtype=torch.float).to(device)
-    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
-    test_dataloader = DataLoader(test_dataset, batch_size=params['batch_size'], shuffle=False, drop_last=(operation_mode not in params['test_modes']))
-    return test_dataloader, additional_data, input_size, model_id, feature_names, invoice_date_column_positions
-
-def get_train_test_params(params, operation_mode, t0, acceptance_period, retrain_period):
-    default_params = {
-        "model_path": params['model_path'],
-        "train_start": datetime.strptime(params['train_start'], '%Y-%m-%d').date(),
-        "train_end": t0 - timedelta(days=acceptance_period),
-        "test_start": t0 - timedelta(days=acceptance_period),
-        "test_end": t0 - timedelta(days=1),
-    }
-
-    mode_params = {
-        "test_today": {
-            "test_start": t0,
-            "test_end": t0
-        },
-        "acceptance_test": {
-            "test_end":  t0 + timedelta(days=acceptance_period)
-        },
-        "test_to_the_end": {
-            "test_start": t0,
-            "test_end": datetime.strptime(params['test_end'], '%Y-%m-%d').date()
-        },
-        "train": {
-            "train_end": t0 - timedelta(days=1)
-        },
-        "retrain_periods": {
-            "train_end": t0 - timedelta(days=1)
-        },
-        "train_and_acceptance_test": {
-            "train_start": datetime.strptime(params['train_start'], '%Y-%m-%d').date(),
-            "train_end": t0 - timedelta(days=1) - timedelta(days=acceptance_period),
-            "test_start": t0 - timedelta(days=1) - timedelta(days=acceptance_period),
-            "test_end": t0 - timedelta(days=1)
-        },
-        "both": {},
-        "test_to_today": {
-            "test_start": datetime.strptime(params['train_start'], '%Y-%m-%d').date(),
-            "test_end": t0
-        },
-
-        "test_null_to_today": {
-            "test_start": datetime.strptime(params['train_start'], '%Y-%m-%d').date(),
-            "test_end": t0
-        }
-    }
-
-    selected_params = mode_params.get(operation_mode, {})
-    final_params = {**default_params, **selected_params}
-    # 30122025 START dla 100 klientów nie da się przekazać tak długiej nazwy
-    return (final_params['model_path'], final_params['test_start'], final_params['test_end'], final_params['train_start'], final_params['train_end'])
-    # return ('C:/Users/OE00SG/CashPredictor/dev3/model/first_model_FULL_2026-03-02.pt', final_params['test_start'], final_params['test_end'], final_params['train_start'], final_params['train_end'])
-    # 30122025 STOP
-    
-def train_model1(dataloader, model, reg_loss_fn, ce_loss_fn, optimizer, mean, std, device, params, N, alpha, beta):
-    model.train()
-    train_loss = 0.0
-    for X, y in dataloader:
-        X, y = X.to(device), y.to(device)  # y: [B,1]
-        # sanity
-        X = torch.where(torch.isnan(X) | torch.isinf(X), torch.tensor(0.0, device=X.device), X)
-        X = normalize_data_model1(X, mean, std)
-
-        # targety
-        y_days = y.squeeze(-1)                                # [B]
-        cls_target = torch.clamp(y_days.round().long(), 0, N) # indeks klasy 0..N
-
-        optimizer.zero_grad()
-        reg_pred, logits = model(X)                           # reg:[B], logits:[B,N+1]
-
-        # straty
-        loss_reg = reg_loss_fn(reg_pred, y_days)
-        loss_cls = ce_loss_fn(logits, cls_target)
-        loss = alpha * loss_cls + beta * loss_reg
-
-        train_loss += loss.item()
-        loss.backward()
-        optimizer.step()
-
-    avg_loss = train_loss / max(1, len(dataloader))
-    logging.info(f'train total loss: {avg_loss:.6f}')
-    return avg_loss
-
-def extract_date_info(X, params, invoice_date_column_positions, wyodrebnij_date=False):
-    # Pobieranie kolumn na podstawie pozycji z invoice_date_column_positions
-    DNI_OD_UTWORZENIA = X[:, invoice_date_column_positions['DNI_OD_UTWORZENIA']].long()
-    UTW_DZIEN_TYG = X[:, invoice_date_column_positions['UTW_DZIEN_TYG']].long()
-    if wyodrebnij_date:
-        UTW_DZIEN_MIESIACA = X[:, invoice_date_column_positions['UTW_DZIEN_MIESIACA']].long()
-        UTW_MIESIAC = X[:, invoice_date_column_positions['UTW_MIESIAC']].long()
-        UTW_ROK = X[:, invoice_date_column_positions['UTW_ROK']].long()
-        return DNI_OD_UTWORZENIA, UTW_DZIEN_TYG, UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK
-    else:
-        return DNI_OD_UTWORZENIA, UTW_DZIEN_TYG
-
-def get_invoice_date_column_positions(df, params):
-    positions = {
-        'UTW_DZIEN_TYG': df.columns.get_loc(params['UTW_DZIEN_TYG']),
-        'UTW_DZIEN_MIESIACA': df.columns.get_loc(params['UTW_DZIEN_MIESIACA']),
-        'UTW_MIESIAC': df.columns.get_loc(params['UTW_MIESIAC']),
-        'UTW_ROK': df.columns.get_loc(params['UTW_ROK']),
-        'DNI_OD_UTWORZENIA': df.columns.get_loc(params['DNI_OD_UTWORZENIA']),
-    }
-
-    return positions
-
-def adjust_past_predictions(predicted_days, initial_weekday, DNI_OD_UTWORZENIA, params):
-    next_days_probabilities = params['next_days_probabilities']
-    shift_options = {
-        6: params['shift_options6'],
-        5: params['shift_options5'],
-        4: params['shift_options4'],
-        3: params['shift_options3'],
-        2: params['shift_options2'],
-        1: params['shift_options1'],
-        0: params['shift_options0']
-    }
-    
-    shifted_days = torch.zeros_like(predicted_days, dtype=torch.float32, device=predicted_days.device)
-    adjusted_predicted_days = predicted_days.clone()
-    
-    # Iteracja po wszystkich prognozach
-    for i in range(len(predicted_days)):
-        # Przesuwanie, dopóki estymacja jest wcześniejsza niż aktualny dzień
-        while DNI_OD_UTWORZENIA[i] > adjusted_predicted_days[i]:
-            est_weekday = (initial_weekday[i] + adjusted_predicted_days[i]) % 7
-            est_weekday_val = int(est_weekday.item())  # Pobranie estymowanego dnia tygodnia
-
-            shift_option = shift_options[est_weekday_val]  # Pobranie opcji przesunięcia
-            # Losowanie przesunięcia na podstawie opcji dla danego dnia tygodnia
-            chosen_shift = np.random.choice(shift_option, p=next_days_probabilities)
-            adjusted_predicted_days[i] += chosen_shift
-
-    return adjusted_predicted_days
-
-def adjust_predicted_days_for_holidays(predicted_days, UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK, params):
-    # Pobranie dat świątecznych z bazy danych
-    holiday_dates_df = read_data_from_db(params['sql_query_holidays'], params, currently_testing=False)
-
-    if isinstance(holiday_dates_df, pd.DataFrame):
-        holiday_dates_raw = holiday_dates_df['data'].tolist()
-    else:
-        holiday_dates_raw = holiday_dates_df
-
-    # Konwersja Timestamp do date
-    holiday_dates = set()
-    for day in holiday_dates_raw:
-        if isinstance(day, pd.Timestamp):
-            holiday_dates.add(day.date())
-        elif isinstance(day, str):
-            holiday_dates.add(datetime.strptime(day, "%Y-%m-%d").date())
-
-    # Konwersja przewidywanych dni na daty
-    try:
-        predicted_dates = [
-            datetime(UTW_ROK[i].item(), UTW_MIESIAC[i].item(), UTW_DZIEN_MIESIACA[i].item()) + 
-            timedelta(days=int(predicted_days[i].item())) 
-            for i in range(len(predicted_days))
-        ]
-    except OverflowError:
-        print("Błąd: Przewidywana liczba dni jest zbyt duża do konwersji. Prawdopodobnie należy powtórzyć trening.")
-        return None
-
-    adjusted_predicted_days = predicted_days.clone().fill_(0)
-
-    for i, date in enumerate(predicted_dates):
-        original_date = date
-        while date.date() in holiday_dates:
-            date += timedelta(days=1)
-        
-        final_shift = (date - original_date).days
-        adjusted_predicted_days[i] = final_shift
-
-    return predicted_days + adjusted_predicted_days
-    
-def adjust_predicted_days_for_weekends(predicted_days, initial_weekday, UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK, DNI_OD_UTWORZENIA, params):
-    from1 = params['from1']
-    from2 = params['from2']
-    probabilities1 = params['probabilities1']
-    probabilities2 = params['probabilities2']
-
-    # Upewnij się, że to wektory 1D [B]
-    predicted_days = predicted_days.view(-1)      # [B]
-    initial_weekday = initial_weekday.view(-1)    # [B]
-
-    # KLUCZ: dodajemy element-po-elemencie, bez unsqueeze(1)
-    predicted_weekday = (initial_weekday + torch.round(predicted_days).long()) % 7  # [B]
-
-    adjusted_predicted_days = predicted_days.clone()
-    shifted_days = predicted_days.clone().fill_(0)
-
-    for i in range(len(predicted_days)):
-        wday = int(predicted_weekday[i].item())  # skalar
-        if wday == 5:
-            chosen_shift = np.random.choice(from1, p=probabilities1)
-            shifted_days[i] = chosen_shift
-        elif wday == 6:
-            chosen_shift = np.random.choice(from2, p=probabilities2)
-            shifted_days[i] = chosen_shift
-
-    adjusted_predicted_days += shifted_days
-    return adjusted_predicted_days
-
-def adjust_predicted_days(predicted_days, initial_weekday, UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK, DNI_OD_UTWORZENIA, params):
-
-    out_holidays = adjust_predicted_days_for_holidays(predicted_days, UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK, params)
-
-    out_weekends = adjust_predicted_days_for_weekends(out_holidays, initial_weekday, UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK, DNI_OD_UTWORZENIA, params)
-
-    out_past = adjust_past_predictions(out_weekends, initial_weekday, DNI_OD_UTWORZENIA, params)
-    
-    return out_past
-
-def _build_shift_kernels(params, device):
-    """
-    Zwraca:
-      - shift_list: dict weekday-> 1D LongTensor z dozwolonymi przesunięciami (np. [1,2,3])
-      - prob_list:  dict weekday-> 1D FloatTensor z wagami tych przesunięć (sum=1)
-    """
-    # globalne wagi (tak jak w regresji)
-    base_p = torch.tensor(params['next_days_probabilities'], dtype=torch.float32, device=device)
-    base_p = base_p / base_p.sum()
-
-    shift_list, prob_list = {}, {}
-    for w in range(7):
-        opts = params[f'shift_options{w}']  # np. [1,2,3]
-        s = torch.tensor(opts, dtype=torch.long, device=device)
-        # dopasuj długość – jeżeli base_p ma inną długość niż opts, renormalizujemy po przycięciu
-        p = base_p[:len(opts)].clone()
-        p = p / p.sum()
-        shift_list[w] = s
-        prob_list[w]  = p
-    return shift_list, prob_list
-
-def _redistribute_masked_mass(probs, mask_allowed, initial_weekday, device, N, shift_list, prob_list, max_extra_shift=30):
-    """
-    probs: [B, N+1] (ostatnia kolumna = bucket N_plus)
-    mask_allowed: [B, N+1] w {0,1} — 1 = dozwolone, 0 = wyciąć (dla index=N maskę zwykle 1)
-    initial_weekday: [B] w {0..6} — weekday daty bazowej (UTW_DZIEN_TYG)
-    N: max dzień (ostatnia klasa = N_plus)
-    shift_list, prob_list: słowniki weekday-> tensory shiftów i wag (sum=1)
-    max_extra_shift: zabezpieczenie, by nie iterować w nieskończoność,
-                    gdy kolejne cele też są niedozwolone (np. długi okres świąt/weekendów)
-    Zwraca: probs po przerozdziale.
-    """
-    B = probs.size(0)
-    device = probs.device
-    # Kopie robocze
-    out = probs.clone()
-    # Wycinamy masę z zakazanych pozycji (0..N-1). N_plus (kol. N) zwykle nie maskujemy.
-    illegal_mass = out * (1 - mask_allowed)
-    out = out * mask_allowed  # zero w miejscach zabronionych
-
-    # Rozlewamy masę z zakazanych pozycji – dzień po dniu
-    # Przechodzimy po dniach 0..N-1 (klasy zwykłe)
-    for d in range(N):
-        # masa do przeniesienia z dnia d: [B]
-        m = illegal_mass[:, d]  # [B]
-        if torch.all(m == 0):
-            continue
-
-        # Weekday tego dnia: (initial_weekday + d) % 7
-        wday = (initial_weekday + d) % 7  # [B]
-
-        # Dla każdego z 7 wday mamy różne shift-listy i wagi
-        # Zrobimy 7 masek i rozlejemy hurtowo (bez pętli po B)
-        for w in range(7):
-            mask_w = (wday == w)
-            if mask_w.any():
-                m_w = m[mask_w]  # [b_w]
-                if torch.all(m_w == 0):
-                    continue
-                shifts = shift_list[w]  # [S]
-                weights = prob_list[w]  # [S], sum=1
-
-                # targety = d + shift
-                targets = d + shifts  # [S]
-                # kopiujemy, by nie modyfikować oryginału
-                targets_clamped = targets.clone()
-
-                # te > N-1 trafiają do N_plus (indeks N)
-                to_plus = (targets_clamped > (N - 1))
-                targets_clamped[to_plus] = N  # koszyk plus
-
-                # Zderzenie z kolejną maską: jeżeli target też zablokowany,
-                # to w pętli przesuwamy o dodatkowe 1,2,.. aż do max_extra_shift lub do koszyka N_plus.
-                # (lekka pętla po S jest akceptowalna, S zwykle mała: 2–5)
-                # Uwaga: mask_allowed różni się per próbka, więc sprawdzamy na wycinku mask_w
-                for _ in range(max_extra_shift):
-                    # sprawdź gdzie wciąż trafiamy w zabronione (i nie jest to N_plus)
-                    bad = (targets_clamped < N) & (mask_allowed[mask_w, targets_clamped] == 0)
-                    if not bad.any():
-                        break
-                    # spróbuj przesunąć o +1 (w stronę przyszłości)
-                    targets_clamped[bad] += 1
-                    # wszystko co wyjedzie poza N-1 -> N_plus
-                    over = targets_clamped > (N - 1)
-                    targets_clamped[over] = N
-
-                # Teraz rozlewamy m_w * weights na out[mask_w, targets_clamped]
-                # Każda próbka z mask_w dostaje ten sam rozkład wag z dnia d.
-                # Zbudujemy macierz przydziałów: [b_w, S]
-                alloc = m_w.unsqueeze(1) * weights.unsqueeze(0)  # [b_w, S]
-
-                # Suma do N_plus oraz na poszczególne dni
-                # Niestety targets_clamped ma kształt [S]; musimy zebrać po kolumnach S.
-                # Zrobimy pętlę po S (zwykle małą).
-                for j in range(len(shifts)):
-                    t = targets_clamped[j].item()  # int
-                    out[mask_w, t] += alloc[:, j]
-
-    # Renormalizacja (na wszelki wypadek numeryczny)
-    out = out / (out.sum(dim=1, keepdim=True) + 1e-12)
-    return out
-
-def _mask_weekends(B, N, initial_weekday, device):
-    """
-    Zwraca maskę [B,N+1] w {0,1}: sob/nd (5/6) = 0, reszta = 1; kolumna N_plus = 1.
-    """
-    days = torch.arange(N, device=device).view(1, -1).expand(B, -1)  # [B,N]
-    wday = (initial_weekday.view(-1,1) + days) % 7                  # [B,N]
-    allowed = ((wday != 5) & (wday != 6)).float()                   # [B,N]
-    allowed = torch.cat([allowed, torch.ones(B,1, device=device)], dim=1)  # N_plus
-    return allowed
-
-def _mask_past(B, N, dni_od_utworzenia, device):
-    """
-    Maska [B,N+1]: dni < dni_od_utworzenia = 0; reszta = 1; N_plus = 1
-    """
-    d = torch.arange(N, device=device).view(1, -1)                      # [1,N]
-    cutoff = dni_od_utworzenia.view(-1,1)                               # [B,1]
-    allowed = (d >= cutoff).float().expand(d.size(0), -1)               # [B,N]
-    allowed = allowed.clone()  # expand zwraca view; chcemy realny tensor
-    allowed = torch.cat([allowed, torch.ones(B,1, device=device)], dim=1)
-    return allowed
-
-def _mask_holidays(UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK, holidays_set, N, device):
-    """
-    Zwraca maskę [B,N+1] w {0,1}: święta=0, reszta=1; N_plus=1
-    holidays_set: zbiór pythonowy (set) dat.date()
-    Uwaga: generuje pętlę po B (bo set działa w Pythonie). Dla N~180 i B~kilkaset jest OK.
-    """
-    B = UTW_ROK.size(0)
-    allowed = torch.ones(B, N+1, device=device)
-    allowed[:, N] = 1.0  # plus-bucket zawsze dozwolony
-
-    for i in range(B):
-        try:
-            base = datetime(int(UTW_ROK[i].item()), int(UTW_MIESIAC[i].item()), int(UTW_DZIEN_MIESIACA[i].item()))
-        except Exception:
-            # jeżeli baza zła, nie maskuj (albo zamaskuj wszystko — zależnie od preferencji)
-            continue
-        row = torch.ones(N, device=device)
-        for d in range(N):
-            if (base + timedelta(days=int(d))).date() in holidays_set:
-                row[d] = 0.0
-        allowed[i, :N] = row
-    return allowed
-
-def adjust_pmf(probs,  # [B,N+1]
-               initial_weekday,  # [B]
-               UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK,  # [B] int
-               DNI_OD_UTWORZENIA,  # [B] int
-               params, N, device, holidays_set=None):
-    """
-    Zastosuj kolejno: święta -> weekendy -> przeszłość,
-    po każdej fazie przerozdziel masę z pozycji zabronionych do przodu wg shift-kerneli.
-    """
-    shift_list, prob_list = _build_shift_kernels(params, device)
-
-    out = probs.clone()
-
-    # 1) ŚWIĘTA (opcjonalnie)
-    if holidays_set is not None:
-        m_h = _mask_holidays(UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK, holidays_set, N, device)
-        out = _redistribute_masked_mass(out, m_h, initial_weekday, device, N, shift_list, prob_list)
-
-    # 2) WEEKENDY
-    m_w = _mask_weekends(out.size(0), N, initial_weekday, device)
-    out = _redistribute_masked_mass(out, m_w, initial_weekday, device, N, shift_list, prob_list)
-
-    # 3) PRZESZŁOŚĆ
-    m_p = _mask_past(out.size(0), N, DNI_OD_UTWORZENIA, device)
-    out = _redistribute_masked_mass(out, m_p, initial_weekday, device, N, shift_list, prob_list)
-
-    return out
-
-def predict_model1(dataloader, model, mean, std, reg_loss_fn, device, params, invoice_date_column_positions, N):
-    if len(dataloader) == 0:
-        logging.warning("Dataloader is empty. Skipping prediction.")
-        return None, None, [], None  # + dist_pack
-
-    model.eval()
-    avg_err = 0.0
-    predictions = []
-    attributions_list = []
-    feature_names = [f'Feature_{i+1}' for i in range(dataloader.dataset.tensors[0].shape[1])]
-
-    # Do zebrania rozkładów:
-    all_probs = []   # lista np.array shape [N+1]
-    all_expected = []
-    all_median = []
-    all_p_within_7 = []
-    all_p_within_30 = []
-
-    total_null_count = 0
-    total_row_count = 0
-    total_valid_count = 0
-
-    with torch.no_grad():
-        for X, y in dataloader:
-            X, y = X.to(device), y.to(device)
-            DNI_OD_UTWORZENIA, UTW_DZIEN_TYG, UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK = extract_date_info(
-                X, params, invoice_date_column_positions, wyodrebnij_date=True
+        NUM_SHARDS = params['NUM_SHARDS']
+        batch_size = 1000
+        total_inserted_all = 0
+
+        cursor.execute("DELETE FROM dataset_tab WHERE INVO_CLNTNO = ?", (client_id,))
+        conn.commit()
+
+        for shard in range(NUM_SHARDS + 1):
+
+            stats_pivot_sql = load_sql_file(f"{queries_dir}/query_stats_pivot_select.sql")
+            dataset_raw_sql = load_sql_file(f"{queries_dir}/query_dataset_raw_select.sql")
+            client_filter_sql = build_client_filter_sql(alias="g", use_range=True)
+            shard_condition_sql = build_shard_condition_sql(NUM_SHARDS, shard)
+            stats_pivot_sql = stats_pivot_sql.format(
+                client_filter=client_filter_sql,
+                shard_condition=shard_condition_sql,
+            )
+            dataset_raw_sql = dataset_raw_sql.format(
+                stats_pivot_select=stats_pivot_sql,
+                client_filter=client_filter_sql,
+                shard_condition=shard_condition_sql,
             )
 
-            X = torch.where(torch.isnan(X) | torch.isinf(X), torch.tensor(0.0, device=X.device), X)
-            total_null_count += torch.isnan(y).sum().item()
-            total_row_count += y.numel()
+            current_date = pd.to_datetime(min_date)
+            total_inserted_shard = 0
 
-            X = normalize_data_model1(X, mean, std)
-            reg_pred, logits = model(X)              # reg:[B], logits:[B,N+1]
+            while current_date <= pd.to_datetime(data_end_str):
+                next_date = current_date + pd.Timedelta(days=batch_size - 1)
 
-            # sanity clamp regresji (jak u Ciebie)
-            reg_pred = torch.where(torch.isnan(reg_pred), torch.tensor(365., device=device), reg_pred)
-            reg_pred = torch.clamp(reg_pred, min=-1000, max=1000)
-
-            # Captum na regresji
-            attributions_np = explain_model_with_captum(model, X, device)
-            attributions_list.append(attributions_np)
-
-            # PMF i statystyki
-            # temperatura τ>1 wypłaszcza rozkład (τ<1 wyostrza)
-            tau = max(1e-6, params.get('classification_head', {}).get('softmax_temperature', 1.0))
-            probs = F.softmax(logits / tau, dim=-1)  # [B,N+1], suma=1
-
-            adj_cfg = params.get('classification_head', {})
-            if adj_cfg.get('adjust_pmf', False):
-                # święta – przygotuj set (jak w regresji)
-                holidays_df = read_data_from_db(params['sql_query_holidays'], params, currently_testing=False)
-                if isinstance(holidays_df, pd.DataFrame):
-                    hl = holidays_df['data'].tolist()
-                else:
-                    hl = holidays_df
-                holidays_set = set(
-                    d.date() if isinstance(d, pd.Timestamp)
-                    else datetime.strptime(d, "%Y-%m-%d").date()
-                    for d in hl
+                query_batch_insert = f"""
+                INSERT INTO dataset_tab
+                {dataset_raw_sql}
+                """
+                cursor.execute(
+                    query_batch_insert,
+                    (
+                        client_id,
+                        current_date.strftime('%Y-%m-%d'),
+                        next_date.strftime('%Y-%m-%d'),
+                        client_id,
+                        current_date.strftime('%Y-%m-%d'),
+                        next_date.strftime('%Y-%m-%d'),
+                    )
                 )
-                probs = adjust_pmf(
-                    probs,
-                    initial_weekday=UTW_DZIEN_TYG,
-                    UTW_DZIEN_MIESIACA=UTW_DZIEN_MIESIACA,
-                    UTW_MIESIAC=UTW_MIESIAC,
-                    UTW_ROK=UTW_ROK,
-                    DNI_OD_UTWORZENIA=DNI_OD_UTWORZENIA,
-                    params=params,
-                    N=N,
-                    device=device,
-                    holidays_set=holidays_set  # możesz dać None, jeśli chcesz na start tylko weekendy+przeszłość
+                conn.commit()
+
+                batch_inserted = cursor.rowcount if cursor.rowcount != -1 else 0
+                total_inserted_shard += batch_inserted
+                total_inserted_all += batch_inserted
+
+                print(
+                    f"Dla client={client_id}, shard={shard} zaimportowano "
+                    f"{batch_inserted} rekordów dla dni "
+                    f"{current_date.strftime('%Y-%m-%d')} - {next_date.strftime('%Y-%m-%d')}."
                 )
-            
-            cdf = probs.cumsum(dim=-1)
-        
-            idxs = torch.arange(0, N+1, device=probs.device, dtype=probs.dtype)
-            expected_day = (probs * idxs).sum(dim=-1)            # [B]
-            median_day = (cdf >= 0.5).float().argmax(dim=-1)     # [B]
-            p_within_7 = cdf[:, min(7, N)]
-            p_within_30 = cdf[:, min(30, N)]
+                print(datetime.now().strftime("%H:%M:%S"))
 
-            # korekty na dniach z regresji (Twoja logika)
-            all_y_hat = adjust_predicted_days(torch.round(reg_pred), UTW_DZIEN_TYG, UTW_DZIEN_MIESIACA, UTW_MIESIAC, UTW_ROK, DNI_OD_UTWORZENIA, params)
-            predictions.extend(all_y_hat.detach().cpu().numpy().flatten())
+                current_date = next_date + pd.Timedelta(days=1)
 
-            # metryka na nie-NaN y
-            valid_indices = ~torch.isnan(y.squeeze(-1))
-            if valid_indices.sum() > 0:
-                valid_y = y.squeeze(-1)[valid_indices]
-                valid_y_hat = all_y_hat[valid_indices]
-                y_diff_abs = torch.abs(valid_y_hat - valid_y) / torch.abs(valid_y)
-                y_diff_abs = torch.clamp(y_diff_abs, max=1)
-                avg_err += torch.sum(1 - y_diff_abs)
-                total_valid_count += valid_indices.sum().item()
-
-            # zbierz rozkłady
-            all_probs.append(probs.detach().cpu().numpy())          # [B,N+1]
-            all_expected.append(expected_day.detach().cpu().numpy())
-            all_median.append(median_day.detach().cpu().numpy())
-            all_p_within_7.append(p_within_7.detach().cpu().numpy())
-            all_p_within_30.append(p_within_30.detach().cpu().numpy())
-
-    if total_valid_count > 0:
-        avg_err = (avg_err / total_valid_count).item()
-        logging.info(f'Test ACC: {avg_err * 100:.2f}%')
-    else:
-        logging.info("Brak danych do obliczenia ACC. Prawdopodobnie brak zaksięgowanych płatności na dziś.")
-        avg_err = 0.0
-
-    logging.info(f'{total_null_count} z {total_row_count} wierszy (NULL w kolumnie daty zapłaty).')
-
-    # spakuj rozkłady do jednego dicta (po B)
-    dist_pack = {
-        "probs": np.concatenate(all_probs, axis=0),                   # [B, N+1]
-        "expected": np.concatenate(all_expected, axis=0),             # [B]
-        "median": np.concatenate(all_median, axis=0),                 # [B]
-        "p_within_7": np.concatenate(all_p_within_7, axis=0),         # [B]
-        "p_within_30": np.concatenate(all_p_within_30, axis=0),       # [B]
-    }
-    return predictions, avg_err, attributions_list, dist_pack
-
-def save_model(model, optimizer, epoch, mean, std, learning_rate, batch_size, model_path, operation_mode, retrain_period, train_start, train_end): 
-    logging.info(f"Liczba kolumn (cech) przy zapisie modelu: {model.hidden_layer_1.in_features}")
-    
-    # Logowanie parametrów modelu
-    logging.info(f"Zapisuję model do {model_path} z parametrami:")
-    logging.info(f"Epoch: {epoch}")
-    logging.info(f"Learning rate: {learning_rate}")
-    logging.info(f"Batch size: {batch_size}")
-    logging.info(f"Train start: {train_start}")
-    logging.info(f"Train end: {train_end}")    
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'epoch': epoch,
-        'mean': mean,
-        'std': std,
-        'learning_rate': learning_rate,
-        'batch_size': batch_size,
-        'operation_mode': operation_mode,
-        'train_start': train_start.strftime('%Y-%m-%d'),
-        'train_end': train_end.strftime('%Y-%m-%d'),
-    }, model_path)
-    logging.info(f"Model saved to {model_path}")
-
-def load_model(model_path, device, model):
-    try:
-        checkpoint = torch.load(model_path, map_location=device)
-    except FileNotFoundError as e:
-        logging.error(f"Error loading model: {e}")
-        raise
-
-    # 1) Wczytaj wagi modelu tolerancyjnie (nowe głowy/warstwy mogą nie istnieć w starym checkpointcie)
-    missing, unexpected = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-    if missing:
-        logging.info(f"[load] Missing keys (new heads etc.): {missing}")
-    if unexpected:
-        logging.info(f"[load] Unexpected keys: {unexpected}")
-
-    # 2) Dane pomocnicze
-    mean = checkpoint.get('mean', None)
-    std = checkpoint.get('std', None)
-    # Uwaga: stare checkpointy mogą nie mieć tych pól – sprawdź i zaloguj
-    if mean is None or std is None:
-        logging.warning("[load] 'mean' lub 'std' nie znalezione w checkpoint — użyj wartości z treningu/konfiguracji, jeśli to potrzebne.")
-
-    train_end_str = checkpoint.get('train_end', None)
-    train_start_str = checkpoint.get('train_start', None)
-    if train_end_str:
-        train_end = datetime.strptime(train_end_str, '%Y-%m-%d').date()
-    else:
-        train_end = None
-    if train_start_str:
-        train_start = datetime.strptime(train_start_str, '%Y-%m-%d').date()
-    else:
-        train_start = None
-
-    # 3) Zbuduj optimizer i spróbuj wczytać jego stan — jeśli nie pasuje, zainicjalizuj od nowa
-    lr = checkpoint.get('learning_rate', 1e-3)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    try:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    except Exception as e:
-        logging.warning(f"[load] Nie udało się wczytać optimizer_state_dict ({e}). Inicjalizuję optimizer od nowa (lr={lr}).")
-
-    logging.info(f"Wczytuję model z {model_path} z parametrami z checkpointu:")
-    logging.info(f"Epoch: {checkpoint.get('epoch','?')}")
-    logging.info(f"Learning rate: {lr}")
-    logging.info(f"Batch size: {checkpoint.get('batch_size','?')}")
-    logging.info(f"Train start: {train_start}")
-    logging.info(f"Train end: {train_end}")
-
-    return model, optimizer, mean, std, train_end
-
-def first_model(actual_model_path, test_start, test_end, train_start, train_end, params, operation_mode, t0, acceptance_period, retrain_period):
-    avg_accuracy = 0
-    params['operation_mode'] = operation_mode
-    device = params['device'] if torch.cuda.is_available() else 'cpu'
-
-    N = int(params.get('max_estimation_period', 180))
-    keep_reg_head = bool(params.get('keep_regression_head', True))
-
-    cls_cfg = params.get('classification_head', {}) or {}
-    reg_cfg = params.get('regression_head', {}) or {}
-
-    # --- temperatura softmaxu (inference) ---
-    softmax_temperature = float(cls_cfg.get('softmax_temperature', 1.0))
-    # upewnij się, że trafi do predict_model1 przez params
-    params.setdefault('classification_head', {})
-    params['classification_head']['softmax_temperature'] = softmax_temperature
-    
-    alpha = float(cls_cfg.get('loss_weight', 1.0))
-    beta  = float(reg_cfg.get('loss_weight', 0.3))
-    label_smoothing = float(cls_cfg.get('label_smoothing', 0.0))
-    class_weighting = str(cls_cfg.get('class_weighting', 'none')).lower()
-    reg_loss_type = str(reg_cfg.get('loss_type', 'huber')).lower()
-
-    # wagi klas (opcjonalnie) - tutaj placeholder; jeśli chcesz, policz freq i podaj tensor
-    class_weights_tensor = None
-    ce_loss_fn = nn.CrossEntropyLoss(weight=class_weights_tensor, label_smoothing=label_smoothing)
-
-    if reg_loss_type == "huber":
-        reg_loss_fn = nn.HuberLoss()
-    elif reg_loss_type == "mae":
-        reg_loss_fn = nn.L1Loss()
-    else:
-        reg_loss_fn = nn.MSELoss()
-    
-    test_mode_active = operation_mode in params['test_modes'] or operation_mode in params['train_and_test_modes']
-
-    model = NeuralNetModel1(99, params['network_config']['hidden_layers'], params['network_config']['output_size'], n_classes=N+1, keep_regression_head=keep_reg_head).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=params['learning_rate'])
-    is_training_split_test = False
-    if operation_mode in params['train_modes'] or operation_mode in params['retrain_modes'] or operation_mode in params['train_and_test_modes']:
-        is_training = True
-        if operation_mode in params['retrain_modes']:
-            model, optimizer, mean, std, last_train_end = load_model(actual_model_path, device, model)
-            train_start = last_train_end + 1
-            if train_end < train_start:
-                raise ValueError(f"Cannot perform retraining: train_end ({train_end}) is less than train_start ({train_start}).")
-            if train_end < train_start + retrain_period:
-                warnings.warn(f"Train end ({train_end}) is less than train_start ({train_start}) + retrain_period ({retrain_period}). Retraining will be performed on data from {train_start} to {train_end}.")        
-        train_dataloader, test_dataloader, mean, std, input_size, model_id, invoice_date_column_positions = prepare_for_training(train_start, train_end, operation_mode, params, device)    
-        is_training_split_test = True
-        model = NeuralNetModel1(input_size, params['network_config']['hidden_layers'], params['network_config']['output_size'],
-                                n_classes=N+1, keep_regression_head=keep_reg_head).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=params['learning_rate'])
-        
-        for epoch in range(params['epochs']):
-            train_model1(
-                train_dataloader, model,
-                reg_loss_fn, ce_loss_fn, optimizer,
-                mean, std, device, params,
-                N, alpha, beta
+            print(
+                f"[INFO] Client={client_id}, shard={shard} zakończony. "
+                f"Łącznie w shardzie: {total_inserted_shard}"
             )
+
+        cursor.execute("DELETE FROM dataset WHERE INVO_CLNTNO = ?", (client_id,))
+        conn.commit()
+
+        refill_dataset_for_client(
+            conn,
+            client_id=client_id,
+            source_table="dataset_tab",
+            target_table="dataset",
+            batch_days=params.get("dataset_batch_days", 31)
+        )
+        print(datetime.now().strftime("%H:%M:%S"))
         
-        predicted_clear_dates, avg_accuracy, attributions_list, dist_pack = predict_model1(test_dataloader, model, mean, std, reg_loss_fn, device, params, invoice_date_column_positions, N)
-        save_model(model, optimizer, params['epochs'], mean, std, params['learning_rate'], params['batch_size'], actual_model_path, operation_mode, retrain_period, train_start, train_end)
-        is_training_split_test = False
     
-    if test_mode_active and not is_training_split_test:
-        is_training = False        
-        test_dataloader, additional_data, input_size, model_id, feature_names, invoice_date_column_positions = prepare_for_testing(test_start, test_end, operation_mode, params, device)
-        model = NeuralNetModel1(input_size, params['network_config']['hidden_layers'], params['network_config']['output_size'], n_classes=N+1, keep_regression_head=keep_reg_head).to(device)
-        model, optimizer, mean, std, last_train_end = load_model(actual_model_path, device, model)
-        predicted_clear_dates, avg_accuracy, attributions_list, dist_pack = predict_model1(test_dataloader, model, mean, std, reg_loss_fn, device, params, invoice_date_column_positions, N)
-
-        # Zapis wag Captum
-        df_agg = aggregate_attributions(attributions_list, feature_names)
-        output_filename = f"C:/Users/OE00SG/CashPredictor/dev3/wagi/wagi_{params['test_client_id']}.xlsx"
-        df_agg.to_excel(output_filename, index=False)
-        print(f"Istotności wag Captum zostały zapisane do pliku Excel: {output_filename}")
-        
-        additional_data = additional_data.iloc[:len(predicted_clear_dates)].reset_index(drop=True)
-        additional_data[params['created_data_column']] = pd.to_datetime(additional_data[params['created_data_column']], errors='coerce')
-        predicted_payment_dates = pd.to_datetime(additional_data[params['created_data_column']], errors='coerce') + pd.to_timedelta(predicted_clear_dates, unit='D')
-        predictions_df = pd.DataFrame(predicted_clear_dates, columns=[f'predicted_{params["clear_date"]}'])
-        final_output_df = pd.concat([additional_data.reset_index(drop=True), predictions_df], axis=1)
-        final_output_df['PREDICTED_PAYMENT_DATE'] = predicted_payment_dates
-        # --- NEW: rozkład po dniach i KPI z dist_pack ---
-        if dist_pack is not None:
-            probs = dist_pack["probs"]          # shape [B, N+1]
-            expected = dist_pack["expected"]    # [B]
-            median = dist_pack["median"]        # [B]
-            p7 = dist_pack["p_within_7"]        # [B]
-            p30 = dist_pack["p_within_30"]      # [B]
-
-            # upewnij się, że długości się zgadzają
-            B = len(final_output_df)
-            if probs.shape[0] >= B:
-                probs = probs[:B, :]
-                expected = expected[:B]
-                median = median[:B]
-                p7 = p7[:B]
-                p30 = p30[:B]
-
-                # PMF 0..N-1
-                pmf_cols = {f"p_day_{d}": probs[:, d] for d in range(N)}
-                pmf_df = pd.DataFrame(pmf_cols)
-                
-                # Koszyk N+
-                pmf_df[f"p_day_{N}_plus"] = probs[:, N]
-                
-                # Statystyki i KPI
-                stats_df = pd.DataFrame({
-                    "expected_payment_day": expected,
-                    "median_payment_day": median.astype(int, copy=False),
-                    "p_paid_within_7": p7,
-                    "p_paid_within_30": p30,
-                })
-                
-                # Ujednolić indeksy i skleić jednorazowo
-                final_output_df = pd.concat(
-                    [final_output_df.reset_index(drop=True), pmf_df.reset_index(drop=True), stats_df.reset_index(drop=True)],
-                    axis=1
-                )
-            
-        # Uzupełnianie brakujących wartości DATA_ZAPLATY_NA_DZIEN
-        final_output_df[params['clear_date']] = final_output_df.apply(
-            lambda row: pd.Timestamp(t0) if (pd.isnull(row[params['clear_date']]) and pd.Timestamp(t0) > row[params['invoice_date']] + timedelta(days=24))
-            else (row[params['invoice_date']] + timedelta(days=24) if pd.isnull(row[params['clear_date']])
-                  else row[params['clear_date']]),
-            axis=1
-        )
-        run_identifier = f"{operation_mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        final_output_df = final_output_df.copy()
-        if "RunIdentifier" not in final_output_df.columns:
-            final_output_df.insert(0, "RunIdentifier", run_identifier)
-        write_output_to_db(
-            final_output_df,
-            'first_model_tab',
-            params,
-            original_table_name="first_model_tab",
-            currently_testing=True,
-            create_indexes=False,
-            index_columns=None,
-            insert_only=True
-        )
-    return avg_accuracy
+    insert_aggregated_data_temp(conn, data_end_str)
+    
+    # (na końcu)
+    conn.commit()
+    conn.close()
