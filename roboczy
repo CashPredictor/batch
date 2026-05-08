@@ -1,357 +1,388 @@
-Tak. Poniżej masz uporządkowaną, zaktualizowaną wersję.
+Poniżej masz **kompletną specyfikację tego, co dokładnie trzeba zrobić w kodzie dla ETAPU 1 – KONFIGURACJA**, przygotowaną tak, żeby:
 
-Co zmieniamy
+*   spełniała wymagania architektury (GCP / OnePipeline / security),
+*   była **łatwa do przekazania do narzędzia refactoringowego**,
+*   **minimalizowała zmiany później** (Cloud SQL, Secret Manager, container).
 
-1. swieta nie będą już seedowane z config.yaml, tylko z pliku:
-    data/swieta.csv
-2. aggregated_data_temp przenosimy do pliku SQL w schema
-3. dodatkowe indeksy, które wcześniej były tworzone w kodzie, też lecą z katalogu sql/indexes
-4. db_init.py ma już:
-    * nie używać params['query_*']
-    * nie używać params['idx_*']
-    * czytać SQL tylko z plików
-    * ładować święta z CSV
+Na końcu dostajesz też **gotowy prompt do czata “refactorującego kod”**.
 
-⸻
+***
 
-1. Plik SQL dla aggregated_data_temp
+# ✅ ETAP 1 — KONFIGURACJA (pełna specyfikacja)
 
-Dodaj do sql/schema nowy plik:
+## 🎯 Cel
 
-000_create_aggregated_data_temp.sql
+Zbudować **jedno źródło prawdy konfiguracji**, zgodne z:
 
-zawartość:
+*   12-factor app (ENV-based config)
+*   GCP (Secret Manager)
+*   OnePipeline (parametryzacja deploymentu)
+*   security (brak sekretów w kodzie)
 
-CREATE TABLE IF NOT EXISTS aggregated_data_temp (
-    DZIEN DATE NOT NULL,
-    DZIS_DZIEN_TYG INTEGER NOT NULL,
-    DZIS_SOBOTA INTEGER NOT NULL,
-    DZIS_NIEDZIELA INTEGER NOT NULL
-);
+***
 
-To ma być przed 001_create_swieta.sql, więc numeracja 000_... jest dobra.
+# 🧱 1. ZASADY (MUSZĄ być spełnione)
 
-⸻
+## ✅ 1. Zero hardcode w kodzie
 
-2. CSV ze świętami
+❌ ZABRONIONE:
 
-Założenie:
+```python
+DB_PATH = "local.db"
+MODEL_PATH = "/tmp/model.pkl"
+```
 
-* plik: data/swieta.csv
-* separator: przecinek
-* nagłówki:
-    * nazwa
-    * rodzaj
-    * data
-    * rok
-    * mies
-    * dzien
-    * dzien_tyg
+✅ DOZWOLONE:
 
-To jest OK.
+```python
+DB_URL = os.getenv("DB_URL")
+```
 
-⸻
+***
 
-3. Co jeszcze wyrzucamy z config.yaml
+## ✅ 2. ENV jako główne źródło konfiguracji
 
-Po tej zmianie z configa możesz już docelowo usunąć:
+Priorytet:
 
-* query_swieta
-* swieta_columns
-* swieta_rows
-* wszystkie query_create_*
-* wszystkie query_create_*view*
-* wszystkie idx_*
+1.  ENV variables
+2.  .env (lokalnie tylko)
+3.  default (minimalny)
 
-W configu zostają tylko ścieżki typu:
+***
 
-* sql_paths
-* ewentualnie data_paths
+## ✅ 3. Rozdzielenie konfiguracji
 
-⸻
+Muszą istnieć **3 typy configów**:
 
-4. Zaktualizowany db_init.py
+| Typ            | Przykład            |
+| -------------- | ------------------- |
+| runtime config | DB\_URL, LOG\_LEVEL |
+| ML config      | batch\_size, epochs |
+| infra config   | storage paths       |
 
-Poniżej masz wersję pod nowe podejście.
+***
 
-import argparse
-import csv
+## ✅ 4. Brak sekretów w repo
+
+❌:
+
+```python
+PASSWORD = "admin123"
+```
+
+✅:
+
+*   ENV
+*   Secret Manager (w przyszłości)
+
+***
+
+# 🧩 2. STRUKTURA KODU (co trzeba stworzyć)
+
+## 📁 Nowy katalog
+
+    /config
+       settings.py
+       loader.py
+       schema.py
+
+***
+
+# 🧠 3. DEFINICJA SETTINGS (kluczowy element)
+
+## ✅ Wymagania:
+
+*   typowanie (Python typing)
+*   walidacja
+*   sensowne defaulty tylko lokalnie
+
+***
+
+## ✅ Przykładowa implementacja (do przekazania dalej)
+
+```python
+from dataclasses import dataclass
 import os
-import sqlite3
-import sys
-import yaml
-from pathlib import Path
-def load_sql_file(path: str) -> str:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"SQL file not found: {path}")
-    return p.read_text(encoding="utf-8")
-def exec_sql_file(conn: sqlite3.Connection, path: str) -> None:
-    sql = load_sql_file(path)
-    conn.executescript(sql)
-def exec_sql_dir(conn: sqlite3.Connection, dir_path: str) -> None:
-    sql_dir = Path(dir_path)
-    if not sql_dir.exists():
-        raise FileNotFoundError(f"SQL directory not found: {dir_path}")
-    for path in sorted(sql_dir.glob("*.sql")):
-        print(f"[INFO] Executing {path.name}")
-        exec_sql_file(conn, str(path))
-def load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-def table_exists(cursor: sqlite3.Cursor, table_name: str) -> bool:
-    cursor.execute(
-        """
-        SELECT 1
-        FROM sqlite_master
-        WHERE type = 'table' AND name = ?
-        LIMIT 1
-        """,
-        (table_name,),
+
+@dataclass
+class Settings:
+    # --- ENV ---
+    ENV: str
+
+    # --- DATABASE ---
+    DB_URL: str
+
+    # --- LOGGING ---
+    LOG_LEVEL: str
+
+    # --- BATCH ---
+    JOB_ID: str
+    BATCH_SIZE: int
+
+    # --- STORAGE ---
+    LOCAL_DATA_PATH: str
+    MODEL_PATH: str
+
+    # --- ML ---
+    EPOCHS: int
+    LEARNING_RATE: float
+
+    # --- FEATURE SWITCHES ---
+    ENABLE_CLASSIFICATION_HEAD: bool
+```
+
+***
+
+# 🧠 4. LOADER (logika wczytywania)
+
+## ✅ Wymagania
+
+*   fallback na defaulty (tylko lokalnie)
+*   casting typów
+*   walidacja
+
+***
+
+## ✅ Przykład
+
+```python
+def load_settings() -> Settings:
+    return Settings(
+        ENV=os.getenv("ENV", "local"),
+
+        DB_URL=os.getenv("DB_URL", "sqlite:///local.db"),
+
+        LOG_LEVEL=os.getenv("LOG_LEVEL", "INFO"),
+
+        JOB_ID=os.getenv("JOB_ID", "local-run"),
+
+        BATCH_SIZE=int(os.getenv("BATCH_SIZE", "32")),
+
+        LOCAL_DATA_PATH=os.getenv("LOCAL_DATA_PATH", "./data"),
+        MODEL_PATH=os.getenv("MODEL_PATH", "./models/model.pkl"),
+
+        EPOCHS=int(os.getenv("EPOCHS", "10")),
+        LEARNING_RATE=float(os.getenv("LEARNING_RATE", "0.001")),
+
+        ENABLE_CLASSIFICATION_HEAD=os.getenv("ENABLE_CLASSIFICATION_HEAD", "true") == "true"
     )
-    return cursor.fetchone() is not None
-def seed_swieta_from_csv(cursor: sqlite3.Cursor, csv_path: str) -> None:
-    path = Path(csv_path)
-    if not path.exists():
-        raise FileNotFoundError(f"CSV file with holidays not found: {csv_path}")
-    required_columns = ["nazwa", "rodzaj", "data", "rok", "mies", "dzien", "dzien_tyg"]
-    inserted = 0
-    with path.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f, delimiter=",")
-        if reader.fieldnames is None:
-            raise RuntimeError(f"CSV has no header: {csv_path}")
-        missing = [c for c in required_columns if c not in reader.fieldnames]
-        if missing:
-            raise RuntimeError(
-                f"CSV {csv_path} does not contain required columns: {missing}. "
-                f"Found: {reader.fieldnames}"
-            )
-        for row in reader:
-            values = (
-                row["nazwa"],
-                row["rodzaj"],
-                row["data"],
-                int(row["rok"]) if row["rok"] not in (None, "") else None,
-                int(row["mies"]) if row["mies"] not in (None, "") else None,
-                int(row["dzien"]) if row["dzien"] not in (None, "") else None,
-                row["dzien_tyg"],
-            )
-            cursor.execute(
-                """
-                SELECT 1
-                FROM swieta
-                WHERE nazwa = ?
-                  AND rodzaj = ?
-                  AND data = ?
-                  AND rok = ?
-                  AND mies = ?
-                  AND dzien = ?
-                  AND dzien_tyg = ?
-                LIMIT 1
-                """,
-                values,
-            )
-            exists = cursor.fetchone() is not None
-            if not exists:
-                cursor.execute(
-                    """
-                    INSERT INTO swieta (nazwa, rodzaj, data, rok, mies, dzien, dzien_tyg)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    values,
-                )
-                inserted += 1
-    print(f"[OK] Seed swieta z CSV zakończony. Dodano {inserted} nowych rekordów.")
-def main() -> None:
-    parser = argparse.ArgumentParser(description="SQLite DB schema initialization")
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--db-path", required=True)
-    args = parser.parse_args()
-    if os.path.exists(args.db_path):
-        print(f"[ERROR] Baza już istnieje: {args.db_path}")
-        sys.exit(1)
-    os.makedirs(os.path.dirname(args.db_path), exist_ok=True)
-    cfg = load_config(args.config)
-    sql_paths = cfg["sql_paths"]
-    schema_dir = sql_paths["schema_dir"]
-    views_dir = sql_paths["views_dir"]
-    indexes_dir = sql_paths["indexes_dir"]
-    # możesz trzymać też to w configu jako data_paths["swieta_csv"]
-    swieta_csv_path = cfg.get("data_paths", {}).get("swieta_csv", "data/swieta.csv")
-    conn = sqlite3.connect(args.db_path)
-    cursor = conn.cursor()
-    try:
-        # 1. Schema
-        exec_sql_dir(conn, schema_dir)
-        conn.commit()
-        # 2. Seed swieta z CSV
-        if table_exists(cursor, "swieta"):
-            seed_swieta_from_csv(cursor, swieta_csv_path)
-            conn.commit()
-        else:
-            print("[WARN] Tabela 'swieta' nie istnieje po wykonaniu schema.")
-        # 3. Views
-        exec_sql_dir(conn, views_dir)
-        conn.commit()
-        # 4. Indexes
-        exec_sql_dir(conn, indexes_dir)
-        conn.commit()
-        print(f"[OK] Database schema initialized: {args.db_path}")
-    finally:
-        conn.close()
-if __name__ == "__main__":
-    main()
+```
 
-⸻
+***
 
-5. Co ten kod zakłada o katalogach
+# ✅ 5. GLOBALNY ACCESS (ważne)
 
-Zakłada taki układ:
+Nie przekazuj configu ręcznie wszędzie.
 
-sql/schema
-sql/views
-sql/indexes
-data/swieta.csv
+✅ wprowadź singleton:
 
-albo, jeśli chcesz jawnie z configa:
+```python
+settings = load_settings()
+```
 
-sql_paths:
-  schema_dir: sql/schema
-  views_dir: sql/views
-  indexes_dir: sql/indexes
-data_paths:
-  swieta_csv: data/swieta.csv
+***
 
-⸻
+# ⚠️ 6. WALIDACJA (bardzo ważne)
 
-6. Co usunąć z obecnego db_init.py
+## ✅ Dodaj:
 
-Usuń całkiem:
+```python
+def validate(settings: Settings):
+    if settings.DB_URL is None:
+        raise ValueError("DB_URL is required")
 
-* exec_sql
-* create_indexes
-* create_aggregated_data_temp_schema
-* seed_swieta(...) stare oparte o config
-* wszystkie wywołania:
-    * params.get("query_*")
-    * params['idx_*']
-    * ręczne cursor.execute("CREATE INDEX IF NOT EXISTS ...") dla rzeczy, które już wrzuciłeś do sql/indexes
+    if settings.ENV not in ["local", "dev", "test", "prod"]:
+        raise ValueError("Invalid ENV")
+```
 
-⸻
+***
 
-7. Jak to ma teraz działać
+## ✅ Wywołanie:
 
-Kolejność:
+```python
+settings = load_settings()
+validate(settings)
+```
 
-1. tworzy DB
-2. wykonuje wszystko z sql/schema
-3. ładuje święta z data/swieta.csv
-4. wykonuje wszystko z sql/views
-5. wykonuje wszystko z sql/indexes
+***
 
-To jest już spójne.
+# ✅ 7. .env (lokalnie)
 
-⸻
+## ✅ Plik `.env`
 
-8. Ważna uwaga do Twojego obecnego db_init.py
+    ENV=local
+    DB_URL=sqlite:///local.db
+    LOG_LEVEL=INFO
+    BATCH_SIZE=32
+    EPOCHS=10
+    LEARNING_RATE=0.001
 
-W tym, co wkleiłeś wcześniej, miałeś błąd:
+***
 
-schema_dir = cfg["sql_paths"]["schema_dir"]
-views_dir = cfg["sql_paths"]["views_dir"]
-indexes_dir = cfg["sql_paths"]["indexes_dir"]
-exec_sql_dir(conn, schema_dir)
-exec_sql_dir(conn, views_dir)    
-exec_sql_dir(conn, indexes_dir)
-conn = sqlite3.connect(args.db_path)
+## ✅ Loader (opcjonalnie)
 
-To jest niepoprawne, bo conn jest użyte zanim powstanie.
+```python
+from dotenv import load_dotenv
+load_dotenv()
+```
 
-W nowej wersji to jest już naprawione.
+***
 
-⸻
+# ✅ 8. MIGRACJA OBECNEGO KODU (co zmienić)
 
-9. Dodatkowe pliki indeksów ze zdjęcia
+## 🔴 Wyszukaj i zmień:
 
-Na zdjęciu widać, że dodałeś też:
+### 1. Ścieżki
 
-* create_idx_dataset_inv_day.sql
-* create_idx_dataset_clear.sql
-* create_idx_summary_client_days_tab_one_for_all.sql
-* create_idx_group_cust_inv_days_year_month.sql
-* create_idx_invo_one_for_all.sql
-* create_idx_first_model_tab_runid.sql
-* create_idx_first_model_tab_client_day.sql
-* create_idx_first_model_tab_invoice.sql
+```python
+"model.pkl"
+```
 
-To bardzo dobrze — wtedy nie rób ich już w Pythonie. Wystarczy exec_sql_dir(conn, indexes_dir).
+➡️
 
-Czyli po prostu trzymaj całość indeksów w sql/indexes.
+```python
+settings.MODEL_PATH
+```
 
-⸻
+***
 
-10. Proponowane nazwy obiektów ↔ pliki
+### 2. DB
 
-Żeby było spójnie, ja bym przyjął taki wzorzec:
+```python
+sqlite3.connect("file.db")
+```
 
-schema
+➡️
 
-* 000_create_aggregated_data_temp.sql
-* 001_create_swieta.sql
-* 002_create_invo.sql
-* 003_create_debc.sql
-* 004_create_clhs.sql
-* 005_create_dcmo.sql
-* 006_create_group_cust_inv_days.sql
-* 007_create_grouped_client_days.sql
-* 008_create_summary_client_days_tab.sql
-* 009_create_extended_grouped_client_days_tab.sql
-* 010_create_dataset_tab.sql
-* 011_create_dataset.sql
-* 012_create_first_model_tab.sql
-* 013_create_statystyki_faktur.sql
+```python
+create_engine(settings.DB_URL)
+```
 
-views
+***
 
-* 101_create_invo_view.sql
-* 102_create_clhs_view.sql
-* 103_create_debc_view.sql
-* 104_create_dcmo_view.sql
-* 105_create_invo_clhs_joined.sql
-* 106_create_summary_client_days_view.sql
-* 107_create_extended_grouped_client_days.sql
+### 3. Parametry ML
 
-indexes
+```python
+epochs = 10
+```
 
-zostawiłbym tak jak masz:
+➡️
 
-* create_idx_...sql
+```python
+epochs = settings.EPOCHS
+```
 
-To już jest czytelne.
+***
 
-⸻
+### 4. magic numbers
 
-11. Minimalny config po zmianie
+```python
+batch_size = 32
+```
 
-Przykład:
+➡️ CONFIG
 
-sql_paths:
-  schema_dir: sql/schema
-  views_dir: sql/views
-  indexes_dir: sql/indexes
-data_paths:
-  swieta_csv: data/swieta.csv
-first_model_params:
-  database: ...
-  multi_client_excel_path: ...
-  od_dnia: ...
-  NUM_SHARDS: ...
-  excel_date_columns:
-    INVO: [...]
-    DEBC: [...]
-    CLHS: [...]
-    DCMO: [...]
+***
 
-⸻
+# ✅ 9. READY FOR CLOUD (dlaczego to działa)
 
-Najkrócej: tak, teraz kierunek jest dobry — db_init.py powinien już iść wyłącznie w pliki + CSV dla świąt. Jeśli chcesz, mogę teraz od razu przygotować Ci też analogiczne odchudzenie build_dataset_db.py, żeby tam już nie było żadnych resztek po configowych SQL-ach.
+Po tej zmianie:
+
+### ✅ Local:
+
+    DB_URL=sqlite:///local.db
+
+### ✅ GCP:
+
+    DB_URL=postgresql://user:pass@cloudsql:5432/db
+
+➡️ ZERO zmian w kodzie
+
+***
+
+# ✅ 10. COMPLIANCE CHECK (czy spełnia wymagania)
+
+| Wymaganie                 | Status |
+| ------------------------- | ------ |
+| brak sekretów w kodzie    | ✅      |
+| ENV-based config          | ✅      |
+| gotowe pod pipeline       | ✅      |
+| gotowe pod Secret Manager | ✅      |
+| audytowalne               | ✅      |
+
+***
+
+# 🧠 PROMPT DO CZATA REFACOTORUJĄCEGO KOD
+
+Skopiuj ↓
+
+***
+
+## 🧾 PROMPT
+
+    Masz za zadanie przeprowadzić refactoring kodu Python aplikacji ML (Cash Predictor), aby wdrożyć centralny system konfiguracji zgodny z zasadami:
+
+    - 12-factor app (config przez ENV)
+    - brak hardcode wartości
+    - przygotowanie pod GCP i Cloud SQL
+    - przyszła integracja z Secret Manager
+    - zgodność z CI/CD (OnePipeline)
+
+    Wymagania:
+
+    1. Utwórz strukturę:
+       /config/settings.py
+       /config/loader.py
+
+    2. Zdefiniuj klasę Settings (dataclass lub pydantic) zawierającą:
+       - ENV
+       - DB_URL
+       - LOG_LEVEL
+       - JOB_ID
+       - BATCH_SIZE
+       - LOCAL_DATA_PATH
+       - MODEL_PATH
+       - EPOCHS
+       - LEARNING_RATE
+       - ENABLE_CLASSIFICATION_HEAD
+
+    3. Zaimplementuj funkcję load_settings():
+       - pobiera dane z ENV
+       - ma sensowne defaulty dla local
+       - konwertuje typy (int, float, bool)
+
+    4. Dodaj walidację ustawień (np. ENV tylko local/dev/test/prod, DB_URL wymagane)
+
+    5. Wprowadź globalny dostęp:
+       settings = load_settings()
+
+    6. Zrefaktoruj istniejący kod:
+       - usuń wszystkie hardcoded wartości
+       - zastąp:
+         - ścieżki -> settings
+         - DB connection -> settings.DB_URL
+         - parametry modelu -> settings
+       - NIE zmieniaj logiki biznesowej
+
+    7. Nie wprowadzaj zależności, które wymagają internetu
+
+    8. Kod ma być kompatybilny z przyszłą migracją:
+       - SQLite → PostgreSQL
+       - local → GCP
+
+    9. Nie zmieniaj struktury funkcjonalnej aplikacji — tylko konfigurację
+
+    Wynik:
+    - pełny refactored kod
+    - nowe pliki config
+    - lista zmian
+
+***
+
+# 🚀 Jeśli chcesz dalej
+
+Mogę kolejnym krokiem zrobić:
+
+✅ gotowy **template loggera pod GCP (structured logging)**  
+✅ warstwę DB (SQLite → PostgreSQL-ready)  
+✅ albo skeleton pod Docker + ENV injection
