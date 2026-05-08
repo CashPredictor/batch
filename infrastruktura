@@ -1,16 +1,397 @@
-service_display_name,name,quantity,region,service_id,sku,"total_price, USD",notes
-GKE (Kubernetes Engine),Zonal Kubernetes Clusters,1.0,global,CCD8-9BF1-090E,6B92-A835-08AB,73,
-GKE (Kubernetes Engine),Regional Kubernetes Clusters,0.0,global,CCD8-9BF1-090E,B561-BFBD-1264,0,
-GKE (Kubernetes Engine),Nvidia Tesla T4 GPU running in Warsaw,32.0,europe-central2,CCD8-9BF1-090E,63E1-FFD5-0FA7,13.12,
-GKE (Kubernetes Engine),Balanced PD Capacity in Warsaw,0.1,europe-central2,CCD8-9BF1-090E,7F37-4B04-C4BF,0.013,
-GKE (Kubernetes Engine),N1 Predefined Instance Core running in Warsaw,512.0,europe-central2,CCD8-9BF1-090E,8131-C7CF-24C6,19.584,
-GKE (Kubernetes Engine),N1 Predefined Instance Ram running in Warsaw,1920.0,europe-central2,CCD8-9BF1-090E,1B51-BAD1-3C07,9.84384,
-GKE 2 (Kubernetes Engine),Zonal Kubernetes Clusters,1.0,global,CCD8-9BF1-090E,6B92-A835-08AB,73,
-GKE 2 (Kubernetes Engine),Regional Kubernetes Clusters,0.0,global,CCD8-9BF1-090E,B561-BFBD-1264,0,
-GKE 2 (Kubernetes Engine),Balanced PD Capacity in Warsaw,10.0,europe-central2,CCD8-9BF1-090E,7F37-4B04-C4BF,1.3,
-GKE 2 (Kubernetes Engine),Custom Instance Ram running in Warsaw,2920.0,europe-central2,CCD8-9BF1-090E,EE8C-8C3B-96EE,15.70843,
-GKE 2 (Kubernetes Engine),Custom Instance Core running in Warsaw,1460.0,europe-central2,CCD8-9BF1-090E,76F7-C3FC-E954,58.63652,
-PostgreSQL (Cloud SQL),Cloud SQL for PostgreSQL: Zonal - Micro instance in Warsaw,730.0,europe-central2,9662-B51E-5089,E52B-F700-310D,9.198,
-PostgreSQL (Cloud SQL),Cloud SQL for PostgreSQL: Zonal - Standard storage in Warsaw,73000.0,europe-central2,9662-B51E-5089,0743-3BA4-1E28,18.99898,
-Cloud Storage,Standard Storage Warsaw,100.0,europe-central2,95FF-2EF5-5EA1,109D-AA78-91BA,2.3,
+Architektura aplikacji Cash Predictor PLICF – opis tekstowy
 
+Ogólny cel architektury
+
+Architektura przedstawia środowisko aplikacji AI/ML „Cash Predictor PLICF” uruchomione w Google Cloud Platform (GCP), zintegrowane z infrastrukturą bankową on-premise przez IPC/FES oraz wykorzystujące:
+
+* Kubernetes (GKE),
+* Cloud SQL (PostgreSQL),
+* Cloud Storage,
+* GPU do treningu modeli,
+* Secret Manager,
+* komunikację HTTPS/SFTP z systemami bankowymi.
+
+Architektura została przygotowana głównie pod przetwarzanie batchowe (offline/batch processing), a nie pod API realtime.
+
+⸻
+
+Różnice pomiędzy dwoma diagramami
+
+Diagram 1 – infrastrukturalny / deploymentowy
+
+Pierwszy diagram pokazuje:
+
+* konkretne zasoby infrastrukturalne,
+* parametry maszyn,
+* podział na Pody Kubernetes,
+* ilość CPU/RAM,
+* GPU,
+* połączenia techniczne,
+* komponenty pomocnicze (sql proxy, init container),
+* region deploymentu,
+* Secret Manager,
+* połączenie z IPC/DWH.
+
+To jest diagram bardziej techniczny / operacyjny.
+
+⸻
+
+Diagram 2 – logiczny / integracyjny
+
+Drugi diagram pokazuje:
+
+* przepływy integracyjne,
+* komunikację między bankiem a GCP,
+* protokoły komunikacyjne,
+* logiczny podział aplikacji,
+* relacje pomiędzy komponentami,
+* zależności systemowe.
+
+To jest bardziej diagram Solution Intent / integracyjny.
+
+⸻
+
+Architektura – komponenty
+
+1. Środowisko Google Cloud Platform (GCP)
+
+Cała aplikacja działa w regionie:
+
+* europe-central2
+* lokalizacja: Warszawa
+
+⸻
+
+2. GKE / Kubernetes
+
+Aplikacja działa na Kubernetes Engine (GKE).
+
+W architekturze występują dwa główne Pody:
+
+⸻
+
+Pod 1 – Backend
+
+Komponent odpowiedzialny za backend aplikacji.
+
+Konfiguracja:
+
+* Typ maszyny:
+    * n1 custom
+* CPU:
+    * 2 vCPU
+* RAM:
+    * 4 GB
+
+Wewnątrz poda:
+
+* Backend application
+* SQL Proxy
+* Init Container
+
+Dodatkowe komponenty:
+
+SQL Proxy
+
+* 0.2 CPU
+* 0.2 GB RAM
+
+Odpowiada za bezpieczne połączenie do Cloud SQL.
+
+Init Container
+
+* 0.5 CPU
+* 1 GB RAM
+
+Wykorzystywany do inicjalizacji środowiska przed startem aplikacji.
+
+⸻
+
+Pod 2 – Trainer (Front)
+
+Komponent odpowiedzialny za:
+
+* trening modeli AI/ML,
+* frontend,
+* procesy obliczeniowe.
+
+Konfiguracja:
+
+* GPU:
+    * NVIDIA T4
+* Typ maszyny:
+    * n1-standard-64
+* RAM:
+    * 240 GB
+
+Wewnątrz poda:
+
+* Trainer / Front
+* SQL Proxy
+* Init Container
+
+SQL Proxy
+
+* 0.2 CPU
+* 0.2 GB RAM
+
+Init Container
+
+* 0.5 CPU
+* 1 GB RAM
+
+⸻
+
+3. Cloud SQL (PostgreSQL)
+
+Centralna baza danych aplikacji.
+
+Parametry:
+
+* Typ:
+    * PostgreSQL
+* Instancja:
+    * db-f1-micro
+* vCPU:
+    * 1
+* RAM:
+    * 3.75 GB
+
+Funkcja:
+
+* przechowywanie:
+    * metadanych,
+    * wyników modeli,
+    * konfiguracji,
+    * danych aplikacyjnych.
+
+Lokalizacja:
+
+* Warsaw (Europe-Central2-a)
+
+⸻
+
+4. Cloud Storage
+
+Storage obiektowy wykorzystywany do:
+
+* datasetów,
+* modeli,
+* plików batchowych,
+* danych wejściowych/wyjściowych,
+* artefaktów treningowych.
+
+Parametry:
+
+* 100 GB
+* region:
+    * europe-central2
+
+Na drugim diagramie storage jest opisany jako:
+
+* S3 Cloud Storage
+
+(co prawdopodobnie oznacza storage kompatybilny logicznie z podejściem S3, mimo że fizycznie działa w GCP).
+
+⸻
+
+5. Secret Manager
+
+Wykorzystywany do:
+
+* zarządzania sekretami,
+* hasłami,
+* credentialami,
+* konfiguracją dostępową.
+
+Połączony z podami Kubernetes.
+
+⸻
+
+6. Integracja z bankiem / On-Premise
+
+IPC / DWH_PLICF
+
+Po stronie banku znajduje się:
+
+* IPC
+* hurtownia:
+    * DWH_PLICF
+
+⸻
+
+Integracja FES/FXB/FESII
+
+Diagram pokazuje integrację:
+
+* FES/XFB
+* FESII
+
+Komunikacja realizowana przez:
+
+* HTTPS
+* SFTP
+
+⸻
+
+7. Aktorzy / użytkownicy
+
+Support User
+
+Użytkownik supportowy ma dostęp do środowiska aplikacji.
+
+Actor
+
+Na diagramie logicznym występuje ogólny użytkownik biznesowy/systemowy.
+
+⸻
+
+8. Charakter przetwarzania
+
+Na diagramie znajduje się ważna informacja:
+
+“The current application architecture is only for batch processing.”
+
+Oznacza to:
+
+* brak architektury realtime,
+* brak publicznego API produkcyjnego,
+* procesy działają wsadowo,
+* trening i predykcje wykonywane okresowo.
+
+Dodatkowo:
+
+“If there is a need to use the API in processes, a new Solution Intent will be required.”
+
+Czyli:
+
+* obecny design nie obejmuje API integration runtime,
+* wdrożenie API wymaga nowego projektu architektury/security review.
+
+⸻
+
+Zamówione zasoby GCP – podsumowanie
+
+Kubernetes / GKE
+
+Cluster 1
+
+Koszt bazowy:
+
+* Zonal Kubernetes Cluster:
+    * ~73 USD
+
+GPU:
+
+* NVIDIA Tesla T4:
+    * 32 godziny
+    * ~13.12 USD
+
+Compute:
+
+* N1 Instance Core:
+    * 512 godzin
+    * ~19.58 USD
+
+RAM:
+
+* 1920 GB-hours
+    * ~9.84 USD
+
+Dysk:
+
+* Balanced Persistent Disk:
+    * ~0.013 USD
+
+⸻
+
+Cluster 2
+
+Zonal Kubernetes Cluster:
+
+* ~73 USD
+
+Compute:
+
+* Custom Instance Core:
+    * 1460 godzin
+    * ~58.64 USD
+
+RAM:
+
+* 2920 GB-hours
+    * ~15.71 USD
+
+Dysk:
+
+* Balanced PD:
+    * ~1.3 USD
+
+⸻
+
+Cloud SQL
+
+PostgreSQL
+
+Instancja:
+
+* Micro instance
+
+Koszty:
+
+* Compute:
+    * ~9.20 USD
+* Storage:
+    * ~19 USD
+
+⸻
+
+Cloud Storage
+
+Standard Storage
+
+Region:
+
+* Warsaw / europe-central2
+
+Rozmiar:
+
+* 100 GB
+
+Koszt:
+
+* ~2.30 USD
+
+⸻
+
+Wnioski architektoniczne
+
+Architektura jest:
+
+* batchowa,
+* silnie nastawiona na trening ML,
+* relatywnie mała kosztowo,
+* oparta o pojedynczy region,
+* z wyraźnym rozdzieleniem:
+    * backend,
+    * trainer,
+    * storage,
+    * database.
+
+⸻
+
+Najbardziej zasobożerny komponent:
+
+Trainer/Front z GPU NVIDIA T4 oraz dużą ilością RAM (240 GB).
+
+⸻
+
+Najważniejsze elementy:
+
+1. GKE jako runtime aplikacji.
+2. GPU dla treningu modeli.
+3. Cloud SQL jako centralna baza.
+4. Cloud Storage dla datasetów/modeli.
+5. Integracja bankowa przez IPC/FES.
+6. Secret Manager dla bezpieczeństwa.
+7. Batch-only architecture.
