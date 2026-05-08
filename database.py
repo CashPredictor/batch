@@ -299,3 +299,4 @@ def write_output_to_db(df, table_name, params, original_table_name=None, current
             conn.rollback()
             raise
     logging.info(f"Finished writing DataFrame to table: {table_name}")
+ 
