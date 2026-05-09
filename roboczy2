@@ -1,355 +1,71 @@
-Tak — da się to jasno rozebrać. U Ciebie problem nie jest już w samym pomyśle nowego podejścia, tylko w tym, że nowy SQL nie jest równoważny staremu.
-
-Co było wcześniej
-
-Miałeś taki przepływ:
-
-1. Dla każdego shard budowałeś tekst shard_condition.
-2. Wstrzykiwałeś go do:
-    * query_create_stats_pivot_view
-    * query_create_dataset_raw_view
-3. Tworzyłeś dwa widoki:
-    * stats_pivot_view
-    * dataset_raw_view
-4. Potem robiłeś:
-    * INSERT INTO dataset_tab SELECT * FROM dataset_raw_view WHERE dzien ...
-
-Czyli logika była:
-
-* najpierw pełny widok pivotu statystyk dla shardu,
-* potem pełny widok datasetu raw, który korzystał z tego pivotu,
-* potem insert partiami po dacie.
-
-⸻
-
-Co jest teraz
-
-Teraz robisz:
-
-1. Ładujesz query_stats_pivot_select.sql
-2. Ładujesz query_dataset_raw_select.sql
-3. Wstawiasz do nich:
-    * {client_filter}
-    * {shard_condition}
-    * {stats_pivot_select}
-4. Na końcu wykonujesz:
-
-INSERT INTO dataset_tab
-<duży SELECT ...>
-
-Czyli zamiast tworzyć widoki, budujesz jeden wielki SELECT inline.
-
-To jest poprawne podejście, ale tylko jeśli:
-
-* query_stats_pivot_select.sql odpowiada staremu SELECT z stats_pivot_view
-* query_dataset_raw_select.sql odpowiada staremu SELECT z dataset_raw_view
-
-U Ciebie teraz nie odpowiada.
-
-⸻
-
-Główny błąd: no such column: PARAM_Z_ILU_DNI
-
-To mówi wprost, że w miejscu, gdzie liczysz:
-
-MAX(CASE WHEN PARAM_Z_ILU_DNI = ... THEN ... END)
-
-SQLite nie widzi kolumny PARAM_Z_ILU_DNI.
-
-To oznacza, że w nowym query_stats_pivot_select.sql brakuje źródła tej kolumny.
-
-W starym SQL było
-
-W starym configu miałeś:
-
-FROM group_cust_inv_days g
-LEFT JOIN statystyki_faktur stats_pivot
-ON ...
-WHERE {shard_condition}
-GROUP BY ...
-
-Czyli kolumny:
-
-* PARAM_Z_ILU_DNI
-* SCENARIUSZ
-* AVG_DNI_DO_ZAPLATY
-* itd.
-
-pochodziły z tabeli statystyki_faktur alias stats_pivot.
-
-W nowym wydruku SQL jest
-
-W Twoim wydruku wewnętrzny pivot wygląda tak:
-
-SELECT ...
-FROM group_cust_inv_days g
-where 1=1
-AND g.INVO_CLNTNO = ?
-AND DATE(g.DZIEN) >= DATE(?)
-AND DATE(g.DZIEN) <= DATE(?)
-AND (...)
-GROUP BY ...
-
-I tu nie ma:
-
-LEFT JOIN statystyki_faktur stats_pivot ON ...
-
-Więc to jest dokładna przyczyna błędu.
-
-⸻
-
-Co trzeba poprawić
-
-Musisz poprawić query_stats_pivot_select.sql, żeby znów zawierał join do statystyki_faktur.
-
-Ten plik powinien wyglądać logicznie tak
-
-SELECT
-    g.INVO_ADMNO,
-    g.INVO_CLNTNO,
-    g.INVO_DEBH_NO,
-    g.INVO_DEBC_NO,
-    g.DZIEN,
-    MAX(CASE WHEN stats_pivot.PARAM_Z_ILU_DNI = 7   AND stats_pivot.SCENARIUSZ LIKE 'zapłacone_przed_terminem' THEN stats_pivot.AVG_DNI_DO_ZAPLATY END) AS F7_11_AVG_DNI_DO_ZAPLATY,
-    MAX(CASE WHEN stats_pivot.PARAM_Z_ILU_DNI = 7   AND stats_pivot.SCENARIUSZ LIKE 'zapłacone_przed_terminem' THEN stats_pivot.STDEV_DNI_DO_ZAPLATY END) AS F7_11_STDEV_DNI_DO_ZAPLATY
-    -- itd...
-FROM group_cust_inv_days g
-LEFT JOIN statystyki_faktur stats_pivot
-    ON g.INVO_ADMNO = stats_pivot.INVO_ADMNO
-   AND g.INVO_CLNTNO = stats_pivot.INVO_CLNTNO
-   AND g.INVO_DEBH_NO = stats_pivot.INVO_DEBH_NO
-   AND g.INVO_DEBC_NO = stats_pivot.INVO_DEBC_NO
-   AND DATE(g.DZIEN) = DATE(stats_pivot.DZIEN)
-WHERE 1=1
-{client_filter}
-AND {shard_condition}
-GROUP BY
-    g.INVO_ADMNO,
-    g.INVO_CLNTNO,
-    g.INVO_DEBH_NO,
-    g.INVO_DEBC_NO,
-    g.DZIEN
-
-Ważne
-
-Warto już teraz pisać jawnie:
-
-* stats_pivot.PARAM_Z_ILU_DNI
-* stats_pivot.SCENARIUSZ
-* stats_pivot.AVG_DNI_DO_ZAPLATY
-
-zamiast samych nazw kolumn, bo:
-
-* jest czytelniej,
-* unikasz konfliktów nazw,
-* łatwiej debugować.
-
-⸻
-
-Druga różnica: dawniej były VIEW, teraz jest inline subquery
-
-To samo semantycznie może działać tak samo, ale różni się technicznie.
-
-Dawniej
-
-* DROP VIEW
-* CREATE VIEW stats_pivot_view
-* CREATE VIEW dataset_raw_view
-* INSERT ... SELECT * FROM dataset_raw_view WHERE dzien ...
-
-Teraz
-
-* bez widoków
-* budujesz jeden wielki SELECT
-* robisz INSERT ... <SELECT ...>
-
-To jest OK.
-
-Zaleta nowego podejścia
-
-Nie robisz DDL w każdej iteracji shardu:
-
-* mniej DROP VIEW
-* mniej CREATE VIEW
-
-Wada
-
-Masz bardziej złożony SQL inline i łatwiej zgubić fragment, co właśnie się stało.
-
-⸻
-
-Czy logika shardowania jest taka sama?
-
-Tak, jeśli build_shard_condition_sql() zwraca dokładnie to samo, co dawny if shard < NUM_SHARDS ... else ....
-
-U Ciebie zwraca:
-
-* dla shardów 0..NUM_SHARDS-1:
-
-(
-    g.INVO_DEBC_NO IS NOT NULL
-    AND g.INVO_DEBC_NO NOT GLOB '*[^0-9]*'
-    AND (CAST(g.INVO_DEBC_NO AS INTEGER) % {num_shards}) = {shard}
-)
-
-* dla ostatniego shardu:
-
-(
-    g.INVO_DEBC_NO IS NULL
-    OR g.INVO_DEBC_NO GLOB '*[^0-9]*'
-)
-
-To odpowiada starej logice.
-
-Czyli same shardy są OK.
-
-⸻
-
-Czy filtrowanie klienta i daty jest takie samo jak wcześniej?
-
-Nie całkiem.
-
-Wcześniej
-
-W starym kodzie:
-
-* stats_pivot_view miał tylko WHERE {shard_condition}
-* dataset_raw_view też miał tylko WHERE {shard_condition}
-* a zakres dat dokładałeś dopiero tutaj:
-
-INSERT INTO dataset_tab 
-SELECT * FROM dataset_raw_view
-WHERE dzien >= '...' AND dzien <= '...';
-
-Teraz
-
-dokładasz:
-
-* client_filter
-* zakres dat
-
-już wewnątrz:
-
-* stats_pivot_select
-* i znowu w dataset_raw_select
-
-To oznacza, że teraz masz filtrowanie:
-
-* wcześniej
-* bardziej lokalnie
-* i dwa razy
-
-To nie jest błędem. To nawet bywa lepsze. Ale to już nie jest 1:1 ten sam mechanizm.
-
-⸻
-
-Czy wydajnościowo jest to samo?
-
-Najuczciwiej:
-
-Semantycznie
-
-Może być to samo.
-
-Wydajnościowo
-
-Najpewniej bardzo podobne, a czasem nawet trochę lepsze, ale nie gwarantuję 1:1.
-
-Dlaczego:
-
-* w SQLite widok nie jest materializowany jak tabela, tylko jest rozwijany do zapytania
-* więc CREATE VIEW ... SELECT ... i potem SELECT * FROM view często kończy jako podobny plan wykonania
-* nowe podejście unika DROP VIEW/CREATE VIEW, więc może być lżejsze organizacyjnie
-* ale jeśli inline SQL stał się bardziej rozbudowany i masz dwa razy te same filtry, optimizer może to potraktować trochę inaczej
-
-Praktycznie
-
-Po poprawieniu query_stats_pivot_select.sql spodziewałbym się:
-
-* wydajności podobnej,
-* może minimalnie lepszej,
-* na pewno nie dramatycznie gorszej tylko przez sam brak view.
-
-⸻
-
-Co dokładnie poprawić teraz
-
-1. Napraw query_stats_pivot_select.sql
-
-Dodaj z powrotem:
-
-LEFT JOIN statystyki_faktur stats_pivot
-
-i używaj kolumn przez alias stats_pivot.
-
-To jest obowiązkowe.
-
-⸻
-
-2. Upewnij się, że query_dataset_raw_select.sql w miejscu pivotu ma:
-
-LEFT JOIN (
-{stats_pivot_select}
-) pivot
-
-i że potem łączysz po:
-
-ON g.INVO_ADMNO = pivot.INVO_ADMNO
-AND g.INVO_CLNTNO = pivot.INVO_CLNTNO
-AND g.INVO_DEBH_NO = pivot.INVO_DEBH_NO
-AND g.INVO_DEBC_NO = pivot.INVO_DEBC_NO
-AND DATE(g.DZIEN) = DATE(pivot.DZIEN)
-
-U Ciebie teraz jest:
-
-ON pivot.INVO_CLNTNO = i.INVO_CLNTNO
-AND pivot.INVO_ADMNO = i.INVO_ADMNO
-...
-
-To jest podejrzane. W starym kodzie pivot był łączony do g, nie do i.
-
-Powinno zostać po staremu, czyli do g.
-
-⸻
-
-3. Dla czytelności w query_stats_pivot_select.sql
-
-wszędzie zamień np.:
-
-PARAM_Z_ILU_DNI
-SCENARIUSZ
-AVG_DNI_DO_ZAPLATY
+Najbezpieczniej zostaw bazę tam, gdzie była, czyli w katalogu Database/. Wtedy nie rozwalasz starego sposobu pracy, tylko opisujesz go przez DB_URL.
+
+Utwórz strukturę:
+
+CashPredictor/
+  Database/
+    cash_predictor.db
+  data/
+  models/
+  config.yaml
+  .env
+  runner_batch.py
+
+W .env daj:
+
+ENV=local
+DB_URL=sqlite:///Database/cash_predictor.db
+DB_PATH=Database/cash_predictor.db
+CONFIG_PATH=config.yaml
+LOCAL_DATA_PATH=./data
+MODEL_PATH=./models/first_model.pt
+RESULTS_FILE=./model_runs.xlsx
+WEIGHTS_OUTPUT_DIR=./data/wagi
+LOG_LEVEL=INFO
+JOB_ID=local-run
+
+DB_URL to docelowe źródło prawdy, a DB_PATH zostawiłbym chwilowo jako kompatybilność, bo część kodu nadal pracuje lokalnie na ścieżce SQLite.
+
+Z ENV wyrzuciłbym na razie te parametry:
+
+BATCH_SIZE=32
+EPOCHS=10
+LEARNING_RATE=0.001
+ENABLE_CLASSIFICATION_HEAD=true
+
+Dlaczego? Bo one już są w config.yaml jako parametry modelu:
+
+batch_size: 32
+epochs: 5
+learning_rate: 0.0001
+classification_head:
+  enabled: true
+
+Czyli lepiej:
+ENV/.env = runtime/infrastruktura: baza, ścieżki, logi, job id.
+config.yaml = ML/business config: batch size, epochs, learning rate, classification head, SQL query, kolumny, tryby.
+
+W config.yaml zmieniłbym tylko bazę z:
+
+database: 'local.db'
 
 na:
 
-stats_pivot.PARAM_Z_ILU_DNI
-stats_pivot.SCENARIUSZ
-stats_pivot.AVG_DNI_DO_ZAPLATY
+database: 'Database/cash_predictor.db'
 
-⸻
+albo docelowo można ją całkiem ignorować i brać z .env, ale na teraz zostaw tę wartość dla zgodności ze starym kodem.
 
-Najkrótsza diagnoza
+Czyli praktyczna wersja na teraz:
 
-Masz obecnie różnicę między starym a nowym podejściem taką, że:
+common_params:
+  database: 'Database/cash_predictor.db'
 
-* stary kod budował stats_pivot_view z joinem do statystyki_faktur
-* nowy query_stats_pivot_select.sql ten join zgubił
-* przez to kolumny typu PARAM_Z_ILU_DNI nie istnieją w subquery
-* dodatkowo pivot w dataset_raw_select powinien być spinany z g, nie z i
+Model:
 
-⸻
+model_path: './models/first_model.pt'
 
-Co bym zrobił dokładnie
+Excel wejściowy:
 
-1. Najpierw poprawił query_stats_pivot_select.sql, żeby był 1:1 logicznie jak dawny query_create_stats_pivot_view, tylko:
-    * bez CREATE VIEW stats_pivot_view AS
-    * z {client_filter}
-    * z {shard_condition}
-2. Potem sprawdził query_dataset_raw_select.sql, żeby był 1:1 logicznie jak dawny query_create_dataset_raw_view, tylko:
-    * bez CREATE VIEW dataset_raw_view AS
-    * z {stats_pivot_select}
-    * z {client_filter}
-    * z {shard_condition}
-3. Potem dopiero test.
+multi_client_excel_path: './data/input/Bartek_dane_20260429.xlsx'
 
-Jeśli chcesz, w następnym kroku mogę Ci rozpisać dokładnie szablon poprawnego query_stats_pivot_select.sql i fragment query_dataset_raw_select.sql, wskazując gdzie wkleić stare joiny i które aliasy zmienić.
+Najważniejsza zasada: baza SQLite lokalnie może leżeć w Database/, modele w models/, dane wejściowe w data/input/, wyniki/tymczasowe pliki w data/ albo output/. ENV trzyma tylko „gdzie jestem i do czego się podłączam”, YAML trzyma „jak model ma działać”.
