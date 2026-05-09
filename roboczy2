@@ -1,92 +1,77 @@
-Tak — ten .env jest OK:
+Problem jest prosty: runner_batch.py nadal bierze domyślną wartość "local.db" zamiast Twojego .env.
 
-ENV=local
-DB_URL=sqlite:///data/database/CashPredictor.db
-DB_PATH=data/database/CashPredictor.db
-LOG_LEVEL=INFO
-JOB_ID=local-run
-LOCAL_DATA_PATH=./data
-MODEL_PATH=./models/first_model.pt
-RESULTS_FILE=./model_runs.xlsx
-WEIGHTS_OUTPUT_DIR=./data/wagi
-CONFIG_PATH=config.yaml
+Na screenie widać:
 
-Baza będzie fizycznie tutaj:
+FileNotFoundError: Baza nie istnieje: local.db
 
-CashPredictor/data/database/CashPredictor.db
+czyli:
 
-DB_URL jest poprawny. Dla SQLite relatywnego powinno być właśnie:
+* .env nie został wczytany
+    LUB
+* parser CLI ma default "local.db" i ignoruje settings.
 
-DB_URL=sqlite:///data/database/CashPredictor.db
+Najprawdopodobniej masz w runner_batch.py coś takiego:
 
-a nie:
+parser.add_argument("--db-path", default="local.db")
 
-DB_URL=sqlite:////data/database/CashPredictor.db
+i później:
 
-bo to drugie oznaczałoby ścieżkę absolutną od roota systemu.
+validate_db_path(args.db_path)
 
-Najważniejsze: odpalaj skrypty z katalogu głównego projektu, czyli tam gdzie jest runner_batch.py, .env, config.yaml.
+Zmień to na:
 
-Co do podziału ENV vs YAML:
+from config.settings import settings
+parser.add_argument(
+    "--db-path",
+    default=settings.DB_PATH
+)
 
-Zostawiłbym w .env
+albo jeszcze lepiej:
 
-To są parametry runtime / infrastruktura / ścieżki środowiskowe:
+parser.add_argument("--db-path")
 
-ENV=local
-DB_URL=sqlite:///data/database/CashPredictor.db
-DB_PATH=data/database/CashPredictor.db
-LOG_LEVEL=INFO
-JOB_ID=local-run
-LOCAL_DATA_PATH=./data
-MODEL_PATH=./models/first_model.pt
-RESULTS_FILE=./model_runs.xlsx
-WEIGHTS_OUTPUT_DIR=./data/wagi
-CONFIG_PATH=config.yaml
+a potem:
 
-Zostawiłbym w config.yaml
+db_path = args.db_path or settings.DB_PATH
+db_path = validate_db_path(db_path)
 
-To są parametry modelu i logiki ML:
+To jest poprawniejszy wzorzec.
 
-batch_size: 32
-epochs: 5
-learning_rate: 0.0001
-classification_head:
-  enabled: true
+Druga rzecz: upewnij się, że .env jest faktycznie w katalogu:
 
-Nie dublowałbym ich w .env.
+C:\Users\OE00SG\CashPredictor\dev3\gcp batch\
 
-Jedna rzecz do poprawy w YAML
+czyli obok:
 
-Dodałbym do common_params jawnie:
+runner_batch.py
+config.yaml
+.env
 
-database: 'data/database/CashPredictor.db'
+i że masz w loaderze:
 
-Czyli:
+from dotenv import load_dotenv
+load_dotenv()
 
-common_params: &common_params
-  database: 'data/database/CashPredictor.db'
-  model_name: 'ING'
-  ...
+bez tego ENV się nie załaduje.
 
-Kod po refaktoryzacji i tak głównie korzysta z DB_PATH, ale to pole warto zostawić dla zgodności ze starymi miejscami w kodzie.
+Dodatkowo sprawdź:
 
-multi_client_excel_path
+pip install python-dotenv
 
-Ten parametr lepiej docelowo przenieść do ENV, bo to ścieżka wejściowa zależna od środowiska/runu, a nie stały parametr modelu.
+albo:
 
-Docelowo w .env:
+conda install python-dotenv
 
-MULTI_CLIENT_EXCEL_PATH=./data/input/Bartek_dane_20260429.xlsx
+Najbardziej prawdopodobne jest jednak to, że runner_batch.py ma nadal zaszyty:
 
-Ale uwaga: kod, który Ci wcześniej podałem, obecnie czyta to z YAML:
+default="local.db"
 
-multi_client_excel_path: './data/input/Bartek_dane_20260429.xlsx'
+i trzeba go przepiąć na:
 
-Więc na teraz zostaw w YAML, żeby działało. Następny drobny refactor powinien zrobić zasadę:
+default=settings.DB_PATH
 
-file_path = os.getenv("MULTI_CLIENT_EXCEL_PATH", params["multi_client_excel_path"])
+Po tej zmianie powinno już szukać:
 
-Wtedy YAML będzie miał default lokalny, a ENV będzie mógł go nadpisać.
+data/database/CashPredictor.db
 
-Moja rekomendacja na teraz: zostaw multi_client_excel_path w YAML, ale dodaj potem obsługę override z ENV.
+zamiast local.db.
