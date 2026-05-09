@@ -1,388 +1,66 @@
-Poniżej masz **kompletną specyfikację tego, co dokładnie trzeba zrobić w kodzie dla ETAPU 1 – KONFIGURACJA**, przygotowaną tak, żeby:
-
-*   spełniała wymagania architektury (GCP / OnePipeline / security),
-*   była **łatwa do przekazania do narzędzia refactoringowego**,
-*   **minimalizowała zmiany później** (Cloud SQL, Secret Manager, container).
-
-Na końcu dostajesz też **gotowy prompt do czata “refactorującego kod”**.
-
-***
-
-# ✅ ETAP 1 — KONFIGURACJA (pełna specyfikacja)
-
-## 🎯 Cel
-
-Zbudować **jedno źródło prawdy konfiguracji**, zgodne z:
-
-*   12-factor app (ENV-based config)
-*   GCP (Secret Manager)
-*   OnePipeline (parametryzacja deploymentu)
-*   security (brak sekretów w kodzie)
-
-***
-
-# 🧱 1. ZASADY (MUSZĄ być spełnione)
-
-## ✅ 1. Zero hardcode w kodzie
-
-❌ ZABRONIONE:
-
-```python
-DB_PATH = "local.db"
-MODEL_PATH = "/tmp/model.pkl"
-```
-
-✅ DOZWOLONE:
-
-```python
-DB_URL = os.getenv("DB_URL")
-```
-
-***
-
-## ✅ 2. ENV jako główne źródło konfiguracji
-
-Priorytet:
-
-1.  ENV variables
-2.  .env (lokalnie tylko)
-3.  default (minimalny)
-
-***
-
-## ✅ 3. Rozdzielenie konfiguracji
-
-Muszą istnieć **3 typy configów**:
-
-| Typ            | Przykład            |
-| -------------- | ------------------- |
-| runtime config | DB\_URL, LOG\_LEVEL |
-| ML config      | batch\_size, epochs |
-| infra config   | storage paths       |
-
-***
-
-## ✅ 4. Brak sekretów w repo
-
-❌:
-
-```python
-PASSWORD = "admin123"
-```
-
-✅:
-
-*   ENV
-*   Secret Manager (w przyszłości)
-
-***
-
-# 🧩 2. STRUKTURA KODU (co trzeba stworzyć)
-
-## 📁 Nowy katalog
-
-    /config
-       settings.py
-       loader.py
-       schema.py
-
-***
-
-# 🧠 3. DEFINICJA SETTINGS (kluczowy element)
-
-## ✅ Wymagania:
-
-*   typowanie (Python typing)
-*   walidacja
-*   sensowne defaulty tylko lokalnie
-
-***
-
-## ✅ Przykładowa implementacja (do przekazania dalej)
-
-```python
-from dataclasses import dataclass
-import os
-
-@dataclass
-class Settings:
-    # --- ENV ---
-    ENV: str
-
-    # --- DATABASE ---
-    DB_URL: str
-
-    # --- LOGGING ---
-    LOG_LEVEL: str
-
-    # --- BATCH ---
-    JOB_ID: str
-    BATCH_SIZE: int
-
-    # --- STORAGE ---
-    LOCAL_DATA_PATH: str
-    MODEL_PATH: str
-
-    # --- ML ---
-    EPOCHS: int
-    LEARNING_RATE: float
-
-    # --- FEATURE SWITCHES ---
-    ENABLE_CLASSIFICATION_HEAD: bool
-```
-
-***
-
-# 🧠 4. LOADER (logika wczytywania)
-
-## ✅ Wymagania
-
-*   fallback na defaulty (tylko lokalnie)
-*   casting typów
-*   walidacja
-
-***
-
-## ✅ Przykład
-
-```python
-def load_settings() -> Settings:
-    return Settings(
-        ENV=os.getenv("ENV", "local"),
-
-        DB_URL=os.getenv("DB_URL", "sqlite:///local.db"),
-
-        LOG_LEVEL=os.getenv("LOG_LEVEL", "INFO"),
-
-        JOB_ID=os.getenv("JOB_ID", "local-run"),
-
-        BATCH_SIZE=int(os.getenv("BATCH_SIZE", "32")),
-
-        LOCAL_DATA_PATH=os.getenv("LOCAL_DATA_PATH", "./data"),
-        MODEL_PATH=os.getenv("MODEL_PATH", "./models/model.pkl"),
-
-        EPOCHS=int(os.getenv("EPOCHS", "10")),
-        LEARNING_RATE=float(os.getenv("LEARNING_RATE", "0.001")),
-
-        ENABLE_CLASSIFICATION_HEAD=os.getenv("ENABLE_CLASSIFICATION_HEAD", "true") == "true"
-    )
-```
-
-***
-
-# ✅ 5. GLOBALNY ACCESS (ważne)
-
-Nie przekazuj configu ręcznie wszędzie.
-
-✅ wprowadź singleton:
-
-```python
-settings = load_settings()
-```
-
-***
-
-# ⚠️ 6. WALIDACJA (bardzo ważne)
-
-## ✅ Dodaj:
-
-```python
-def validate(settings: Settings):
-    if settings.DB_URL is None:
-        raise ValueError("DB_URL is required")
-
-    if settings.ENV not in ["local", "dev", "test", "prod"]:
-        raise ValueError("Invalid ENV")
-```
-
-***
-
-## ✅ Wywołanie:
-
-```python
-settings = load_settings()
-validate(settings)
-```
-
-***
-
-# ✅ 7. .env (lokalnie)
-
-## ✅ Plik `.env`
-
-    ENV=local
-    DB_URL=sqlite:///local.db
-    LOG_LEVEL=INFO
-    BATCH_SIZE=32
-    EPOCHS=10
-    LEARNING_RATE=0.001
-
-***
-
-## ✅ Loader (opcjonalnie)
-
-```python
-from dotenv import load_dotenv
-load_dotenv()
-```
-
-***
-
-# ✅ 8. MIGRACJA OBECNEGO KODU (co zmienić)
-
-## 🔴 Wyszukaj i zmień:
-
-### 1. Ścieżki
-
-```python
-"model.pkl"
-```
-
-➡️
-
-```python
-settings.MODEL_PATH
-```
-
-***
-
-### 2. DB
-
-```python
-sqlite3.connect("file.db")
-```
-
-➡️
-
-```python
-create_engine(settings.DB_URL)
-```
-
-***
-
-### 3. Parametry ML
-
-```python
-epochs = 10
-```
-
-➡️
-
-```python
-epochs = settings.EPOCHS
-```
-
-***
-
-### 4. magic numbers
-
-```python
-batch_size = 32
-```
-
-➡️ CONFIG
-
-***
-
-# ✅ 9. READY FOR CLOUD (dlaczego to działa)
-
-Po tej zmianie:
-
-### ✅ Local:
-
-    DB_URL=sqlite:///local.db
-
-### ✅ GCP:
-
-    DB_URL=postgresql://user:pass@cloudsql:5432/db
-
-➡️ ZERO zmian w kodzie
-
-***
-
-# ✅ 10. COMPLIANCE CHECK (czy spełnia wymagania)
-
-| Wymaganie                 | Status |
-| ------------------------- | ------ |
-| brak sekretów w kodzie    | ✅      |
-| ENV-based config          | ✅      |
-| gotowe pod pipeline       | ✅      |
-| gotowe pod Secret Manager | ✅      |
-| audytowalne               | ✅      |
-
-***
-
-# 🧠 PROMPT DO CZATA REFACOTORUJĄCEGO KOD
-
-Skopiuj ↓
-
-***
-
-## 🧾 PROMPT
-
-    Masz za zadanie przeprowadzić refactoring kodu Python aplikacji ML (Cash Predictor), aby wdrożyć centralny system konfiguracji zgodny z zasadami:
-
-    - 12-factor app (config przez ENV)
-    - brak hardcode wartości
-    - przygotowanie pod GCP i Cloud SQL
-    - przyszła integracja z Secret Manager
-    - zgodność z CI/CD (OnePipeline)
-
-    Wymagania:
-
-    1. Utwórz strukturę:
-       /config/settings.py
-       /config/loader.py
-
-    2. Zdefiniuj klasę Settings (dataclass lub pydantic) zawierającą:
-       - ENV
-       - DB_URL
-       - LOG_LEVEL
-       - JOB_ID
-       - BATCH_SIZE
-       - LOCAL_DATA_PATH
-       - MODEL_PATH
-       - EPOCHS
-       - LEARNING_RATE
-       - ENABLE_CLASSIFICATION_HEAD
-
-    3. Zaimplementuj funkcję load_settings():
-       - pobiera dane z ENV
-       - ma sensowne defaulty dla local
-       - konwertuje typy (int, float, bool)
-
-    4. Dodaj walidację ustawień (np. ENV tylko local/dev/test/prod, DB_URL wymagane)
-
-    5. Wprowadź globalny dostęp:
-       settings = load_settings()
-
-    6. Zrefaktoruj istniejący kod:
-       - usuń wszystkie hardcoded wartości
-       - zastąp:
-         - ścieżki -> settings
-         - DB connection -> settings.DB_URL
-         - parametry modelu -> settings
-       - NIE zmieniaj logiki biznesowej
-
-    7. Nie wprowadzaj zależności, które wymagają internetu
-
-    8. Kod ma być kompatybilny z przyszłą migracją:
-       - SQLite → PostgreSQL
-       - local → GCP
-
-    9. Nie zmieniaj struktury funkcjonalnej aplikacji — tylko konfigurację
-
-    Wynik:
-    - pełny refactored kod
-    - nowe pliki config
-    - lista zmian
-
-***
-
-# 🚀 Jeśli chcesz dalej
-
-Mogę kolejnym krokiem zrobić:
-
-✅ gotowy **template loggera pod GCP (structured logging)**  
-✅ warstwę DB (SQLite → PostgreSQL-ready)  
-✅ albo skeleton pod Docker + ENV injection
+Tak — najprościej:
+
+1. Zrób backup starego katalogu.
+2. Rozpakuj ZIP.
+3. Skopiuj zawartość refactored_cash_predictor/ do swojego katalogu aplikacji.
+4. Podmień stare pliki:
+    runner_batch.py, first_model.py, db_init.py, database.py, build_dataset_db.py, build_client_dbs.py, config.yaml.
+5. Dodaj nowy katalog:
+    config/
+6. Dodaj .env na podstawie .env.example.
+
+Docelowo struktura katalogu powinna wyglądać mniej więcej tak:
+
+CashPredictor/
+  runner_batch.py
+  first_model.py
+  db_init.py
+  database.py
+  build_dataset_db.py
+  build_client_dbs.py
+  config.yaml
+  .env
+  config/
+    __init__.py
+    schema.py
+    loader.py
+    settings.py
+  data/
+  models/
+
+Najważniejsze: uruchamiaj z katalogu głównego aplikacji, czyli tam, gdzie jest runner_batch.py, config.yaml i folder config/.
+
+Minimalny .env lokalnie:
+
+ENV=local
+DB_URL=sqlite:///local.db
+CONFIG_PATH=config.yaml
+LOCAL_DATA_PATH=./data
+MODEL_PATH=./models/first_model.pt
+RESULTS_FILE=./model_runs.xlsx
+WEIGHTS_OUTPUT_DIR=./data/wagi
+LOG_LEVEL=INFO
+BATCH_SIZE=32
+EPOCHS=10
+LEARNING_RATE=0.001
+ENABLE_CLASSIFICATION_HEAD=true
+
+Jeżeli wcześniej miałeś bazę pod konkretną nazwą, np. cash_predictor.db, zmień:
+
+DB_URL=sqlite:///cash_predictor.db
+
+Jeżeli jakiś skrypt nadal oczekuje starego DB_PATH, możesz dopisać tymczasowo:
+
+DB_PATH=cash_predictor.db
+
+Kolejność testu:
+
+python db_init.py
+python build_dataset_db.py
+python first_model.py
+
+albo, jeśli wcześniej odpalałeś wszystko runnerem:
+
+python runner_batch.py
+
+Najbardziej prawdopodobne miejsca, które trzeba będzie dopasować, to ścieżki w config.yaml: katalog z danymi wejściowymi, nazwy plików Excel/CSV oraz nazwa lokalnej bazy. Zasada: nie dawaj już ścieżek typu C:\Users\..., tylko relatywne, np. ./data/plik.xlsx, ./models/model.pt, ./output/results.xlsx.
