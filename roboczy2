@@ -1,71 +1,150 @@
-Najbezpieczniej zostaw bazę tam, gdzie była, czyli w katalogu Database/. Wtedy nie rozwalasz starego sposobu pracy, tylko opisujesz go przez DB_URL.
-
-Utwórz strukturę:
-
-CashPredictor/
-  Database/
-    cash_predictor.db
-  data/
-  models/
-  config.yaml
-  .env
-  runner_batch.py
-
-W .env daj:
-
+czyuli mamy taki env:
 ENV=local
-DB_URL=sqlite:///Database/cash_predictor.db
-DB_PATH=Database/cash_predictor.db
-CONFIG_PATH=config.yaml
+DB_URL=sqlite:///data/database/CashPredictor.db
+DB_PATH=data/database/CashPredictor.db
+LOG_LEVEL=INFO
+JOB_ID=local-run
 LOCAL_DATA_PATH=./data
 MODEL_PATH=./models/first_model.pt
 RESULTS_FILE=./model_runs.xlsx
 WEIGHTS_OUTPUT_DIR=./data/wagi
-LOG_LEVEL=INFO
-JOB_ID=local-run
+CONFIG_PATH=config.yaml
 
-DB_URL to docelowe źródło prawdy, a DB_PATH zostawiłbym chwilowo jako kompatybilność, bo część kodu nadal pracuje lokalnie na ścieżce SQLite.
+i taki config:
+common_params: &common_params
+  model_name: 'ING'
+  invoice_id: 'INVO_NO'
+  day: 'DZIEN'
+  current_to_date_column: 'current_to_date'
+  day_of_week_column: 'DZIS_DZIEN_TYG'
+  day_of_month_column: 'DZIEN_DAYS_FROM_MONTH_START'
+  days_to_month_end_column: 'DZIEN_DAYS_TO_MONTH_END'
+  month_column: 'DZIEN_MONTH'
+  year_column: 'DZIEN_YEAR'
+  clear_date: 'INVO_FINALPAYMENTDATE'
+  clear_days: 'INVO_FINALPAYMENTDATE_DAYS_DIFF'
+  invoice_date: 'INVO_INVDATE'
+  invoice_DUE_IN_DATE: 'INVO_DUEDATE'
+  invoice_amount: 'INVO_AINITIALH'
+  prediction_0_1: 'prediction'
+  RunIdentifier_column: 'RunIdentifier'
+  saturday_column: 'DZIS_SOBOTA'
+  sunday_column: 'DZIS_NIEDZIELA'
+  PREDICTED_CLEAR_DATE_COLUMN: 'PREDICTED_PAYMENT_DATE'
+  client_id_col: 'INVO_CLNTNO'
+  days: 60
+  days_to_test: 1
+  sequence_length: 90
+  data_limit: 500000
+  sql_paths:
+    schema_dir: "sql/schema"
+    views_dir: "sql/views"
+    indexes_dir: "sql/indexes"
+    queries_dir: "sql/queries"
 
-Z ENV wyrzuciłbym na razie te parametry:
+first_model_params:
+  <<: *common_params
+  excel_date_columns:
+    INVO:
+      - INVO_DATECHANGE
+      - INVO_DATSTARTDELCREDEREINVST
+    DEBC:
+      - DEBC_DATECHANGE
+    CLHS: []
+    DCMO:
+      - DEBC_DATENTRY
+  max_estimation_period: 180
+  keep_regression_head: true
+  classification_head:
+    enabled: true
+    loss_weight: 1.0
+    class_weighting: "balanced"     # none|balanced|custom
+    label_smoothing: 0.0
+    softmax_temperature: 5
+  regression_head:
+    loss_weight: 0.3
+    loss_type: "huber"              # huber|mae|mse
+  remove_tables: False
+  multi_client_excel_path: './data/input/Bartek_dane_20260429.xlsx' # override by environment/deployment config
+  id_columns: ['INVO_NO', 'INVO_DEBH_NO','INVO_FINALPAYMENTDATE']
+  platnik_column: ['INVO_DEBH_NO']
+  non_numeric_cols: ['INVO_NO', 'INVO_ADMNO', 'INVO_CLNTNO', 'INVO_DEBH_NO', 'INVO_DEBC_NO', 'INVO_INVDATE', 'DZIEN', 'INVO_DUEDATE', 'INVO_FINALPAYMENTDATE']
+  od_dnia: '2024-12-22'
+  UTW_DZIEN_TYG: 'INVO_INVDATE_WEEKDAY'
+  UTW_DZIEN_MIESIACA: 'INVO_INVDATE_DAYS_FROM_MONTH_START'
+  UTW_MIESIAC: 'INVO_INVDATE_MONTH'
+  UTW_ROK: 'INVO_INVDATE_YEAR'
+  DNI_OD_UTWORZENIA: 'FROM_DZIEN_TO_INVO_INVDATE'
+  device: cpu
+  model_path: './models/first_model.pt'
+  batch_size: 32
+  epochs: 5
+  learning_rate: 0.0001
+  test_end: '2024-07-31'
+  train_start: '2024-06-22'
+  network_config:
+    hidden_layers: [500, 1000, 500]
+    output_size: 64
+  acceptance_period: 7
+  retrain_period: 7
+  sql_query_test:  "SELECT * FROM dataset WHERE date(INVO_INVDATE) >= '2024-01-22' AND date(DZIEN) >= date('{data_start}') AND date(DZIEN) <= date('{data_end}') and INVO_AINITIALH > 0 AND date(DZIEN) >= '2024-07-22'"
+  sql_query_train: "SELECT * FROM dataset WHERE date(INVO_INVDATE) >= '2024-01-22' AND date(DZIEN) >= date('{data_start}') AND date(DZIEN) <= date('{data_end}') and INVO_AINITIALH > 0 AND date(DZIEN) >= '2024-07-22' AND date(INVO_FINALPAYMENTDATE) <= date('{data_end}')"
+  sql_query_holidays: "SELECT data FROM swieta"  
+  return_columns: ['INVO_NO', 'INVO_ADMNO', 'INVO_CLNTNO', 'INVO_DEBH_NO', 'INVO_DEBC_NO', 'INVO_INVDATE', 'DZIEN', 'INVO_DUEDATE', 'INVO_AINITIALH', 'INVO_FINALPAYMENTDATE','INVO_FINALPAYMENTDATE_DAYS_DIFF']
+  shift_options6: [2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 16, 17, 18, 19, 20, 23, 24, 25, 26, 27]
+  shift_options5: [3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 17, 18, 19, 20, 21, 24, 25, 26, 27, 28]
+  shift_options4: [1, 4, 5, 6, 7, 8, 11, 12, 13, 14, 17, 18, 19, 20, 21, 24, 25, 26, 27, 28]
+  shift_options3: [1, 2, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23, 26, 27, 28]
+  shift_options2: [1, 2, 3, 6, 7, 8, 9, 10, 13, 14, 15, 16, 17, 20, 21, 22, 23, 24, 27, 28]
+  shift_options1: [1, 2, 3, 4, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 21, 22, 23, 24, 27, 28]
+  shift_options0: [1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 15, 16, 17, 18, 19, 22, 23, 24, 25, 26]
+  from1: [-5, -4, -3, -2, -1, 2, 3, 4, 5, 6, 9, 10, 11, 13, 14, 17, 18, 19, 23, 24, 25, 27, 45, 51, 53, 54, 66]
+  from2: [-6, -5, -4, -3, -2, 1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 13, 15, 16, 17, 22, 23, 24, 26, 44, 50, 52, 53, 74]
+  probabilities1: [0.0233, 0.0442, 0.1248, 0.093, 0.1116, 0.2626, 0.1054, 0.0721, 0.0124, 0.0287, 0.024, 0.0039, 0.0062, 0.0054, 0.0031, 0.0008, 0.0078, 0.0031, 0.0054, 0.0023, 0.0016, 0.0481, 0.0047, 0.0016, 0.0023, 0.0008, 0.0008]
+  probabilities2: [0.004, 0.0119, 0.0099, 0.1158, 0.1089, 0.2423, 0.1446, 0.1416, 0.0188, 0.0267, 0.001, 0.0218, 0.0059, 0.0149, 0.001, 0.005, 0.001, 0.0109, 0.004, 0.0069, 0.003, 0.001, 0.0733, 0.003, 0.005, 0.0158, 0.001, 0.001]
+  next_days_probabilities: [0.2879, 0.1837, 0.0076, 0.1174, 0.0485, 0.1392, 0.0431, 0.0311, 0.0369, 0.0125, 0.0129, 0.0027, 0.0053, 0.0004, 0.0138, 0.0058, 0.0267, 0.016, 0.0018, 0.0067]
 
-BATCH_SIZE=32
-EPOCHS=10
-LEARNING_RATE=0.001
-ENABLE_CLASSIFICATION_HEAD=true
+  captum_drop_column: []
+  created_data_column: 'INVO_INVDATE'
+  rows_limit: 3000000
+  enable_tunning: False
+  
+  train_modes: ["train"]
+  retrain_modes: ["retrain_periods"]
+  train_and_test_modes: ["train_and_acceptance_test", "both"]
+  test_modes: ["test_today", "acceptance_test", "test_to_the_end","test_to_today","test_null_to_today"]
+  modes:
+    test_today:
+      number: "1"
+      description: "Test new data for day t0 (today)"
+    acceptance_test:
+      number: "2"
+      description: "Perform acceptance test for last acceptance period to yesterday"
+    test_to_the_end:
+      number: "3"
+      description: "Test from now to the end of data"
+    train:
+      number: "4"
+      description: "Train model until yesterday"
+    retrain_periods:
+      number: "5"
+      description: "Retrain model for last retrain period to yesterday"
+    train_and_acceptance_test:
+      number: "6"
+      description: "Train model until satisfactory accuracy is achieved and run acceptance tests for given period to yesterday"
+    both:
+      number: "7"
+      description: "Train and test from beginning to the end of data"
+    test_to_today:
+      number: "8"
+      description: "Test from beginning of the world to today" 
+    test_null_to_today:
+      number: "9"
+      description: "Test from beginning of the world to today only for invoices without payment date"       
+  NUM_SHARDS: 30
 
-Dlaczego? Bo one już są w config.yaml jako parametry modelu:
 
-batch_size: 32
-epochs: 5
-learning_rate: 0.0001
-classification_head:
-  enabled: true
-
-Czyli lepiej:
-ENV/.env = runtime/infrastruktura: baza, ścieżki, logi, job id.
-config.yaml = ML/business config: batch size, epochs, learning rate, classification head, SQL query, kolumny, tryby.
-
-W config.yaml zmieniłbym tylko bazę z:
-
-database: 'local.db'
-
-na:
-
-database: 'Database/cash_predictor.db'
-
-albo docelowo można ją całkiem ignorować i brać z .env, ale na teraz zostaw tę wartość dla zgodności ze starym kodem.
-
-Czyli praktyczna wersja na teraz:
-
-common_params:
-  database: 'Database/cash_predictor.db'
-
-Model:
-
-model_path: './models/first_model.pt'
-
-Excel wejściowy:
-
-multi_client_excel_path: './data/input/Bartek_dane_20260429.xlsx'
-
-Najważniejsza zasada: baza SQLite lokalnie może leżeć w Database/, modele w models/, dane wejściowe w data/input/, wyniki/tymczasowe pliki w data/ albo output/. ENV trzyma tylko „gdzie jestem i do czego się podłączam”, YAML trzyma „jak model ma działać”.
+przeanalizuj czy jest ok, czy coś jeszcze powinno być tu a nie tu, czy nic się nie pokrywa, z czego korzysta kod który mi wcześneij podałeś
+po refaktoryzacji i czy dobrze pobiera. zastanów się też czy ten parametr nie powinien być w env zamiast w config i jeżeli tak,
+to jak powinien wyglądać?
+  multi_client_excel_path: './data/input/Bartek_dane_20260429.xlsx'
