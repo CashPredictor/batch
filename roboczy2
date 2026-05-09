@@ -1,15 +1,79 @@
-jeszcze chyba to trzeba dodac do env:
-  sql_paths:
-    schema_dir: "sql/schema"
-    views_dir: "sql/views"
-    indexes_dir: "sql/indexes"
-    queries_dir: "sql/queries"
+Tak — to już jest typowy runtime/infrastructure path, więc to MA sens w .env, szczególnie pod GKE i kontenery.
 
-JAK TO DODAĆ DO ENV I JAK TO OBSŁUŻYĆ GDZIE OBECNIE JEST OBSŁUGIWANE NP TAK:
-    queries_dir = params["sql_paths"]["queries_dir"]
+Bo te katalogi:
 
-    sql_paths = common["sql_paths"]
-    
-    schema_dir = sql_paths["schema_dir"]
-    views_dir = sql_paths["views_dir"]
-    indexes_dir = sql_paths["indexes_dir"]
+sql/schema
+sql/views
+sql/indexes
+sql/queries
+
+to nie jest logika modelu ML, tylko lokalizacja zasobów aplikacji.
+
+Czyli dobrze wyczułeś — to powinno wyjść z YAML.
+
+Najczyściej zrób tak:
+
+.env
+
+SQL_SCHEMA_DIR=sql/schema
+SQL_VIEWS_DIR=sql/views
+SQL_INDEXES_DIR=sql/indexes
+SQL_QUERIES_DIR=sql/queries
+
+Potem w config/settings.py dodaj:
+
+SQL_SCHEMA_DIR: str
+SQL_VIEWS_DIR: str
+SQL_INDEXES_DIR: str
+SQL_QUERIES_DIR: str
+
+i w loaderze:
+
+SQL_SCHEMA_DIR=os.getenv("SQL_SCHEMA_DIR", "sql/schema"),
+SQL_VIEWS_DIR=os.getenv("SQL_VIEWS_DIR", "sql/views"),
+SQL_INDEXES_DIR=os.getenv("SQL_INDEXES_DIR", "sql/indexes"),
+SQL_QUERIES_DIR=os.getenv("SQL_QUERIES_DIR", "sql/queries"),
+
+To jest dobra architektura.
+
+Potem obecny kod:
+
+queries_dir = params["sql_paths"]["queries_dir"]
+
+powinieneś zastąpić:
+
+queries_dir = settings.SQL_QUERIES_DIR
+
+A ten fragment:
+
+sql_paths = common["sql_paths"]
+schema_dir = sql_paths["schema_dir"]
+views_dir = sql_paths["views_dir"]
+indexes_dir = sql_paths["indexes_dir"]
+
+zamienić na:
+
+schema_dir = settings.SQL_SCHEMA_DIR
+views_dir = settings.SQL_VIEWS_DIR
+indexes_dir = settings.SQL_INDEXES_DIR
+
+I wtedy możesz całkowicie usunąć z YAML:
+
+sql_paths:
+  schema_dir: "sql/schema"
+  views_dir: "sql/views"
+  indexes_dir: "sql/indexes"
+  queries_dir: "sql/queries"
+
+To jest dokładnie zgodne z Twoim docelowym podziałem:
+
+* .env
+    → runtime / infrastruktura / ścieżki / deployment
+* config.yaml
+    → logika modelu / feature engineering / hyperparametry / SQL query templates
+
+I to będzie bardzo dobrze działało później w Docker/GKE, bo np. w kontenerze możesz zmienić:
+
+SQL_SCHEMA_DIR=/app/sql/schema
+
+bez ruszania YAML.
