@@ -1,187 +1,75 @@
-TO  teraz po tych wszystkich zmianach sprawdź czy mam dobrze pliki konfiguracyujne porobione:
-# loader.py
-from __future__ import annotations
+Nie jest jeszcze OK — masz jedną krytyczną rzecz do poprawy.
 
-import os
-from pathlib import Path
-from urllib.parse import urlparse, unquote
+W loader.py tworzysz:
 
-from .schema import Settings
+SQL_SCHEMA_DIR=...
+SQL_VIEWS_DIR=...
+SQL_INDEXES_DIR=...
+SQL_QUERIES_DIR=...
 
-_ALLOWED_ENVS = {"local", "dev", "test", "prod"}
+ale w schema.py klasa Settings nie ma tych pól. To da błąd:
 
+TypeError: Settings.__init__() got an unexpected keyword argument 'SQL_SCHEMA_DIR'
 
-def _load_dotenv_if_available() -> None:
-    """Load .env for local runs without making python-dotenv a hard dependency."""
-    try:
-        from dotenv import load_dotenv  # type: ignore
-    except ImportError:
-        return
-    load_dotenv()
+Dodaj do schema.py:
 
+# --- SQL PATHS ---
+SQL_SCHEMA_DIR: str
+SQL_VIEWS_DIR: str
+SQL_INDEXES_DIR: str
+SQL_QUERIES_DIR: str
+# --- INPUT FILES ---
+MULTI_CLIENT_EXCEL_PATH: str
 
-def _getenv(name: str, default: str | None = None) -> str | None:
-    value = os.getenv(name)
-    if value is None or value == "":
-        return default
-    return value
+Czyli końcówka schema.py powinna wyglądać tak:
 
-
-def _get_bool(name: str, default: bool) -> bool:
-    raw = _getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _get_int(name: str, default: int) -> int:
-    raw = _getenv(name)
-    if raw is None:
-        return default
-    return int(raw)
-
-
-def _get_float(name: str, default: float) -> float:
-    raw = _getenv(name)
-    if raw is None:
-        return default
-    return float(raw)
-
-
-def sqlite_path_from_db_url(db_url: str) -> str | None:
-    """Return filesystem path for sqlite:/// URLs. Non-SQLite URLs return None.
-
-    This keeps the current SQLite code running locally while the same config field
-    can later point to postgresql://... in GCP/Cloud SQL.
-    """
-    if not db_url.startswith("sqlite://"):
-        return None
-    parsed = urlparse(db_url)
-    if parsed.netloc and parsed.path:
-        # sqlite://host/path is not expected for this app.
-        return unquote(parsed.path)
-    path = unquote(parsed.path or "")
-    if path.startswith("/") and not db_url.startswith("sqlite:////"):
-        # sqlite:///relative.db is parsed as /relative.db; strip only the URL slash.
-        path = path[1:]
-    return path or "local.db"
-
-
-def load_settings() -> Settings:
-    _load_dotenv_if_available()
-
-    env = _getenv("ENV", "local") or "local"
-    default_db_url = "sqlite:///local.db" if env == "local" else None
-    db_url = _getenv("DB_URL", default_db_url)
-
-    settings = Settings(
-        ENV=env,
-        DB_URL=db_url or "",
-        LOG_LEVEL=_getenv("LOG_LEVEL", "INFO") or "INFO",
-        JOB_ID=_getenv("JOB_ID", "local-run") or "local-run",
-        BATCH_SIZE=_get_int("BATCH_SIZE", 32),
-        LOCAL_DATA_PATH=_getenv("LOCAL_DATA_PATH", "./data") or "./data",
-        MODEL_PATH=_getenv("MODEL_PATH", "./models/first_model.pt") or "./models/first_model.pt",
-        RESULTS_FILE=_getenv("RESULTS_FILE", "./model_runs.xlsx") or "./model_runs.xlsx",
-        WEIGHTS_OUTPUT_DIR=_getenv("WEIGHTS_OUTPUT_DIR", "./data/wagi") or "./data/wagi",
-        EPOCHS=_get_int("EPOCHS", 10),
-        LEARNING_RATE=_get_float("LEARNING_RATE", 0.001),
-        ENABLE_CLASSIFICATION_HEAD=_get_bool("ENABLE_CLASSIFICATION_HEAD", True),
-        CONFIG_PATH=_getenv("CONFIG_PATH", "config.yaml") or "config.yaml",
-        DB_PATH=_getenv("DB_PATH", sqlite_path_from_db_url(db_url or "")),
-        TEST_DB_PATH=_getenv("TEST_DB_PATH", None),
-        SQL_SCHEMA_DIR=os.getenv("SQL_SCHEMA_DIR", "sql/schema"),
-        SQL_VIEWS_DIR=os.getenv("SQL_VIEWS_DIR", "sql/views"),
-        SQL_INDEXES_DIR=os.getenv("SQL_INDEXES_DIR", "sql/indexes"),
-        SQL_QUERIES_DIR=os.getenv("SQL_QUERIES_DIR", "sql/queries"),        
-    )
-    validate(settings)
-    return settings
-
-
-def validate(settings: Settings) -> None:
-    if settings.ENV not in _ALLOWED_ENVS:
-        raise ValueError(f"Invalid ENV '{settings.ENV}'. Allowed values: {sorted(_ALLOWED_ENVS)}")
-    if not settings.DB_URL:
-        raise ValueError("DB_URL is required")
-    if settings.BATCH_SIZE <= 0:
-        raise ValueError("BATCH_SIZE must be greater than 0")
-    if settings.EPOCHS <= 0:
-        raise ValueError("EPOCHS must be greater than 0")
-    if settings.LEARNING_RATE <= 0:
-        raise ValueError("LEARNING_RATE must be greater than 0")
-
-    if settings.ENV != "local" and settings.DB_URL.startswith("sqlite://"):
-        raise ValueError("SQLite DB_URL is allowed only for ENV=local")
-
-    for path_value in [settings.LOCAL_DATA_PATH, settings.MODEL_PATH, settings.RESULTS_FILE, settings.WEIGHTS_OUTPUT_DIR]:
-        if path_value:
-            parent = Path(path_value).parent if Path(path_value).suffix else Path(path_value)
-            parent.mkdir(parents=True, exist_ok=True)
-
-
-# __init__.py
-from .settings import settings
-from .schema import Settings
-from .loader import load_settings, validate, sqlite_path_from_db_url
-
-__all__ = ["Settings", "settings", "load_settings", "validate", "sqlite_path_from_db_url"]
-
-
-# schema.py
-from dataclasses import dataclass
-from typing import Optional
-
-
-@dataclass(frozen=True)
-class Settings:
-    # --- ENV ---
-    ENV: str
-
-    # --- DATABASE ---
-    DB_URL: str
-
-    # --- LOGGING ---
-    LOG_LEVEL: str
-
-    # --- BATCH ---
-    JOB_ID: str
-    BATCH_SIZE: int
-
-    # --- STORAGE ---
-    LOCAL_DATA_PATH: str
-    MODEL_PATH: str
-    RESULTS_FILE: str
-    WEIGHTS_OUTPUT_DIR: str
-
-    # --- ML ---
-    EPOCHS: int
-    LEARNING_RATE: float
-
-    # --- FEATURE SWITCHES ---
-    ENABLE_CLASSIFICATION_HEAD: bool
-
-    # --- OPTIONAL LOCAL COMPATIBILITY ---
     CONFIG_PATH: str
     DB_PATH: Optional[str] = None
     TEST_DB_PATH: Optional[str] = None
+    # --- SQL PATHS ---
+    SQL_SCHEMA_DIR: str = "sql/schema"
+    SQL_VIEWS_DIR: str = "sql/views"
+    SQL_INDEXES_DIR: str = "sql/indexes"
+    SQL_QUERIES_DIR: str = "sql/queries"
+    # --- INPUT FILES ---
+    MULTI_CLIENT_EXCEL_PATH: str = "./data/input/Bartek_dane_20260429.xlsx"
 
+W loader.py dodaj też:
 
-#settings.py
+MULTI_CLIENT_EXCEL_PATH=_getenv(
+    "MULTI_CLIENT_EXCEL_PATH",
+    "./data/input/Bartek_dane_20260429.xlsx"
+) or "./data/input/Bartek_dane_20260429.xlsx",
 
-from .loader import load_settings
+czyli w konstruktorze Settings(...):
+
+        SQL_SCHEMA_DIR=_getenv("SQL_SCHEMA_DIR", "sql/schema") or "sql/schema",
+        SQL_VIEWS_DIR=_getenv("SQL_VIEWS_DIR", "sql/views") or "sql/views",
+        SQL_INDEXES_DIR=_getenv("SQL_INDEXES_DIR", "sql/indexes") or "sql/indexes",
+        SQL_QUERIES_DIR=_getenv("SQL_QUERIES_DIR", "sql/queries") or "sql/queries",
+        MULTI_CLIENT_EXCEL_PATH=_getenv(
+            "MULTI_CLIENT_EXCEL_PATH",
+            "./data/input/Bartek_dane_20260429.xlsx"
+        ) or "./data/input/Bartek_dane_20260429.xlsx",
+
+W settings.py usuń to:
+
 from dotenv import load_dotenv
 load_dotenv()
-
 SQL_SCHEMA_DIR: str
 SQL_VIEWS_DIR: str
 SQL_INDEXES_DIR: str
 SQL_QUERIES_DIR: str
 
+Zostaw tylko:
 
+from .loader import load_settings
 settings = load_settings()
 
-i env:
+Bo .env już ładujesz w loader.py.
+
+Twój .env jest OK:
+
 ENV=local
 DB_URL=sqlite:///data/database/CashPredictor.db
 DB_PATH=data/database/CashPredictor.db
@@ -198,4 +86,51 @@ SQL_VIEWS_DIR=sql/views
 SQL_INDEXES_DIR=sql/indexes
 SQL_QUERIES_DIR=sql/queries
 
-czyuli sprawdź czy jest ok po tych zmianach w configu, scieżki powinny byc przesuniete do env i odpowiednio zaktualizowane również inne pliki.
+Potem w kodzie zamień:
+
+queries_dir = params["sql_paths"]["queries_dir"]
+
+na:
+
+from config import settings
+queries_dir = settings.SQL_QUERIES_DIR
+
+oraz:
+
+sql_paths = common["sql_paths"]
+schema_dir = sql_paths["schema_dir"]
+views_dir = sql_paths["views_dir"]
+indexes_dir = sql_paths["indexes_dir"]
+
+na:
+
+from config import settings
+schema_dir = settings.SQL_SCHEMA_DIR
+views_dir = settings.SQL_VIEWS_DIR
+indexes_dir = settings.SQL_INDEXES_DIR
+
+I dla Excela:
+
+multi_client_excel_path = params["multi_client_excel_path"]
+
+zamień na:
+
+multi_client_excel_path = settings.MULTI_CLIENT_EXCEL_PATH
+
+albo bezpieczniej tymczasowo:
+
+multi_client_excel_path = settings.MULTI_CLIENT_EXCEL_PATH or params.get("multi_client_excel_path")
+
+Po tych zmianach możesz usunąć z config.yaml:
+
+sql_paths:
+  schema_dir: "sql/schema"
+  views_dir: "sql/views"
+  indexes_dir: "sql/indexes"
+  queries_dir: "sql/queries"
+
+oraz docelowo także:
+
+multi_client_excel_path: './data/input/Bartek_dane_20260429.xlsx'
+
+ale to drugie usuń dopiero, gdy kod już bierze settings.MULTI_CLIENT_EXCEL_PATH.
