@@ -1,93 +1,15 @@
-Masz już prawie dobrze. Zmień tylko logikę w parse_args() tak, żeby CLI było opcjonalnym override, a ENV było defaultem.
+jeszcze chyba to trzeba dodac do env:
+  sql_paths:
+    schema_dir: "sql/schema"
+    views_dir: "sql/views"
+    indexes_dir: "sql/indexes"
+    queries_dir: "sql/queries"
 
-Problem może być w imporcie:
+JAK TO DODAĆ DO ENV I JAK TO OBSŁUŻYĆ GDZIE OBECNIE JEST OBSŁUGIWANE NP TAK:
+    queries_dir = params["sql_paths"]["queries_dir"]
 
-from config import settings
-
-Jeżeli settings nie ładuje .env, dostajesz stare defaulty typu local.db.
-
-Najpierw upewnij się, że w config/__init__.py masz:
-
-from .settings import settings
-
-A w config/settings.py albo config/loader.py masz:
-
-from dotenv import load_dotenv
-load_dotenv()
-
-Potem zmień w runner_batch.py te fragmenty:
-
-parser.add_argument("--model-path", default=settings.MODEL_PATH, help="Path to .pt model")
-parser.add_argument("--db-path", default=settings.DB_PATH, help="Path/URL to shared DB")
-
-na:
-
-parser.add_argument("--model-path", default=None, help="Path to .pt model")
-parser.add_argument("--db-path", default=None, help="Path/URL to shared DB")
-
-i w main() zmień:
-
-db_path = validate_db_path(args.db_path)
-
-na:
-
-db_path = validate_db_path(args.db_path or settings.DB_PATH)
-model_path = args.model_path or settings.MODEL_PATH
-results_file = args.results_file or settings.RESULTS_FILE
-
-oraz niżej usuń albo zastąp:
-
-model_path = args.model_path
-
-bo już będzie ustawione wcześniej.
-
-Czyli w main() powinieneś mieć tak:
-
-def main():
-    args = parse_args()
-    config = load_config(args.config or settings.CONFIG_PATH)
-    t0 = datetime.strptime(args.t0, "%Y-%m-%d").date()
-    if not args.run_train and not args.run_test:
-        raise SystemExit("Podaj przynajmniej --run-train albo --run-test")
-    db_path = validate_db_path(args.db_path or settings.DB_PATH)
-    model_path = args.model_path or settings.MODEL_PATH
-    results_file = args.results_file or settings.RESULTS_FILE
-    train_include = parse_client_ids(args.train_client_ids)
-    test_include = parse_client_ids(args.test_client_ids)
-    train_exclude = parse_client_ids(args.exclude_train_client_ids)
-    test_exclude = parse_client_ids(args.exclude_test_client_ids)
-    all_clients = get_all_clients_from_db(db_path, table_name="dataset")
-
-I potem wszędzie zamiast:
-
-results_file=args.results_file,
-
-daj:
-
-results_file=results_file,
-
-Wtedy będą działały oba warianty.
-
-Bez ścieżek — bierze z .env:
-
-python runner_batch.py ^
-  --t0 2026-02-01 ^
-  --run-test ^
-  --test-client-ids 13309,3037,11428,4080,9068
-
-Ze ścieżkami — terminal nadpisuje .env:
-
-python runner_batch.py ^
-  --t0 2026-02-01 ^
-  --run-test ^
-  --test-client-ids 13309,3037,11428,4080,9068 ^
-  --db-path C:/Users/OE00SG/CashPredictor/dev3/databases/2026-04-29/2026-04-29/CashPredictor.db ^
-  --model-path C:/Users/OE00SG/CashPredictor/dev3/model/first_model.pt
-
-Dodałbym jeszcze log kontrolny po wyliczeniu ścieżek:
-
-logging.info("Effective db_path=%s", db_path)
-logging.info("Effective model_path=%s", model_path)
-logging.info("Effective results_file=%s", results_file)
-
-To od razu pokaże, czy bierze ENV czy CLI.
+    sql_paths = common["sql_paths"]
+    
+    schema_dir = sql_paths["schema_dir"]
+    views_dir = sql_paths["views_dir"]
+    indexes_dir = sql_paths["indexes_dir"]
